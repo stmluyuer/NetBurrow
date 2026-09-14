@@ -44,7 +44,7 @@ impl NetBurrowApp {
                     match netburrow_core::new_group() {
                         Ok(group) => {
                             self.settings.group = group;
-                            self.notice = Some("联机组已创建，可复制给朋友；启用时保存。".into());
+                            self.notice = None;
                         }
                         Err(error) => self.notice = Some(error),
                     }
@@ -104,10 +104,12 @@ impl NetBurrowApp {
                     }
                 });
             });
-        ui.small(if enabled {
-            "点击选择最近联机组，也可以直接粘贴"
+        field.response.clone().on_hover_text(if self.preflight.is_some() {
+            "检查期间无法编辑"
+        } else if !enabled {
+            "停止联机后可编辑"
         } else {
-            "停止联机后可修改连接配置"
+            "与朋友使用相同的服务器和组码"
         });
         if !enabled {
             self.view.history_open = false;

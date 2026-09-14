@@ -215,12 +215,12 @@ mod runtime {
 
     fn connection_hint(error: &io::Error) -> &'static str {
         match error.kind() {
-            io::ErrorKind::TimedOut => "连接服务器超时：请检查服务器地址、网络和防火墙；3 秒后自动重试。修改连接设置前请先停止联机。",
-            io::ErrorKind::ConnectionRefused => "服务器拒绝连接：请确认 Relay 已启动、端口填写正确且已放行；3 秒后自动重试。修改连接设置前请先停止联机。",
-            io::ErrorKind::WouldBlock => "服务器已满：请稍后再试，或联系服务器管理员增加容量；3 秒后自动重试。",
-            io::ErrorKind::PermissionDenied => "服务器拒绝加入：请确认地址指向 NetBurrow Relay，并核对工具与服务器版本；3 秒后自动重试。可先停止联机再修改设置。",
-            io::ErrorKind::InvalidData => "服务器协议不匹配：请确认端口指向 NetBurrow Relay，且双方版本一致；3 秒后自动重试。可先停止联机再修改设置。",
-            _ => "无法连接服务器：请检查地址、域名解析、网络及 Relay 服务状态；3 秒后自动重试。查看日志可获取底层错误，修改设置前请先停止联机。",
+            io::ErrorKind::TimedOut => "连接服务器超时，请检查地址、网络和防火墙；3 秒后重试。",
+            io::ErrorKind::ConnectionRefused => "服务器拒绝连接，请检查服务是否启动、端口是否开放；3 秒后重试。",
+            io::ErrorKind::WouldBlock => "服务器已满，请稍后再试；3 秒后重试。",
+            io::ErrorKind::PermissionDenied => "服务器拒绝加入，请核对服务器地址和版本；3 秒后重试。",
+            io::ErrorKind::InvalidData => "服务器协议不匹配，请核对端口和版本；3 秒后重试。",
+            _ => "无法连接服务器，请检查地址、网络和服务状态；3 秒后重试。",
         }
     }
 
@@ -732,9 +732,9 @@ mod runtime {
                                 // Members is authoritative for peer cleanup; these errors carry no target identity.
                                 let phase = state.lock().unwrap_or_else(|p| p.into_inner()).phase;
                                 status(state, phase, if reason == "target connection is slow" {
-                                    "对方连接拥堵或接收不及时，已断开；本机仍连接 Relay，可等待对方重新加入。"
+                                    "对方连接拥堵，已断开；本机仍在线，等待对方重新加入。"
                                 } else {
-                                    "对方连接已关闭；本机仍连接 Relay，可等待对方重新加入。"
+                                    "对方已断开；本机仍在线，等待对方重新加入。"
                                 });
                             }
                             Some(NetworkEvent::Tcp(Message::Error(reason))) if reason == "status reports are limited to once per second" => {

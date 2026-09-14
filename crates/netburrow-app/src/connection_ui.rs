@@ -98,11 +98,11 @@ impl NetBurrowApp {
                 let start = pending.start_after && unchanged && report.can_start();
                 self.notice = Some(
                     if !unchanged {
-                        "连接设置已修改，请重新自检；未自动启用。"
+                        "设置已修改，请重新检查"
                     } else if !report.can_start() {
-                        "自检未通过，请处理下方问题后重试。"
+                        "自检未通过，请查看检查结果"
                     } else {
-                        "自检完成，请查看结果中的版本兼容性提示。"
+                        "自检完成"
                     }
                     .into(),
                 );
@@ -123,7 +123,7 @@ impl NetBurrowApp {
         if self.preflight.is_some() {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("正在自检配置、文件和服务器…");
+                ui.label("正在检查连接…");
             });
             ui.add_space(8.0);
         }

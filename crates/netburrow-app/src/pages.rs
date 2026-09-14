@@ -93,12 +93,9 @@ impl NetBurrowApp {
             message.as_str(),
             "完整组码已复制。"
                 | "版本信息已复制。"
-                | "启动偏好已保存。"
-                | "已保存，下次启动生效。"
-                | "窗口偏好已保存。"
-                | "通知偏好已保存。"
-                | "游戏与网络设置已应用，下次启用联机时使用。"
-                | "诊断已导出，可打开所在文件夹。"
+                | "设置已应用"
+                | "诊断已导出"
+                | "自检完成"
         );
         if transient && self.view.notice_since.elapsed() > Duration::from_secs(4) {
             self.notice = None;
@@ -156,7 +153,7 @@ impl NetBurrowApp {
                 self.settings.transport = draft.transport;
                 self.settings.allow_late_hook = draft.allow_late_hook;
                 self.view.game_draft = Some(self.settings.clone());
-                self.notice = Some("游戏与网络设置已应用，下次启用联机时使用。".into());
+                self.notice = Some("设置已应用".into());
                 true
             }
             Err(error) => {
@@ -227,7 +224,7 @@ impl NetBurrowApp {
             )
             .show(ui, |ui| {
                 if let Some(destination) = self.view.leave_settings {
-                    ui.label("游戏设置尚未应用，如何返回？");
+                    ui.label("有未保存的更改");
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("应用更改并返回").clicked() && self.apply_game() {
                             self.view.leave_settings = None;
@@ -243,7 +240,6 @@ impl NetBurrowApp {
                         }
                     });
                 } else if self.view.page == Page::Settings && self.game_dirty() {
-                    ui.small("未应用的修改不会保存");
                     ui.horizontal(|ui| {
                         if ui.button("放弃修改").clicked() {
                             self.view.game_draft = Some(self.settings.clone());
@@ -333,8 +329,6 @@ impl NetBurrowApp {
         ui.colored_label(color, status);
         if self.client.is_some() {
             ui.label(&self.last_snapshot.detail);
-        } else {
-            ui.label("检查配置和游戏文件后，再启用联机。");
         }
         ui.add_space(12.0);
         if ui
@@ -412,7 +406,6 @@ impl NetBurrowApp {
             );
             ui.checkbox(&mut self.view.log_follow, "跟随最新");
         });
-        ui.small("当前记录 · 完整历史请打开日志文件夹");
         if let Some(error) = netburrow_core::diagnostics::last_error() {
             ui.colored_label(Color32::from_rgb(174, 65, 60), error);
         }
@@ -467,7 +460,6 @@ impl NetBurrowApp {
             "查看发布版本 ↗",
             "https://github.com/stmluyuer/NetBurrow/releases",
         );
-        ui.small("在浏览器中查看发布页，手动下载更新。");
         ui.hyperlink_to("项目主页 ↗", "https://github.com/stmluyuer/NetBurrow");
         ui.hyperlink_to(
             "反馈问题 ↗",

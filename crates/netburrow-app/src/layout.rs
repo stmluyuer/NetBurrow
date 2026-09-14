@@ -7,7 +7,6 @@ impl NetBurrowApp {
             return;
         }
         egui::Panel::bottom("primary-action")
-            .exact_size(142.0)
             .resizable(false)
             .frame(
                 egui::Frame::new()
@@ -65,13 +64,15 @@ impl NetBurrowApp {
                 ui.vertical_centered(|ui| {
                     ui.label(
                         RichText::new(if checking {
-                            "正在检查配置、游戏文件和服务器"
+                            "正在检查连接…"
+                        } else if active && self.current_phase() == Phase::WaitingForGame {
+                            "请从 Steam 启动游戏"
                         } else if active {
-                            "停止联机后，需重开游戏才能再次接入"
+                            "停止后需重开游戏"
                         } else if self.settings.allow_late_hook {
-                            "已允许中途接入，请停在游戏主菜单后启用"
+                            "请停在游戏主菜单后启用"
                         } else {
-                            "启用后，从 Steam 正常启动游戏"
+                            "启用后，从 Steam 启动游戏"
                         })
                         .size(12.0)
                         .color(MUTED),
@@ -270,7 +271,11 @@ impl NetBurrowApp {
                         )
                         .frame(false),
                     )
-                    .on_disabled_hover_text("停止联机后可修改显示名")
+                    .on_disabled_hover_text(if self.preflight.is_some() {
+                        "检查期间无法编辑"
+                    } else {
+                        "停止联机后可编辑"
+                    })
                     .clicked()
                 {
                     if is_server {
@@ -445,7 +450,7 @@ mod tests {
                         Page::Settings,
                         SettingsTab::General,
                         DiagnosticTab::Checks,
-                        "通用偏好立即保存",
+                        "登录 Windows 时启动",
                     ),
                     (
                         Page::Settings,

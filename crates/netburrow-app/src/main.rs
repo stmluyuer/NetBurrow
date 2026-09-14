@@ -219,7 +219,7 @@ impl NetBurrowApp {
                 let previous = self.settings.recent_connections.clone();
                 self.settings.remember_connection();
                 self.notice = match netburrow_core::save_recent_connections(&self.settings.recent_connections) {
-                    Ok(()) => Some("自检通过，已启用联机；游戏兼容性由实际接入检查确认。".into()),
+                    Ok(()) => None,
                     Err(error) => {
                         self.settings.recent_connections = previous;
                         Some(format!("联机已启用，但最近连接保存失败：{error}"))
@@ -268,7 +268,7 @@ impl NetBurrowApp {
         if self.client.is_none() { snapshot.detail = "联机当前未启用；下方可能包含上次运行记录。".into(); }
         match netburrow_core::export_report(&self.settings, &snapshot) {
             Ok(path) => {
-                self.notice = Some("诊断已导出，可打开所在文件夹。".into());
+                self.notice = Some("诊断已导出".into());
                 self.diagnostic_export = Some(path);
             }
             Err(error) => self.notice = Some(error),
@@ -300,19 +300,18 @@ impl NetBurrowApp {
             ui.label(RichText::new("同组成员").font(bold(20.0)));
             ui.label(RichText::new(format!("{} 人", if show_members { self.last_snapshot.peers.len() } else { 0 })).color(MUTED));
         });
-        if self.client.is_some() {
-            ui.label(RichText::new(&self.last_snapshot.detail).size(13.0).color(TEXT));
-        }
-        if self.client.is_some() {
-            let (quality, reason) = netburrow_core::connection_quality(&self.last_snapshot, Instant::now());
-            let (label, color) = match quality {
-                netburrow_core::Quality::Pending => ("待测", MUTED),
-                netburrow_core::Quality::Normal => ("正常", ACCENT),
-                netburrow_core::Quality::Unstable => ("波动", Color32::from_rgb(151, 103, 37)),
-                netburrow_core::Quality::Abnormal => ("异常", Color32::from_rgb(174, 65, 60)),
-            };
-            ui.label(RichText::new(format!("到 Relay 的连接质量：{label} · {reason}")).color(color))
-                .on_hover_text("参考阈值：延迟 ≥150 ms 或最近 20 个样本极差 ≥80 ms 为波动，延迟 ≥300 ms 或 5 秒未收到心跳为异常。最近 60 秒断线也标为波动。不是玩家之间的延迟或丢包率。");
+        let detail = self.last_snapshot.detail.trim();
+        // A warning may keep the current phase (e.g. a peer disconnects while we stay Ready).
+        // Hide only routine messages already covered by the status label and launch hint.
+        let routine = matches!(detail,
+            "正在连接 Relay…"
+                | "Relay 已连接，请从 Steam 正常启动游戏"
+                | "游戏已退出，等待下次从 Steam 启动"
+                | "已发现游戏进程，正在加载自己的 Hook…"
+                | "游戏已接入 NetBurrow，可在游戏中邀请同组朋友"
+        );
+        if self.client.is_some() && !detail.is_empty() && !routine {
+            ui.label(RichText::new(detail).size(13.0).color(TEXT));
         }
         if matches!(self.current_phase(), Phase::Connecting | Phase::RestartRequired | Phase::Failed) {
             if icons::button(ui, icons::Action::Log, "查看排查日志").clicked() {
@@ -320,12 +319,7 @@ impl NetBurrowApp {
             }
         }
         if self.client.as_ref().is_some_and(Client::is_finished) {
-            ui.label(RichText::new("联机服务已结束。处理上述原因后，点击“停止联机”，再重新启用。").color(Color32::from_rgb(151, 103, 37)));
-        }
-        if self.client.is_some() && self.last_snapshot.peers.len() <= 1
-            && matches!(self.current_phase(), Phase::WaitingForGame | Phase::Ready)
-        {
-            ui.label(RichText::new("未看到朋友？请核对双方服务器地址与完整组码；不同的有效组码会进入不同联机组。").size(12.0).color(MUTED));
+            ui.label(RichText::new("请停止联机，处理问题后重新启用").color(Color32::from_rgb(151, 103, 37)));
         }
         if !show_members || self.last_snapshot.peers.is_empty() {
             ui.add_space(14.0);
@@ -333,9 +327,9 @@ impl NetBurrowApp {
                 icons::members_empty(ui);
                 ui.add_space(6.0);
                 ui.label(RichText::new(if self.client.is_some() {
-                    "正在等待同组成员"
+                    "等待成员加入"
                 } else {
-                    "启用联机后，同组朋友会显示在这里"
+                    "暂无成员"
                 }).color(MUTED).size(12.0));
             });
             ui.add_space(14.0);
@@ -404,12 +398,6 @@ impl NetBurrowApp {
                     }
                 });
             });
-        }
-        if show_members {
-            ui.add_space(4.0);
-            ui.label(RichText::new("延迟为各成员到 Relay 的往返时间").size(11.0).color(MUTED))
-                .on_hover_text("每 1 秒测速 · 成员状态约 3 秒同步 · 超过 10 秒标记过期");
-
         }
     }
 
