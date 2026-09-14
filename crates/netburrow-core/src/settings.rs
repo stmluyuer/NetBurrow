@@ -12,6 +12,15 @@ pub enum Transport {
     Udp,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowPlacement {
+    /// Normal window rectangle in Windows workspace coordinates.
+    pub normal: [i32; 4],
+    pub maximized: bool,
+}
+
+fn enabled_by_default() -> bool { true }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -23,6 +32,12 @@ pub struct Settings {
     pub allow_late_hook: bool,
     #[serde(default)]
     pub display_name: String,
+    #[serde(default)]
+    pub minimize_on_close: bool,
+    #[serde(default = "enabled_by_default")]
+    pub notifications_enabled: bool,
+    #[serde(default)]
+    pub window_placement: Option<WindowPlacement>,
 }
 
 impl Default for Settings {
@@ -36,6 +51,9 @@ impl Default for Settings {
             transport: Transport::Tcp,
             allow_late_hook: false,
             display_name: String::new(),
+            minimize_on_close: false,
+            notifications_enabled: true,
+            window_placement: None,
         }
     }
 }
@@ -80,7 +98,7 @@ pub fn parse_group(input: &str) -> Result<netburrow_protocol::Group, String> {
         .strip_prefix("NB1-")
         .ok_or("联机组格式无效，请创建或导入 NB1- 开头的组码")?;
     if hex.len() != 64 {
-        return Err("联机组应为 NB1- 加 64 位十六进制字符".into());
+        return Err("联机组不完整：应为 NB1- 加 64 位十六进制字符，请重新复制朋友的完整组码".into());
     }
     let mut group = [0; 32];
     for (slot, pair) in group.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
@@ -88,7 +106,7 @@ pub fn parse_group(input: &str) -> Result<netburrow_protocol::Group, String> {
             (b as char)
                 .to_digit(16)
                 .map(|n| n as u8)
-                .ok_or("联机组含无效字符")
+                .ok_or("联机组含无效字符，请重新复制朋友的完整组码，或创建新组并分享")
         };
         *slot = digit(pair[0])? * 16 + digit(pair[1])?;
     }
@@ -128,7 +146,34 @@ pub fn load_settings() -> Result<Settings, String> {
 }
 
 pub fn save_settings(settings: &Settings) -> Result<(), String> {
-    let dir = config_directory();
+    save_settings_in(&config_directory(), settings)
+}
+
+pub fn save_minimize_on_close(enabled: bool) -> Result<(), String> {
+    save_minimize_on_close_in(&config_directory(), enabled)
+}
+
+pub fn save_notifications_enabled(enabled: bool) -> Result<(), String> {
+    update_preferences_in(&config_directory(), |settings| settings.notifications_enabled = enabled)
+}
+
+pub fn save_window_placement(placement: WindowPlacement) -> Result<(), String> {
+    update_preferences_in(&config_directory(), |settings| settings.window_placement = Some(placement))
+}
+
+fn save_minimize_on_close_in(dir: &Path, enabled: bool) -> Result<(), String> {
+    update_preferences_in(dir, |settings| settings.minimize_on_close = enabled)
+}
+
+fn update_preferences_in(dir: &Path, update: impl FnOnce(&mut Settings)) -> Result<(), String> {
+    // Read the saved connection values, never the UI's unconfirmed edits.
+    // A corrupt configuration must remain untouched for explicit recovery.
+    let mut settings = read_settings(&dir.join("settings.json"))?;
+    update(&mut settings);
+    save_settings_in(dir, &settings)
+}
+
+fn save_settings_in(dir: &Path, settings: &Settings) -> Result<(), String> {
     fs::create_dir_all(&dir).map_err(|e| format!("无法创建设置目录：{e}"))?;
     let bytes = serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())?;
     let staging = dir.join("settings.new");
@@ -168,6 +213,36 @@ pub fn autodetect_game() -> Option<PathBuf> {
 mod tests {
     use super::*;
     #[test]
+    fn preference_save_preserves_connection_and_corrupt_file() {
+        let dir = std::env::temp_dir().join(format!("netburrow-preferences-{}-{}", std::process::id(), new_group().unwrap()));
+        let saved = Settings { server: "saved.example:24872".into(), group: new_group().unwrap(), ..Settings::default() };
+        save_settings_in(&dir, &saved).unwrap();
+        save_minimize_on_close_in(&dir, true).unwrap();
+        let loaded = read_settings(&dir.join("settings.json")).unwrap();
+        assert!(loaded.minimize_on_close);
+        assert_eq!(loaded.server, saved.server);
+        assert_eq!(loaded.group, saved.group);
+        let placement = WindowPlacement { normal: [50, 60, 690, 880], maximized: true };
+        update_preferences_in(&dir, |settings| {
+            settings.notifications_enabled = false;
+            settings.window_placement = Some(placement.clone());
+        }).unwrap();
+        let loaded = read_settings(&dir.join("settings.json")).unwrap();
+        assert!(!loaded.notifications_enabled);
+        assert_eq!(loaded.window_placement, Some(placement));
+        assert!(loaded.minimize_on_close);
+        assert_eq!(loaded.group, saved.group);
+        assert_eq!(loaded.server, saved.server);
+        fs::write(dir.join("settings.json"), b"{broken}").unwrap();
+        assert!(save_minimize_on_close_in(&dir, false).is_err());
+        assert_eq!(fs::read(dir.join("settings.json")).unwrap(), b"{broken}");
+        fs::remove_file(dir.join("settings.json")).unwrap();
+        save_minimize_on_close_in(&dir, true).unwrap();
+        assert!(read_settings(&dir.join("settings.json")).unwrap().minimize_on_close);
+        fs::remove_file(dir.join("settings.json")).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+    #[test]
     fn group_roundtrip_and_invalid_input() {
         let value = new_group().unwrap();
         assert_ne!(parse_group(&value).unwrap(), [0; 32]);
@@ -193,18 +268,31 @@ mod tests {
             transport: Transport::Udp,
             allow_late_hook: true,
             display_name: "测试玩家".into(),
+            minimize_on_close: true,
+            notifications_enabled: false,
+            window_placement: Some(WindowPlacement { normal: [50, 60, 690, 880], maximized: false }),
         };
         let encoded = serde_json::to_vec(&value).unwrap();
         let decoded: Settings = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded.group, value.group);
         assert_eq!(decoded.transport, Transport::Udp);
         assert!(decoded.allow_late_hook);
+        assert!(decoded.minimize_on_close);
+        assert!(!decoded.notifications_enabled);
+        assert_eq!(decoded.window_placement, value.window_placement);
         assert_eq!(decoded.display_name, "测试玩家");
         let mut legacy = serde_json::to_value(&value).unwrap();
         legacy.as_object_mut().unwrap().remove("allow_late_hook");
         legacy.as_object_mut().unwrap().remove("display_name");
+        legacy.as_object_mut().unwrap().remove("minimize_on_close");
+        legacy.as_object_mut().unwrap().remove("notifications_enabled");
+        legacy.as_object_mut().unwrap().remove("window_placement");
         let legacy: Settings = serde_json::from_value(legacy).unwrap();
         assert!(!legacy.allow_late_hook);
+        assert!(!legacy.minimize_on_close);
+        assert!(legacy.notifications_enabled);
+        assert!(legacy.window_placement.is_none());
+        assert!(!Settings::default().minimize_on_close);
         assert!(legacy.display_name.is_empty());
         assert_eq!(legacy.group, value.group);
         assert!(serde_json::from_slice::<Settings>(b"{broken}").is_err());

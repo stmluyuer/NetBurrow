@@ -5,6 +5,49 @@ use std::sync::{Arc, OnceLock};
 
 use eframe::egui;
 
+#[cfg(windows)]
+static TRAY_WINDOW: std::sync::atomic::AtomicPtr<std::ffi::c_void> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+pub fn notify(notification: &crate::notifications::Notification) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::Shell::{NIF_INFO, NIF_REALTIME, NIIF_INFO, NIIF_WARNING, NIIF_NOSOUND, NIIF_RESPECT_QUIET_TIME, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW};
+        let hwnd = TRAY_WINDOW.load(std::sync::atomic::Ordering::Acquire);
+        if hwnd.is_null() { return false; }
+        let mut icon: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+        icon.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        icon.hWnd = hwnd;
+        icon.uID = 1;
+        icon.uFlags = NIF_INFO | NIF_REALTIME;
+        icon.dwInfoFlags = (if notification.warning { NIIF_WARNING } else { NIIF_INFO }) | NIIF_NOSOUND | NIIF_RESPECT_QUIET_TIME;
+        for (target, value) in icon.szInfoTitle.iter_mut().take(63).zip(notification.title.encode_utf16()) { *target = value; }
+        for (target, value) in icon.szInfo.iter_mut().take(255).zip(notification.body.encode_utf16()) { *target = value; }
+        return unsafe { Shell_NotifyIconW(NIM_MODIFY, &icon) != 0 };
+    }
+    #[cfg(not(windows))]
+    { let _ = notification; false }
+}
+
+pub fn dismiss_notification() {
+    let _ = notify(&crate::notifications::Notification { title: "", body: "", warning: false });
+}
+
+pub fn shutdown() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_CLOSE};
+        let hwnd = TRAY_WINDOW.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::AcqRel);
+        if !hwnd.is_null() {
+            use windows_sys::Win32::UI::Shell::{NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW};
+            let mut icon: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+            icon.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+            icon.hWnd = hwnd;
+            icon.uID = 1;
+            unsafe { Shell_NotifyIconW(NIM_DELETE, &icon); SendMessageW(hwnd, WM_CLOSE, 0, 0); }
+        }
+    }
+}
+
 static ACTIONS: OnceLock<TrayActions> = OnceLock::new();
 
 #[derive(Clone)]
@@ -46,7 +89,7 @@ fn run() {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::Shell::{
-        NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+        NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIN_BALLOONUSERCLICK, NOTIFYICONDATAW, Shell_NotifyIconW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
@@ -68,7 +111,7 @@ fn run() {
         lparam: LPARAM,
     ) -> LRESULT {
         match message {
-            TRAY_MESSAGE if lparam as u32 == WM_LBUTTONUP => {
+            TRAY_MESSAGE if lparam as u32 == WM_LBUTTONUP || lparam as u32 == NIN_BALLOONUSERCLICK => {
                 show_window();
                 0
             }
@@ -84,9 +127,7 @@ fn run() {
                             actions
                                 .stop_requested
                                 .store(true, std::sync::atomic::Ordering::Release);
-                            actions
-                                .context
-                                .send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                            show_window();
                         }
                     }
                     EXIT_APP => {
@@ -116,6 +157,12 @@ fn run() {
             actions
                 .context
                 .send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            actions
+                .context
+                .send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            actions
+                .context
+                .send_viewport_cmd(egui::ViewportCommand::Focus);
         }
     }
 
@@ -182,12 +229,14 @@ fn run() {
         icon.uID = 1;
         icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         icon.uCallbackMessage = TRAY_MESSAGE;
-        icon.hIcon = LoadIconW(std::ptr::null_mut(), 32512usize as *const u16);
+        icon.hIcon = LoadIconW(instance, 1usize as *const u16);
         let tip = wide("NetBurrow 正在后台运行");
         for (destination, source) in icon.szTip.iter_mut().zip(tip.iter()) {
             *destination = *source;
         }
-        let _ = Shell_NotifyIconW(NIM_ADD, &icon);
+        if Shell_NotifyIconW(NIM_ADD, &icon) != 0 {
+            TRAY_WINDOW.store(hwnd, std::sync::atomic::Ordering::Release);
+        }
 
         let mut message = zeroed();
         while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
@@ -195,6 +244,7 @@ fn run() {
             let _ = DispatchMessageW(&message);
         }
         let _ = Shell_NotifyIconW(NIM_DELETE, &icon);
+        TRAY_WINDOW.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
     }
 }
 

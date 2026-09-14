@@ -1,7 +1,10 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod clipboard;
+mod icons;
+mod notifications;
 mod tray;
+mod window_state;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -21,14 +24,15 @@ const ACCENT: Color32 = Color32::from_rgb(114, 215, 190);
 
 fn main() {
     let smoke_test = std::env::args().any(|argument| argument == "--smoke-test");
-    let _instance = match if smoke_test {
+    let instance = match if smoke_test {
         Ok(None)
     } else {
-        SingleInstance::acquire().map(Some)
+        SingleInstance::acquire()
     } {
+        Ok(None) if !smoke_test => return,
         Ok(instance) => instance,
         Err(error) => {
-            show_error(&format!("NetBurrow 已在运行。\n\n{error}"));
+            show_error(&format!("无法启动 NetBurrow。\n\n{error}"));
             return;
         }
     };
@@ -40,7 +44,7 @@ fn main() {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(Vec2::new(640.0, 820.0))
             .with_min_inner_size(Vec2::new(580.0, 720.0))
-            .with_title(WINDOW_TITLE),
+            .with_title(WINDOW_TITLE).with_icon(icons::window_icon()),
         ..Default::default()
     };
 
@@ -53,6 +57,7 @@ fn main() {
             Ok(Box::new(NetBurrowApp::new(
                 creation_context.egui_ctx.clone(),
                 smoke_test,
+                instance,
             )))
         }),
     ) {
@@ -61,6 +66,7 @@ fn main() {
 }
 
 struct NetBurrowApp {
+    instance: Option<SingleInstance>,
     settings: Settings,
     client: Option<Client>,
     last_snapshot: Snapshot,
@@ -68,13 +74,17 @@ struct NetBurrowApp {
     config_error: Option<String>,
     requires_explicit_save: bool,
     show_logs: bool,
+    show_about: bool,
+    diagnostic_export: Option<std::path::PathBuf>,
+    notifications: notifications::Notifications,
+    restore_window_pending: bool,
     stop_requested: Arc<AtomicBool>,
     quit_requested: Arc<AtomicBool>,
     smoke_test: Option<Instant>,
 }
 
 impl NetBurrowApp {
-    fn new(context: egui::Context, smoke_test: bool) -> Self {
+    fn new(context: egui::Context, smoke_test: bool, instance: Option<SingleInstance>) -> Self {
         let (settings, config_error, requires_explicit_save) = match if smoke_test {
             Ok(Settings::default())
         } else {
@@ -92,6 +102,7 @@ impl NetBurrowApp {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let quit_requested = Arc::new(AtomicBool::new(false));
         let mut app = Self {
+            instance,
             settings,
             client: None,
             last_snapshot: Snapshot::default(),
@@ -99,6 +110,10 @@ impl NetBurrowApp {
             config_error,
             requires_explicit_save,
             show_logs: false,
+            show_about: false,
+            diagnostic_export: None,
+            notifications: notifications::Notifications::default(),
+            restore_window_pending: !smoke_test,
             stop_requested,
             quit_requested,
             smoke_test: smoke_test.then(Instant::now),
@@ -173,6 +188,7 @@ impl NetBurrowApp {
     }
 
     fn stop(&mut self) {
+        self.notifications.update(Phase::Stopped, false, Instant::now());
         if let Some(mut client) = self.client.take() {
             netburrow_core::diagnostics::record(
                 "INFO",
@@ -202,9 +218,26 @@ impl NetBurrowApp {
     fn poll_core(&mut self) {
         if let Some(client) = &self.client {
             self.last_snapshot = client.snapshot();
-            if client.is_finished() {
-                self.notice = Some("联机服务已结束，请查看状态或重新启用。".to_owned());
+        }
+        if let Some(notification) = self.notifications.update(
+            self.current_phase(), self.settings.notifications_enabled && self.smoke_test.is_none(), Instant::now(),
+        ) {
+            if !tray::notify(&notification) {
+                netburrow_core::diagnostics::record("WARN", "notification", "Tray notification could not be submitted; see application status");
             }
+        }
+    }
+
+    fn export_diagnostics(&mut self) {
+        let mut snapshot = self.last_snapshot.clone();
+        snapshot.phase = self.current_phase();
+        if self.client.is_none() { snapshot.detail = "联机当前未启用；下方可能包含上次运行记录。".into(); }
+        match netburrow_core::export_report(&self.settings, &snapshot) {
+            Ok(path) => {
+                self.notice = Some(format!("诊断信息已导出到 {}", path.display()));
+                self.diagnostic_export = Some(path);
+            }
+            Err(error) => self.notice = Some(error),
         }
     }
 
@@ -243,7 +276,7 @@ impl NetBurrowApp {
                 .hint_text("粘贴朋友的组码，或在下方创建一个"),
         );
         ui.horizontal(|ui| {
-            if ui.button("创建联机组").clicked() {
+            if icons::button(ui, icons::Action::Add, "创建联机组").clicked() {
                 match netburrow_core::new_group() {
                     Ok(group) => {
                         self.settings.group = group;
@@ -252,11 +285,11 @@ impl NetBurrowApp {
                     Err(error) => self.notice = Some(format!("无法创建联机组：{error}")),
                 }
             }
-            if ui.button("复制").clicked() {
+            if icons::button(ui, icons::Action::Copy, "复制").clicked() {
                 ui.ctx().copy_text(self.settings.group.clone());
                 self.notice = Some("联机组已复制到剪贴板。".to_owned());
             }
-            if ui.button("粘贴").clicked() {
+            if icons::button(ui, icons::Action::Paste, "粘贴").clicked() {
                 match clipboard::read_text() {
                     Ok(group) if group.is_empty() => {
                         self.notice = Some("剪贴板中的联机组为空。".to_owned())
@@ -286,7 +319,7 @@ impl NetBurrowApp {
             ui.horizontal(|ui| {
                 ui.label("游戏路径");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("自动检测").clicked() {
+                    if icons::button(ui, icons::Action::Search, "自动检测").clicked() {
                         match netburrow_core::autodetect_game() {
                             Some(path) => {
                                 self.settings.game_path = path.display().to_string();
@@ -319,20 +352,56 @@ impl NetBurrowApp {
             );
         });
         ui.add_space(6.0);
+        if ui.checkbox(&mut self.settings.minimize_on_close, "关闭窗口时最小化")
+            .on_hover_text("默认关闭：关闭窗口会退出并停止联机。开启后关闭窗口会最小化到任务栏，联机继续。此选项自动保存。").changed()
+            && self.smoke_test.is_none()
+        {
+            match netburrow_core::save_minimize_on_close(self.settings.minimize_on_close) {
+                Ok(()) => self.notice = Some("窗口偏好已自动保存。".into()),
+                Err(error) => {
+                    self.settings.minimize_on_close = !self.settings.minimize_on_close;
+                    self.notice = Some(format!("窗口偏好保存失败，已恢复原值：{error}"));
+                }
+            }
+        }
+        if ui.checkbox(&mut self.settings.notifications_enabled, "重要状态通知")
+            .on_hover_text("接入成功、连接中断或接入失败时显示静音系统通知；同类通知 30 秒内不重复。此选项自动保存。").changed()
+            && self.smoke_test.is_none()
+        {
+            match netburrow_core::save_notifications_enabled(self.settings.notifications_enabled) {
+                Ok(()) => {
+                    if !self.settings.notifications_enabled { tray::dismiss_notification(); }
+                    self.notice = Some("通知偏好已自动保存。".into());
+                }
+                Err(error) => {
+                    self.settings.notifications_enabled = !self.settings.notifications_enabled;
+                    self.notice = Some(format!("通知偏好保存失败，已恢复原值：{error}"));
+                }
+            }
+        }
         ui.horizontal(|ui| {
-            if ui.button("保存设置").clicked() {
+            if icons::button(ui, icons::Action::Save, "保存设置").clicked() {
                 self.save_only();
             }
-            if ui.button("查看日志").clicked() {
+            if icons::button(ui, icons::Action::Log, "查看日志").clicked() {
                 self.show_logs = true;
             }
+            if ui.button("导出诊断").clicked() { self.export_diagnostics(); }
+            if ui.button("关于").clicked() { self.show_about = true; }
             if self.requires_explicit_save {
                 ui.colored_label(Color32::from_rgb(238, 184, 84), "请重新填写并保存后再启用");
             }
         });
+        if let Some(path) = &self.diagnostic_export {
+            if ui.button("在文件夹中查看诊断文件").clicked() {
+                if let Err(error) = std::process::Command::new("explorer.exe").arg("/select,").arg(path).spawn() {
+                    self.notice = Some(format!("无法打开文件夹：{error}"));
+                }
+            }
+        }
     }
 
-    fn activity_ui(&self, ui: &mut egui::Ui) {
+    fn activity_ui(&mut self, ui: &mut egui::Ui) {
         let (status, color) = self.status_label();
         ui.horizontal(|ui| {
             ui.label(RichText::new("联机状态").strong().size(17.0));
@@ -349,6 +418,19 @@ impl NetBurrowApp {
             &self.last_snapshot.detail
         };
         ui.label(RichText::new(detail).size(13.0).color(MUTED));
+        if matches!(self.current_phase(), Phase::Connecting | Phase::RestartRequired | Phase::Failed) {
+            if icons::button(ui, icons::Action::Log, "查看排查日志").clicked() {
+                self.show_logs = true;
+            }
+        }
+        if self.client.as_ref().is_some_and(Client::is_finished) {
+            ui.label(RichText::new("联机服务已结束。处理上述原因后，点击“停止联机”，再重新启用。").color(Color32::from_rgb(238, 184, 120)));
+        }
+        if self.client.is_some() && self.last_snapshot.peers.len() <= 1
+            && matches!(self.current_phase(), Phase::WaitingForGame | Phase::Ready)
+        {
+            ui.label(RichText::new("未看到朋友？请核对双方服务器地址与完整组码；不同的有效组码会进入不同联机组。").size(12.0).color(MUTED));
+        }
         ui.add_space(10.0);
         ui.columns(3, |columns| {
             let ping = self
@@ -358,7 +440,7 @@ impl NetBurrowApp {
             for (column, (title, value)) in columns.iter_mut().zip([
                 ("发送数据包", self.last_snapshot.sent.to_string()),
                 ("接收数据包", self.last_snapshot.received.to_string()),
-                ("本机 → Relay", ping),
+                ("本机 ↔ Relay", ping),
             ]) {
                 column.label(RichText::new(title).size(12.0).color(MUTED));
                 column.label(RichText::new(value).size(23.0).strong());
@@ -458,7 +540,7 @@ impl NetBurrowApp {
         }
         ui.add_space(4.0);
         ui.label(
-            RichText::new("延迟 = 每人到 Relay 的往返时间 · 约 3 秒更新 · 超过 10 秒标记过期")
+            RichText::new("延迟 = 到 Relay 的往返时间 · 每 1 秒测速 · 成员状态约 3 秒同步 · 超过 10 秒标记过期")
                 .size(11.0)
                 .color(MUTED),
         );
@@ -474,18 +556,20 @@ impl NetBurrowApp {
         }
     }
     fn logs_ui(&mut self, context: &egui::Context) {
+        let mut export_requested = false;
         egui::Window::new("运行日志")
             .open(&mut self.show_logs)
             .default_width(520.0)
             .default_height(280.0)
             .show(context, |ui| {
                 ui.small("下方为最近状态；详细记录保存在日志文件夹。");
+                if ui.button("导出诊断信息（已脱敏）").clicked() { export_requested = true; }
                 ui.label(
                     netburrow_core::diagnostics::directory()
                         .display()
                         .to_string(),
                 );
-                if ui.button("打开日志文件夹").clicked() {
+                if icons::button(ui, icons::Action::Folder, "打开日志文件夹").clicked() {
                     let folder = netburrow_core::diagnostics::directory();
                     let result = std::fs::create_dir_all(&folder).and_then(|_| {
                         std::process::Command::new("explorer.exe")
@@ -516,11 +600,54 @@ impl NetBurrowApp {
                         }
                     });
             });
+        if export_requested { self.export_diagnostics(); }
+    }
+
+    fn about_ui(&mut self, context: &egui::Context) {
+        egui::Window::new("关于 NetBurrow")
+            .open(&mut self.show_about)
+            .resizable(false)
+            .default_width(380.0)
+            .show(context, |ui| {
+                ui.heading("NetBurrow");
+                ui.label(format!("版本 {} · {}", env!("CARGO_PKG_VERSION"), std::env::consts::ARCH));
+                ui.label("以撒的结合：忏悔+ / 好友联机工具");
+                ui.separator();
+                ui.hyperlink_to("项目主页", "https://github.com/stmluyuer/NetBurrow");
+                ui.hyperlink_to("问题反馈", "https://github.com/stmluyuer/NetBurrow/issues/new");
+                ui.hyperlink_to("检查更新（打开发布页）", "https://github.com/stmluyuer/NetBurrow/releases");
+                ui.small("在发布页对照当前版本，手动下载更新。反馈问题时可附上导出的诊断文件。");
+            });
     }
 }
 
 impl eframe::App for NetBurrowApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.smoke_test.is_none() {
+            if let Some(placement) = window_state::capture() {
+                if let Err(error) = netburrow_core::save_window_placement(placement) {
+                    netburrow_core::diagnostics::record("WARN", "window placement", &error);
+                }
+            }
+            tray::shutdown();
+        }
+    }
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        if std::mem::take(&mut self.restore_window_pending) {
+            netburrow_core::diagnostics::record("INFO", "window", "restoring saved placement");
+            if let Some(placement) = &self.settings.window_placement {
+                if let Err(error) = window_state::restore(placement) {
+                    netburrow_core::diagnostics::record("WARN", "window restore", &error);
+                    self.notice = Some(error);
+                }
+            }
+            netburrow_core::diagnostics::record("INFO", "window", "placement initialization complete");
+        }
+        if self.instance.as_ref().is_some_and(SingleInstance::activation_requested) {
+            context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            context.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            context.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         if self.stop_requested.swap(false, Ordering::AcqRel) {
             self.stop();
         }
@@ -537,11 +664,12 @@ impl eframe::App for NetBurrowApp {
             context.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         if context.input(|input| input.viewport().close_requested())
+            && self.settings.minimize_on_close
             && !self.quit_requested.load(Ordering::Acquire)
             && self.smoke_test.is_none()
         {
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            context.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
         context.request_repaint_after(Duration::from_millis(400));
     }
@@ -584,7 +712,11 @@ impl eframe::App for NetBurrowApp {
                 ui.add_space(8.0);
                 ui.vertical_centered(|ui| {
                     ui.label(
-                        RichText::new("关闭窗口后保留在托盘，退出工具才会停止联机")
+                        RichText::new(if self.settings.minimize_on_close {
+                            "关闭窗口会最小化到任务栏，托盘菜单可退出工具"
+                        } else {
+                            "关闭窗口会退出工具并停止联机"
+                        })
                             .size(12.0)
                             .color(MUTED),
                     );
@@ -597,15 +729,7 @@ impl eframe::App for NetBurrowApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            egui::Frame::new()
-                                .fill(ACCENT)
-                                .corner_radius(12)
-                                .inner_margin(10)
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        RichText::new("NB").size(21.0).strong().color(BACKGROUND),
-                                    );
-                                });
+                            icons::logo(ui);
                             ui.add_space(6.0);
                             ui.vertical(|ui| {
                                 ui.label(RichText::new("NetBurrow").size(25.0).strong());
@@ -656,6 +780,7 @@ impl eframe::App for NetBurrowApp {
         if self.show_logs {
             self.logs_ui(&context);
         }
+        if self.show_about { self.about_ui(&context); }
     }
 }
 

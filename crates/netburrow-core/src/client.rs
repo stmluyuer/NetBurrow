@@ -176,6 +176,17 @@ mod runtime {
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+    fn connection_hint(error: &io::Error) -> &'static str {
+        match error.kind() {
+            io::ErrorKind::TimedOut => "连接服务器超时：请检查服务器地址、网络和防火墙；3 秒后自动重试。修改连接设置前请先停止联机。",
+            io::ErrorKind::ConnectionRefused => "服务器拒绝连接：请确认 Relay 已启动、端口填写正确且已放行；3 秒后自动重试。修改连接设置前请先停止联机。",
+            io::ErrorKind::WouldBlock => "服务器已满：请稍后再试，或联系服务器管理员增加容量；3 秒后自动重试。",
+            io::ErrorKind::PermissionDenied => "服务器拒绝加入：请确认地址指向 NetBurrow Relay，并核对工具与服务器版本；3 秒后自动重试。可先停止联机再修改设置。",
+            io::ErrorKind::InvalidData => "服务器协议不匹配：请确认端口指向 NetBurrow Relay，且双方版本一致；3 秒后自动重试。可先停止联机再修改设置。",
+            _ => "无法连接服务器：请检查地址、域名解析、网络及 Relay 服务状态；3 秒后自动重试。查看日志可获取底层错误，修改设置前请先停止联机。",
+        }
+    }
+
     async fn read<R: AsyncRead + Unpin>(socket: &mut R) -> io::Result<Message> {
         let length = socket.read_u32().await? as usize;
         if length == 0 || length > MAX_FRAME {
@@ -226,12 +237,15 @@ mod runtime {
             let hello = timeout(IO_TIMEOUT, read(&mut input))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "join timeout"))??;
-            let Message::Welcome {
-                client_id,
-                udp_token: token,
-            } = hello
-            else {
-                return Err(io::Error::other("Relay rejected join/version"));
+            let (client_id, token) = match hello {
+                Message::Welcome { client_id, udp_token } => (client_id, udp_token),
+                Message::Error(reason) if reason == "relay is full" => {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "Relay is full"));
+                }
+                Message::Error(_) => {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Relay rejected join"));
+                }
+                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Unexpected Relay handshake")),
             };
             let (tx, events) = mpsc::channel(16);
             let tcp_tx = tx.clone();
@@ -508,8 +522,8 @@ mod runtime {
                 settings.allow_late_hook
             ),
         );
+        status(&state, Phase::Connecting, "正在连接 Relay…");
         while !*stop.borrow() {
-            status(&state, Phase::Connecting, "正在连接 Relay…");
             let result = tokio::select! { biased; _ = stop.changed() => break, result = Network::connect(settings.server.trim(), group, settings.transport) => result };
             let mut network = match result {
                 Ok(n) => n,
@@ -518,7 +532,7 @@ mod runtime {
                     status(
                         &state,
                         Phase::Connecting,
-                        "Relay 暂不可达或拒绝加入，稍后自动重试；请检查地址和服务状态",
+                        connection_hint(&error),
                     );
                     tokio::select! { _ = stop.changed() => break, _ = tokio::time::sleep(Duration::from_secs(3)) => {} }
                     continue;
@@ -567,17 +581,17 @@ mod runtime {
             }
             if result
                 .as_ref()
-                .is_err_and(|error| error.kind() == io::ErrorKind::Unsupported)
+                .is_err_and(|error| error.kind() == io::ErrorKind::Unsupported
+                    || (error.kind() == io::ErrorKind::PermissionDenied
+                        && state.lock().unwrap_or_else(|p| p.into_inner()).phase == Phase::Failed))
             {
                 change(&state, |s| {
                     s.peers.clear();
                     s.ping_ms = None;
                 });
-                status(
-                    &state,
-                    Phase::Failed,
-                    "Relay 尚不支持成员状态，请先更新服务器后重新启用",
-                );
+                if result.as_ref().is_err_and(|error| error.kind() == io::ErrorKind::Unsupported) {
+                    status(&state, Phase::Failed, "服务器版本不兼容：Relay 尚不支持成员状态，请更新服务器后重新启用联机。");
+                }
                 return;
             }
             if result.is_err() {
@@ -664,7 +678,11 @@ mod runtime {
                                 if !status_supported && reason == "message is not accepted from a client" {
                                     return Err(io::Error::new(io::ErrorKind::Unsupported, "Relay does not support member status; update Relay"));
                                 }
-                                status(state, Phase::Failed, "Relay 拒绝了当前游戏身份或数据，请检查是否重复加入"); return Err(io::Error::other("Relay rejected state"));
+                                status(state, Phase::Failed, if reason == "steam_id is already bound in this group" {
+                                    "游戏身份重复：同组已有相同 Steam 身份。请退出重复的游戏或工具实例，再重开游戏并重新启用联机。"
+                                } else {
+                                    "服务器拒绝游戏数据：请确认双方工具与服务器版本一致，查看日志后重开游戏并重新启用联机。"
+                                }); return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Relay rejected state"));
                             }
                             Some(NetworkEvent::Closed) | None => return Err(io::Error::other("Relay disconnected")),
                             _ => return Err(io::Error::other("unexpected Relay message")),
@@ -757,14 +775,14 @@ mod runtime {
                                         log("ERROR", "helper", &diagnostic);
                                         change(state, |s| { s.logs.push(diagnostic.trim().to_owned()); if s.logs.len()>64 {s.logs.remove(0);} });
                                         disconnect_hook(&mut hook, &mut pending, network).await;
-                                        status(state, Phase::RestartRequired, "Hook 加载失败，请查看日志并重开游戏");
+                                        status(state, Phase::RestartRequired, "游戏接入失败：Hook 加载失败。请完整解压工具、检查安全软件是否拦截文件，并查看日志；处理后退出游戏，从 Steam 重开。");
                                         continue;
                                     }
                                 }
                             }
                             if p.since.elapsed() > Duration::from_secs(35) && !hook.as_ref().is_some_and(|h| h.acknowledged) {
                                 disconnect_hook(&mut hook, &mut pending, network).await;
-                                status(state, Phase::RestartRequired, "等待 Hook 就绪超时，请重开游戏；当前版本可能不支持");
+                                status(state, Phase::RestartRequired, "游戏接入超时：请确认运行的是受支持的忏悔+版本，查看日志后退出游戏并从 Steam 重开。");
                             }
                         } else if games.len() > 1 {
                             status(state, Phase::RestartRequired, "发现多个游戏进程，请只保留一个并重开");
@@ -859,6 +877,34 @@ mod runtime {
         use super::*;
         use netburrow_relay::{Config, spawn};
         use tokio::time::{Duration, timeout};
+
+        #[tokio::test]
+        async fn handshake_errors_have_distinct_safe_guidance() {
+            for (reply, expected, hint) in [
+                (Message::Error("relay is full".into()), io::ErrorKind::WouldBlock, "服务器已满"),
+                (Message::Error("untrusted secret text".into()), io::ErrorKind::PermissionDenied, "服务器拒绝加入"),
+                (Message::Pong(0), io::ErrorKind::InvalidData, "服务器协议不匹配"),
+            ] {
+                let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = server.local_addr().unwrap().to_string();
+                let task = tokio::spawn(async move {
+                    let (mut socket, _) = server.accept().await.unwrap();
+                    let _ = read(&mut socket).await.unwrap();
+                    write(&mut socket, &reply).await.unwrap();
+                });
+                let error = Network::connect(&endpoint, [5; 32], Transport::Tcp).await.err().unwrap();
+                assert_eq!(error.kind(), expected);
+                assert!(connection_hint(&error).contains(hint));
+                assert!(!error.to_string().contains("untrusted secret text"));
+                task.await.unwrap();
+            }
+            let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = server.local_addr().unwrap().to_string();
+            drop(server);
+            let error = Network::connect(&endpoint, [5; 32], Transport::Tcp).await.err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+            assert!(connection_hint(&error).contains("服务器拒绝连接"));
+        }
 
         #[test]
         fn member_status_ages_and_cannot_reuse_an_old_game_epoch() {

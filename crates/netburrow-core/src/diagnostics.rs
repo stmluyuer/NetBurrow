@@ -14,7 +14,8 @@ pub fn directory() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("NetBurrow/logs")
+        .join("NetBurrow")
+        .join("logs")
 }
 pub fn init(component: &'static str) {
     let _ = COMPONENT.set(component);
