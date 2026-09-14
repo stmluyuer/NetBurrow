@@ -466,6 +466,12 @@ async fn execute_route(
             let _ = target;
         }
         Route::Rejected(text) => send_error(client_id, state, text).await,
+        Route::TargetUnavailable => {
+            increment(&state.lock().await.stats.target_unavailable);
+        }
+        Route::TargetEpochExpired => {
+            increment(&state.lock().await.stats.target_epoch_expired);
+        }
     }
 }
 
@@ -613,6 +619,8 @@ enum Route {
         datagram: Datagram,
     },
     Rejected(&'static str),
+    TargetUnavailable,
+    TargetEpochExpired,
 }
 
 impl State {
@@ -776,8 +784,9 @@ impl State {
         let Some(source) = self.clients.get(&client_id) else {
             return Route::Rejected("connection is not active");
         };
-        let Some(target_id) = self.valid_target(source, &packet) else {
-            return Route::Rejected("packet source, target, or epoch is invalid");
+        let target_id = match self.valid_target(source, &packet) {
+            Ok(id) => id,
+            Err(route) => return route,
         };
         Route::Tcp {
             target: target_id,
@@ -798,8 +807,9 @@ impl State {
         if source.token != token || source.udp_address != Some(address) {
             return Route::Rejected("UDP endpoint is not bound");
         }
-        let Some(target_id) = self.valid_target(source, &packet) else {
-            return Route::Rejected("packet source, target, or epoch is invalid");
+        let target_id = match self.valid_target(source, &packet) {
+            Ok(id) => id,
+            Err(route) => return route,
         };
         let target = &self.clients[&target_id];
         match target.udp_address {
@@ -819,21 +829,26 @@ impl State {
         }
     }
 
-    fn valid_target(&self, source: &Client, packet: &Packet) -> Option<u64> {
+    fn valid_target(&self, source: &Client, packet: &Packet) -> Result<u64, Route> {
         if source.steam_id == 0
             || source.epoch == 0
             || packet.from != source.steam_id
             || packet.source_epoch != source.epoch
         {
-            return None;
+            return Err(Route::Rejected("packet source or epoch is invalid"));
         }
-        self.clients.iter().find_map(|(id, target)| {
-            (target.group == source.group
-                && target.steam_id != 0
-                && target.steam_id == packet.to
-                && target.epoch == packet.target_epoch)
-                .then_some(*id)
-        })
+        // Members updates race with packets already in transit. A departed or
+        // restarted peer must not turn the sender's whole session into a failure.
+        // Only search this group; never expose whether an identity exists elsewhere.
+        let Some((id, target)) = self.clients.iter().find(|(_, target)| {
+            target.group == source.group && target.steam_id != 0 && target.steam_id == packet.to
+        }) else {
+            return Err(Route::TargetUnavailable);
+        };
+        if target.epoch != packet.target_epoch {
+            return Err(Route::TargetEpochExpired);
+        }
+        Ok(*id)
     }
 
     fn enqueue(&self, client_id: u64, message: Message) -> Result<(), QueueError> {
@@ -1124,6 +1139,84 @@ mod tests {
             .unwrap();
     }
 
+    async fn assert_healthy(stream: &mut TcpStream) {
+        write_tcp_message(stream, &Message::Ping(987))
+            .await
+            .unwrap();
+        // TCP ordering makes Pong a barrier for all earlier requests. Do not
+        // silently skip Error here: the real client treats it as fatal.
+        recv_until(stream, |message| {
+            assert!(!matches!(message, Message::Error(_) | Message::Data(_)));
+            matches!(message, Message::Pong(987))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn peer_unbind_restart_and_disconnect_do_not_fail_remaining_clients() {
+        let relay = spawn(Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            ..Config::default()
+        })
+        .await
+        .unwrap();
+        let (mut one, _, _) = connect(relay.local_addr(), group(1)).await;
+        let (mut two, two_id, _) = connect(relay.local_addr(), group(1)).await;
+        let (mut three, _, _) = connect(relay.local_addr(), group(1)).await;
+        bind(&mut one, 101, 1001).await;
+        bind(&mut two, 202, 2002).await;
+        bind(&mut three, 303, 3003).await;
+        assert_healthy(&mut one).await;
+        assert_healthy(&mut two).await;
+        assert_healthy(&mut three).await;
+
+        for stage in 0..3 {
+            match stage {
+                0 => bind(&mut two, 0, 0).await,
+                1 => bind(&mut two, 202, 2222).await,
+                _ => write_tcp_message(&mut two, &Message::Leave).await.unwrap(),
+            }
+            recv_until(&mut one, |message| {
+                matches!(message, Message::Members(peers) if match stage {
+                    0 => peers.iter().any(|p| p.client_id == two_id && p.epoch == 0),
+                    1 => peers.iter().any(|p| p.client_id == two_id && p.epoch == 2222),
+                    _ => peers.iter().all(|p| p.client_id != two_id),
+                })
+            })
+            .await;
+            write_tcp_message(
+                &mut one,
+                &Message::Data(packet(101, 202, 1001, 2002, 3, b"late")),
+            )
+            .await
+            .unwrap();
+            write_tcp_message(
+                &mut three,
+                &Message::Data(packet(303, 202, 3003, 2002, 3, b"late")),
+            )
+            .await
+            .unwrap();
+            assert_healthy(&mut one).await;
+            assert_healthy(&mut three).await;
+            if stage == 1 {
+                assert_healthy(&mut two).await; // Old data did not reach the new game.
+            }
+            let data = Message::Data(packet(101, 303, 1001, 3003, 3, b"still online"));
+            write_tcp_message(&mut one, &data).await.unwrap();
+            assert_eq!(
+                recv_until(&mut three, |m| matches!(m, Message::Data(_))).await,
+                data
+            );
+            let reply = Message::Data(packet(303, 101, 3003, 1001, 3, b"reply"));
+            write_tcp_message(&mut three, &reply).await.unwrap();
+            assert_eq!(
+                recv_until(&mut one, |m| matches!(m, Message::Data(_))).await,
+                reply
+            );
+        }
+        relay.shutdown().await.unwrap();
+    }
+
     fn member_status(name: &str, phase: u8, transport: u8) -> MemberStatus {
         MemberStatus {
             name: name.into(),
@@ -1133,6 +1226,88 @@ mod tests {
             sent: 5,
             received: 7,
         }
+    }
+
+    #[tokio::test]
+    async fn stale_udp_targets_are_dropped_but_source_checks_remain_enforced() {
+        let mut state = State::new(4096);
+        let one = add_state_client(&mut state, group(1));
+        let two = add_state_client(&mut state, group(1));
+        let other = add_state_client(&mut state, group(2));
+        let now = Instant::now();
+        state.bind(one, 101, 1001, now).unwrap();
+        state.bind(two, 202, 2002, now).unwrap();
+        state.bind(other, 303, 3003, now).unwrap();
+        let address = "127.0.0.1:12345".parse().unwrap();
+        let token = state.clients[&one].token;
+        state.clients.get_mut(&one).unwrap().udp_address = Some(address);
+        let data = packet(101, 202, 1001, 2002, 1, b"late");
+        assert!(
+            matches!(state.route_udp(one, token, address, data.clone()), Route::Tcp { target, .. } if target == two)
+        );
+        state.clients.get_mut(&two).unwrap().udp_address = Some(address);
+        assert!(
+            matches!(state.route_udp(one, token, address, data.clone()), Route::Udp { target, .. } if target == two)
+        );
+
+        state.bind(two, 202, 2222, now).unwrap();
+        let expired = state.route_udp(one, token, address, data.clone());
+        assert!(matches!(expired, Route::TargetEpochExpired));
+        state.bind(two, 0, 0, now).unwrap();
+        let unavailable = state.route_udp(one, token, address, data.clone());
+        assert!(matches!(unavailable, Route::TargetUnavailable));
+        state.remove(two, now);
+        assert!(matches!(
+            state.route_udp(one, token, address, data.clone()),
+            Route::TargetUnavailable
+        ));
+        assert!(matches!(
+            state.route_udp(
+                one,
+                token,
+                address,
+                packet(101, 303, 1001, 3003, 1, b"isolated")
+            ),
+            Route::TargetUnavailable
+        ));
+
+        let mut bad_token = token;
+        bad_token[0] ^= 1;
+        assert!(matches!(
+            state.route_udp(one, bad_token, address, data.clone()),
+            Route::Rejected("UDP endpoint is not bound")
+        ));
+        assert!(matches!(
+            state.route_udp(one, token, "127.0.0.1:12346".parse().unwrap(), data.clone()),
+            Route::Rejected("UDP endpoint is not bound")
+        ));
+        for invalid in [
+            packet(999, 202, 1001, 2002, 1, b"spoofed"),
+            packet(101, 202, 9999, 2002, 1, b"old source"),
+        ] {
+            assert!(matches!(
+                state.route_tcp(one, invalid.clone()),
+                Route::Rejected("packet source or epoch is invalid")
+            ));
+            assert!(matches!(
+                state.route_udp(one, token, address, invalid),
+                Route::Rejected("packet source or epoch is invalid")
+            ));
+        }
+        state.bind(one, 0, 0, now).unwrap();
+        assert!(matches!(
+            state.route_tcp(one, data),
+            Route::Rejected("packet source or epoch is invalid")
+        ));
+
+        let state = Arc::new(Mutex::new(state));
+        execute_route(one, expired, &state, None).await;
+        execute_route(one, unavailable, &state, None).await;
+        let state = state.lock().await;
+        assert_eq!(state.stats.target_epoch_expired.load(Ordering::Relaxed), 1);
+        assert_eq!(state.stats.target_unavailable.load(Ordering::Relaxed), 1);
+        assert_eq!(state.stats.protocol_rejected.load(Ordering::Relaxed), 0);
+        assert_eq!(state.stats.queue_failed.load(Ordering::Relaxed), 0);
     }
 
     fn add_state_client(state: &mut State, group: Group) -> u64 {
@@ -1399,10 +1574,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(
-            recv_until(&mut one, |m| matches!(m, Message::Error(_))).await,
-            Message::Error(_)
-        ));
+        assert_healthy(&mut one).await;
+        assert_healthy(&mut other).await;
         relay.shutdown().await.unwrap();
     }
 

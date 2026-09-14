@@ -34,6 +34,8 @@ pub(crate) struct Stats {
     pub udp_invalid: AtomicU64,
     pub udp_bind_rejected: AtomicU64,
     pub protocol_rejected: AtomicU64,
+    pub target_unavailable: AtomicU64,
+    pub target_epoch_expired: AtomicU64,
     pub queue_failed: AtomicU64,
     pub io_failed: AtomicU64,
 }
@@ -48,7 +50,7 @@ impl Stats {
     ) -> String {
         let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         format!(
-            "online={online} game_bound={game_bound} udp_bound={udp_bound} queued_bytes={queued_bytes} accepted={} joined={} disconnected={} handshake_rejected={} capacity_rejected={} tcp_data_received={} tcp_data_written={} udp_data_received={} udp_data_sent={} udp_invalid={} udp_bind_rejected={} protocol_rejected={} queue_failed={} io_failed={}",
+            "online={online} game_bound={game_bound} udp_bound={udp_bound} queued_bytes={queued_bytes} accepted={} joined={} disconnected={} handshake_rejected={} capacity_rejected={} tcp_data_received={} tcp_data_written={} udp_data_received={} udp_data_sent={} udp_invalid={} udp_bind_rejected={} protocol_rejected={} target_unavailable={} target_epoch_expired={} queue_failed={} io_failed={}",
             get(&self.accepted),
             get(&self.joined),
             get(&self.disconnected),
@@ -61,6 +63,8 @@ impl Stats {
             get(&self.udp_invalid),
             get(&self.udp_bind_rejected),
             get(&self.protocol_rejected),
+            get(&self.target_unavailable),
+            get(&self.target_epoch_expired),
             get(&self.queue_failed),
             get(&self.io_failed),
         )

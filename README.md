@@ -61,6 +61,8 @@ NetBurrow 是给《以撒的结合：忏悔+》朋友联机使用的 Windows 工
 
 Relay 的 stderr 由服务器上的 systemd journal 收集。它只记录生命周期事件，以及每 10 秒一次的在线数、已绑定游戏数、TCP/UDP 投递数、拒绝数和队列字节等累计汇总；不会逐包记录，也不会写入组码、token、显示名、SteamID、IP 或 payload。查看、导出和保留策略核查命令见 [服务器部署说明](docs/server-ai-handoff.md)；不要为排障擅自调整全局 `journald` 配置。
 
+成员退出或重开游戏时，Relay 会丢弃仍发往旧目标的 TCP/UDP 数据，避免发送方因残留包而退出联机。汇总中的 `target_unavailable` 表示同组目标当前不可用，`target_epoch_expired` 表示目标游戏实例已改变；发送方身份或实例不匹配仍记录为 `packet source or epoch is invalid` 并拒绝。此修复需要更新 Relay 才会生效，仅更新客户端不能修复旧 Relay 的连带断线；它也不保证游戏在房主退出后能够继续当前对局。
+
 ## 开发者打包
 
 日常只打包客户端：右键仓库根目录的 `打包客户端.ps1`，选择“使用 PowerShell 运行”。脚本自动构建 x64 客户端与 32 位注入器/DLL、整理许可证并生成 `.local\dist\NetBurrow-<版本>-win-x64.zip`；成功后打开产物目录，窗口会保留结果，按回车关闭。默认每次打包将根 Cargo.toml 的修订号加 1（例如 0.1.0 → 0.1.1），同步 Cargo.lock，保留其他版本的 ZIP。

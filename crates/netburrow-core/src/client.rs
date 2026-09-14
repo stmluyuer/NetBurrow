@@ -944,6 +944,7 @@ mod runtime {
             | "steam_id is already bound in this group"
             | "connection is not active"
             | "packet source, target, or epoch is invalid"
+            | "packet source or epoch is invalid"
             | "UDP endpoint is not bound"
             | "target connection is slow"
             | "target connection closed"
