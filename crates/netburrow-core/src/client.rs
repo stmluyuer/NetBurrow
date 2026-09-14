@@ -44,10 +44,28 @@ pub struct Snapshot {
     pub udp_sent: u64,
     pub udp_received: u64,
     pub ping_ms: Option<u64>,
+    pub rtt_samples: std::collections::VecDeque<u64>,
+    pub last_pong_at: Option<std::time::Instant>,
+    pub last_disconnect_at: Option<std::time::Instant>,
+    pub disconnects: u64,
+    pub heartbeat_timeouts: u64,
     pub logs: Vec<String>,
 }
 
 type Shared = Arc<Mutex<Snapshot>>;
+
+pub(crate) fn probe_relay(settings: &Settings) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|error| format!("无法启动自检：{error}"))?;
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(8), runtime::probe(settings)).await
+                .map_err(|_| "服务器自检超时，请检查网络、地址和端口后重试。".to_owned())?
+        })
+    }
+    #[cfg(not(windows))]
+    { let _ = settings; Err("客户端自检需要 Windows".into()) }
+}
 fn change(shared: &Shared, update: impl FnOnce(&mut Snapshot)) {
     update(&mut shared.lock().unwrap_or_else(|p| p.into_inner()));
 }
@@ -175,6 +193,25 @@ mod runtime {
 
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
     const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    pub(super) async fn probe(settings: &Settings) -> Result<(), String> {
+        let group = parse_group(&settings.group)?;
+        let mut network = Network::connect(settings.server.trim(), group, Transport::Tcp).await
+            .map_err(|error| connection_hint(&error).split('；').next().unwrap_or("服务器连接失败").to_owned())?;
+        network.send(&Message::Status(MemberStatus { name: String::new(), phase: 0, ping_ms: None, transport: 0, sent: 0, received: 0 })).await
+            .map_err(|_| "服务器状态检查发送失败，请稍后重试。".to_owned())?;
+        let result = loop {
+            match network.events.recv().await {
+                Some(NetworkEvent::Tcp(Message::Statuses(_))) => break Ok(()),
+                Some(NetworkEvent::Tcp(Message::Members(_))) => {},
+                Some(NetworkEvent::Tcp(Message::Ping(value))) => { if network.send(&Message::Pong(value)).await.is_err() { break Err("服务器连接中断，请重试。".into()); } },
+                Some(NetworkEvent::Tcp(Message::Error(_))) => break Err("服务器拒绝状态检查，请确认连接的是支持成员状态的 NetBurrow Relay。".into()),
+                _ => break Err("服务器握手或协议检查失败，请检查地址和服务状态。".into()),
+            }
+        };
+        let _ = network.send(&Message::Leave).await;
+        result
+    }
 
     fn connection_hint(error: &io::Error) -> &'static str {
         match error.kind() {
@@ -546,6 +583,8 @@ mod runtime {
             change(&state, |s| {
                 s.peers.clear();
                 s.ping_ms = None;
+                s.rtt_samples.clear();
+                s.last_pong_at = None;
             });
             status(
                 &state,
@@ -578,6 +617,12 @@ mod runtime {
             }
             if *stop.borrow() {
                 break;
+            }
+            if result.is_err() {
+                change(&state, |s| {
+                    s.disconnects += 1;
+                    s.last_disconnect_at = Some(std::time::Instant::now());
+                });
             }
             if result
                 .as_ref()
@@ -670,9 +715,31 @@ mod runtime {
                             }
                             Some(NetworkEvent::Tcp(Message::Data(packet))) => deliver(packet, false, &peers, &mut hook, state).await?,
                             Some(NetworkEvent::Udp(packet)) => deliver(packet, true, &peers, &mut hook, state).await?,
-                            Some(NetworkEvent::Tcp(Message::Pong(sequence))) => { last_pong = Instant::now(); change(state, |s| s.ping_ms = Some((since.elapsed().as_millis() as u64).saturating_sub(sequence))); }
+                            Some(NetworkEvent::Tcp(Message::Pong(sequence))) => {
+                                last_pong = Instant::now();
+                                change(state, |s| {
+                                    let ping = (since.elapsed().as_millis() as u64).saturating_sub(sequence);
+                                    s.ping_ms = Some(ping);
+                                    s.last_pong_at = Some(std::time::Instant::now());
+                                    s.rtt_samples.push_back(ping);
+                                    if s.rtt_samples.len() > 20 { s.rtt_samples.pop_front(); }
+                                });
+                            }
                             Some(NetworkEvent::Tcp(Message::Ping(value))) => network.send(&Message::Pong(value)).await?,
                             Some(NetworkEvent::UdpBound) => { network.udp_bound = true; log("INFO", "udp", "endpoint bound; unreliable packets may use UDP"); }
+                            Some(NetworkEvent::Tcp(Message::Error(reason))) if matches!(reason.as_str(), "target connection is slow" | "target connection closed") => {
+                                log("WARN", "relay peer disconnected", relay_reason(&reason));
+                                // Members is authoritative for peer cleanup; these errors carry no target identity.
+                                let phase = state.lock().unwrap_or_else(|p| p.into_inner()).phase;
+                                status(state, phase, if reason == "target connection is slow" {
+                                    "对方连接拥堵或接收不及时，已断开；本机仍连接 Relay，可等待对方重新加入。"
+                                } else {
+                                    "对方连接已关闭；本机仍连接 Relay，可等待对方重新加入。"
+                                });
+                            }
+                            Some(NetworkEvent::Tcp(Message::Error(reason))) if reason == "status reports are limited to once per second" => {
+                                log("WARN", "relay status throttled", relay_reason(&reason));
+                            }
                             Some(NetworkEvent::Tcp(Message::Error(reason))) => {
                                 log("ERROR", "relay rejected", relay_reason(&reason));
                                 if !status_supported && reason == "message is not accepted from a client" {
@@ -681,7 +748,7 @@ mod runtime {
                                 status(state, Phase::Failed, if reason == "steam_id is already bound in this group" {
                                     "游戏身份重复：同组已有相同 Steam 身份。请退出重复的游戏或工具实例，再重开游戏并重新启用联机。"
                                 } else {
-                                    "服务器拒绝游戏数据：请确认双方工具与服务器版本一致，查看日志后重开游戏并重新启用联机。"
+                                    "服务器拒绝游戏数据：请查看排查日志中的具体原因，再重开游戏并重新启用联机。"
                                 }); return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Relay rejected state"));
                             }
                             Some(NetworkEvent::Closed) | None => return Err(io::Error::other("Relay disconnected")),
@@ -746,7 +813,10 @@ mod runtime {
                             change(state, |s| log("INFO", "traffic", &format!("sent={} received={} udp_sent={} udp_received={} ping_ms={:?} udp_bound={}", s.sent, s.received, s.udp_sent, s.udp_received, s.ping_ms, network.udp_bound)));
                             last_stats = Instant::now();
                         }
-                        if last_pong.elapsed() > Duration::from_secs(15) { return Err(io::Error::new(io::ErrorKind::TimedOut, "Relay heartbeat timeout")); }
+                        if last_pong.elapsed() > Duration::from_secs(15) {
+                            change(state, |s| s.heartbeat_timeouts += 1);
+                            return Err(io::Error::new(io::ErrorKind::TimedOut, "Relay heartbeat timeout"));
+                        }
                         if last_ping.elapsed() >= Duration::from_secs(1) {
                             network.send(&Message::Ping(since.elapsed().as_millis() as u64)).await?;
                             if settings.transport == Transport::Udp && !network.udp_bound { network.bind_udp().await?; }
@@ -841,6 +911,7 @@ mod runtime {
             | "target connection closed"
             | "invalid TCP data"
             | "invalid UDP data"
+            | "status reports are limited to once per second"
             | "Join is only valid during handshake"
             | "message is not accepted from a client" => reason,
             _ => "unrecognized server error (text omitted)",
@@ -877,6 +948,26 @@ mod runtime {
         use super::*;
         use netburrow_relay::{Config, spawn};
         use tokio::time::{Duration, timeout};
+
+        #[tokio::test]
+        async fn preflight_probes_existing_protocol_and_rejects_unsupported_server() {
+            let relay = spawn(Config { bind: "127.0.0.1:0".parse().unwrap(), ..Config::default() }).await.unwrap();
+            let mut settings = Settings { server: relay.local_addr().to_string(), group: crate::new_group().unwrap(), ..Settings::default() };
+            timeout(Duration::from_secs(3), probe(&settings)).await.unwrap().unwrap();
+            relay.shutdown().await.unwrap();
+            let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            settings.server = server.local_addr().unwrap().to_string();
+            let task = tokio::spawn(async move {
+                let (mut socket, _) = server.accept().await.unwrap();
+                assert!(matches!(read(&mut socket).await.unwrap(), Message::Join { .. }));
+                write(&mut socket, &Message::Welcome { client_id: 1, udp_token: [8; 16] }).await.unwrap();
+                assert!(matches!(read(&mut socket).await.unwrap(), Message::Status(_)));
+                write(&mut socket, &Message::Error("message is not accepted from a client".into())).await.unwrap();
+                assert!(matches!(read(&mut socket).await.unwrap(), Message::Leave));
+            });
+            assert!(timeout(Duration::from_secs(3), probe(&settings)).await.unwrap().unwrap_err().contains("状态检查"));
+            task.await.unwrap();
+        }
 
         #[tokio::test]
         async fn handshake_errors_have_distinct_safe_guidance() {
@@ -1003,6 +1094,62 @@ mod runtime {
             })
             .await
             .expect("member statuses did not arrive")
+        }
+
+        #[tokio::test]
+        async fn nonfatal_errors_keep_relay_session_alive() {
+            for (reason, hint) in [
+                ("target connection is slow", "对方连接拥堵"),
+                ("target connection closed", "对方连接已关闭"),
+                ("status reports are limited to once per second", ""),
+            ] {
+                let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = server.local_addr().unwrap().to_string();
+                let (stop, mut stopped) = watch::channel(false);
+                let task = tokio::spawn(async move {
+                    let (mut socket, _) = server.accept().await.unwrap();
+                    assert!(matches!(read(&mut socket).await.unwrap(), Message::Join { .. }));
+                    write(&mut socket, &Message::Welcome {
+                        client_id: 1, udp_token: [8; 16],
+                    }).await.unwrap();
+                    write(&mut socket, &Message::Error(reason.into())).await.unwrap();
+                    write(&mut socket, &Message::Ping(12345)).await.unwrap();
+                    loop {
+                        match read(&mut socket).await.unwrap() {
+                            Message::Pong(12345) => break,
+                            Message::Ping(n) => write(&mut socket, &Message::Pong(n)).await.unwrap(),
+                            Message::Status(_) | Message::Bind { .. } => {},
+                            other => panic!("unexpected message after peer error: {other:?}"),
+                        }
+                    }
+                    stop.send(true).unwrap();
+                    // Keep the socket alive until the client's normal shutdown.
+                    let _ = read(&mut socket).await;
+                });
+                let mut network = Network::connect(&endpoint, [5; 32], Transport::Tcp).await.unwrap();
+                let ipc = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let state = Arc::new(Mutex::new(Snapshot {
+                    phase: Phase::Ready,
+                    ..Snapshot::default()
+                }));
+                let settings = Settings { allow_late_hook: true, ..Settings::default() };
+                let result = timeout(Duration::from_secs(2), connected(
+                    &settings, Path::new("missing-binaries"), Path::new("missing-game"),
+                    &ipc, ipc.local_addr().unwrap().port(), &mut HashSet::new(),
+                    &mut network, &mut stopped, &state,
+                )).await.expect("client stopped responding after peer error");
+                assert!(result.is_ok(), "peer error terminated session: {result:?}");
+                let snapshot = state.lock().unwrap().clone();
+                assert_eq!(snapshot.phase, Phase::Ready);
+                assert!(snapshot.detail.contains(hint));
+                if reason == "status reports are limited to once per second" {
+                    assert!(snapshot.detail.is_empty());
+                    assert_eq!(relay_reason(reason), reason);
+                }
+                assert!(!snapshot.detail.contains("版本"));
+                drop(network);
+                task.await.unwrap();
+            }
         }
 
         #[tokio::test]

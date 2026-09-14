@@ -21,6 +21,12 @@ pub struct WindowPlacement {
 
 fn enabled_by_default() -> bool { true }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentConnection {
+    pub server: String,
+    pub group: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -38,6 +44,10 @@ pub struct Settings {
     pub notifications_enabled: bool,
     #[serde(default)]
     pub window_placement: Option<WindowPlacement>,
+    #[serde(default)]
+    pub start_minimized: bool,
+    #[serde(default)]
+    pub recent_connections: Vec<RecentConnection>,
 }
 
 impl Default for Settings {
@@ -54,11 +64,29 @@ impl Default for Settings {
             minimize_on_close: false,
             notifications_enabled: true,
             window_placement: None,
+            start_minimized: false,
+            recent_connections: Vec::new(),
         }
     }
 }
 
 impl Settings {
+    pub fn same_connection(&self, other: &Self) -> bool {
+        self.server.trim().eq_ignore_ascii_case(other.server.trim())
+            && self.group.trim().eq_ignore_ascii_case(other.group.trim())
+            && self.game_path.trim() == other.game_path.trim()
+            && self.transport == other.transport
+            && self.allow_late_hook == other.allow_late_hook
+            && self.display_name.trim() == other.display_name.trim()
+    }
+
+    pub fn remember_connection(&mut self) {
+        let recent = RecentConnection { server: self.server.trim().into(), group: self.group.trim().into() };
+        self.recent_connections.retain(|entry| !entry.server.eq_ignore_ascii_case(&recent.server) || !entry.group.eq_ignore_ascii_case(&recent.group));
+        self.recent_connections.insert(0, recent);
+        self.recent_connections.truncate(5);
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.display_name.chars().count() > 24 || self.display_name.chars().any(char::is_control)
         {
@@ -75,6 +103,10 @@ impl Settings {
             return Err("服务器地址或端口无效".into());
         }
         parse_group(&self.group)?;
+        self.validate_game()
+    }
+
+    pub fn validate_game(&self) -> Result<(), String> {
         let path = Path::new(self.game_path.trim());
         if !path.is_file() {
             return Err("请选择实际存在的 isaac-ng.exe".into());
@@ -149,6 +181,20 @@ pub fn save_settings(settings: &Settings) -> Result<(), String> {
     save_settings_in(&config_directory(), settings)
 }
 
+/// Save only the settings page fields, preserving home-page connection values and preferences.
+pub fn save_game_settings(draft: &Settings) -> Result<(), String> {
+    draft.validate_game()?;
+    save_game_settings_in(&config_directory(), draft)
+}
+
+fn save_game_settings_in(dir: &Path, draft: &Settings) -> Result<(), String> {
+    update_preferences_in(dir, |saved| {
+        saved.game_path = draft.game_path.trim().into();
+        saved.transport = draft.transport;
+        saved.allow_late_hook = draft.allow_late_hook;
+    })
+}
+
 pub fn save_minimize_on_close(enabled: bool) -> Result<(), String> {
     save_minimize_on_close_in(&config_directory(), enabled)
 }
@@ -159,6 +205,14 @@ pub fn save_notifications_enabled(enabled: bool) -> Result<(), String> {
 
 pub fn save_window_placement(placement: WindowPlacement) -> Result<(), String> {
     update_preferences_in(&config_directory(), |settings| settings.window_placement = Some(placement))
+}
+
+pub fn save_start_minimized(enabled: bool) -> Result<(), String> {
+    update_preferences_in(&config_directory(), |settings| settings.start_minimized = enabled)
+}
+
+pub fn save_recent_connections(recent: &[RecentConnection]) -> Result<(), String> {
+    update_preferences_in(&config_directory(), |settings| settings.recent_connections = recent.iter().take(5).cloned().collect())
 }
 
 fn save_minimize_on_close_in(dir: &Path, enabled: bool) -> Result<(), String> {
@@ -213,6 +267,27 @@ pub fn autodetect_game() -> Option<PathBuf> {
 mod tests {
     use super::*;
     #[test]
+    fn history_is_bounded_deduplicated_and_preferences_are_not_connection_edits() {
+        let mut value = Settings::default();
+        let original = value.clone();
+        value.start_minimized = true;
+        value.notifications_enabled = false;
+        assert!(value.same_connection(&original));
+        for index in 0..7 {
+            value.server = format!("relay{index}:24872");
+            value.group = new_group().unwrap();
+            value.remember_connection();
+        }
+        assert_eq!(value.recent_connections.len(), 5);
+        value.remember_connection();
+        assert_eq!(value.recent_connections.len(), 5);
+        assert_eq!(value.recent_connections[0].server, "relay6:24872");
+        assert!(!value.same_connection(&original));
+        let current = value.clone();
+        value.display_name = "new name".into();
+        assert!(!value.same_connection(&current));
+    }
+    #[test]
     fn preference_save_preserves_connection_and_corrupt_file() {
         let dir = std::env::temp_dir().join(format!("netburrow-preferences-{}-{}", std::process::id(), new_group().unwrap()));
         let saved = Settings { server: "saved.example:24872".into(), group: new_group().unwrap(), ..Settings::default() };
@@ -222,19 +297,37 @@ mod tests {
         assert!(loaded.minimize_on_close);
         assert_eq!(loaded.server, saved.server);
         assert_eq!(loaded.group, saved.group);
+        let draft = Settings { server: "unsaved.example:24872".into(), group: new_group().unwrap(), game_path: "new-game-path".into(), transport: Transport::Udp, allow_late_hook: true, ..saved.clone() };
+        save_game_settings_in(&dir, &draft).unwrap();
+        let merged = read_settings(&dir.join("settings.json")).unwrap();
+        assert_eq!(merged.server, saved.server);
+        assert_eq!(merged.group, saved.group);
+        assert_eq!(merged.game_path, draft.game_path);
+        assert_eq!(merged.transport, Transport::Udp);
+        assert!(merged.allow_late_hook && merged.minimize_on_close);
         let placement = WindowPlacement { normal: [50, 60, 690, 880], maximized: true };
         update_preferences_in(&dir, |settings| {
             settings.notifications_enabled = false;
             settings.window_placement = Some(placement.clone());
+            settings.start_minimized = true;
+            settings.recent_connections = vec![RecentConnection { server: "history.example:24872".into(), group: new_group().unwrap() }];
         }).unwrap();
         let loaded = read_settings(&dir.join("settings.json")).unwrap();
         assert!(!loaded.notifications_enabled);
+        assert!(loaded.start_minimized);
+        assert_eq!(loaded.recent_connections.len(), 1);
         assert_eq!(loaded.window_placement, Some(placement));
         assert!(loaded.minimize_on_close);
         assert_eq!(loaded.group, saved.group);
         assert_eq!(loaded.server, saved.server);
+        update_preferences_in(&dir, |settings| settings.recent_connections.clear()).unwrap();
+        let after_remove = read_settings(&dir.join("settings.json")).unwrap();
+        assert!(after_remove.recent_connections.is_empty());
+        assert_eq!(after_remove.group, saved.group);
+        assert!(after_remove.start_minimized);
         fs::write(dir.join("settings.json"), b"{broken}").unwrap();
         assert!(save_minimize_on_close_in(&dir, false).is_err());
+        assert!(save_game_settings_in(&dir, &draft).is_err());
         assert_eq!(fs::read(dir.join("settings.json")).unwrap(), b"{broken}");
         fs::remove_file(dir.join("settings.json")).unwrap();
         save_minimize_on_close_in(&dir, true).unwrap();
@@ -271,6 +364,8 @@ mod tests {
             minimize_on_close: true,
             notifications_enabled: false,
             window_placement: Some(WindowPlacement { normal: [50, 60, 690, 880], maximized: false }),
+            start_minimized: true,
+            recent_connections: vec![RecentConnection { server: "localhost:24872".into(), group: new_group().unwrap() }],
         };
         let encoded = serde_json::to_vec(&value).unwrap();
         let decoded: Settings = serde_json::from_slice(&encoded).unwrap();
@@ -280,6 +375,8 @@ mod tests {
         assert!(decoded.minimize_on_close);
         assert!(!decoded.notifications_enabled);
         assert_eq!(decoded.window_placement, value.window_placement);
+        assert!(decoded.start_minimized);
+        assert_eq!(decoded.recent_connections, value.recent_connections);
         assert_eq!(decoded.display_name, "测试玩家");
         let mut legacy = serde_json::to_value(&value).unwrap();
         legacy.as_object_mut().unwrap().remove("allow_late_hook");
@@ -287,11 +384,15 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("minimize_on_close");
         legacy.as_object_mut().unwrap().remove("notifications_enabled");
         legacy.as_object_mut().unwrap().remove("window_placement");
+        legacy.as_object_mut().unwrap().remove("start_minimized");
+        legacy.as_object_mut().unwrap().remove("recent_connections");
         let legacy: Settings = serde_json::from_value(legacy).unwrap();
         assert!(!legacy.allow_late_hook);
         assert!(!legacy.minimize_on_close);
         assert!(legacy.notifications_enabled);
         assert!(legacy.window_placement.is_none());
+        assert!(!legacy.start_minimized);
+        assert!(legacy.recent_connections.is_empty());
         assert!(!Settings::default().minimize_on_close);
         assert!(legacy.display_name.is_empty());
         assert_eq!(legacy.group, value.group);

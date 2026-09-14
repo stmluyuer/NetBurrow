@@ -52,6 +52,10 @@ fn build_report(logs: &Path, settings: &Settings, snapshot: &Snapshot) -> String
     if let Some(hex) = settings.group.strip_prefix("NB1-") {
         secrets.push(hex.to_owned());
     }
+    for recent in &settings.recent_connections {
+        secrets.push(recent.server.clone());
+        secrets.push(recent.group.clone());
+    }
     for peer in &snapshot.peers {
         if let Some(report) = &peer.status {
             secrets.push(report.name.clone());
