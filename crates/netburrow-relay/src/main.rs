@@ -1,4 +1,4 @@
-use std::{future, net::SocketAddr, process::ExitCode};
+use std::{net::SocketAddr, process::ExitCode};
 
 use netburrow_relay::{Config, serve};
 
@@ -13,7 +13,7 @@ async fn main() -> ExitCode {
             println!("configuration is valid");
             ExitCode::SUCCESS
         }
-        Ok((config, false)) => match serve(config, future::pending()).await {
+        Ok((config, false)) => match serve(config, shutdown_signal()).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("relay failed: {error}");
@@ -26,6 +26,28 @@ async fn main() -> ExitCode {
             );
             ExitCode::FAILURE
         }
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => {
+                        if let Err(error) = result { eprintln!("shutdown signal failed: {error}"); }
+                    }
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(error) => eprintln!("cannot install termination handler: {error}"),
+        }
+    }
+    #[cfg(not(unix))]
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        eprintln!("shutdown signal failed: {error}");
     }
 }
 

@@ -1,6 +1,10 @@
 //! In-memory NB v1 relay.  A group exists only while one or more TCP clients
 //! are connected; no group credential, payload, or remote endpoint is logged.
 
+mod diagnostics;
+
+use diagnostics::{Stats, increment, record};
+
 use std::{
     collections::HashMap,
     future::Future,
@@ -141,34 +145,74 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let state = Arc::new(Mutex::new(State::new(config.total_outgoing_bytes)));
+    let stats = state.lock().await.stats.clone();
+    record(
+        "INFO",
+        "started",
+        format_args!(
+            "port={} max_clients={} protocol=NBP1 member_status=true",
+            tcp.local_addr()?.port(),
+            config.max_clients
+        ),
+    );
     let (stopping, _) = watch::channel(false);
-    let udp_task = tokio::spawn(udp_loop(udp, state.clone(), stopping.subscribe()));
+    let mut udp_task = tokio::spawn(udp_loop(udp, state.clone(), stopping.subscribe()));
     let mut clients = JoinSet::new();
+    let mut summary = tokio::time::interval(Duration::from_secs(10));
+    summary.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tokio::pin!(shutdown);
 
-    loop {
+    let result = loop {
         tokio::select! {
-            _ = &mut shutdown => break,
+            _ = &mut shutdown => break Ok(()),
+            _ = summary.tick() => {
+                let line = state.lock().await.summary();
+                record("INFO", "summary", format_args!("{line}"));
+            }
+            result = &mut udp_task => {
+                increment(&stats.io_failed);
+                record("ERROR", "udp_loop_stopped", format_args!("task_failed={}", result.is_err()));
+                break Err(io::Error::other("UDP receive loop stopped"));
+            }
             accepted = tcp.accept() => match accepted {
                 Ok((stream, address)) => {
+                    increment(&stats.accepted);
                     if state.lock().await.count() >= config.max_clients {
+                        increment(&stats.capacity_rejected);
                         drop(stream);
                     } else {
                         clients.spawn(client_loop(stream, address, state.clone(), config.clone(), stopping.subscribe()));
                     }
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    increment(&stats.io_failed);
+                    record("ERROR", "accept_failed", format_args!("kind={:?}", error.kind()));
+                    break Err(error);
+                },
             },
-            Some(_) = clients.join_next(), if !clients.is_empty() => {},
+            Some(result) = clients.join_next(), if !clients.is_empty() => {
+                if result.is_err() {
+                    increment(&stats.io_failed);
+                    record("ERROR", "client_task_failed", format_args!(""));
+                }
+            },
         }
-    }
+    };
 
     let _ = stopping.send(true);
     clients.abort_all();
     while clients.join_next().await.is_some() {}
-    udp_task.abort();
-    let _ = udp_task.await;
-    Ok(())
+    if !udp_task.is_finished() {
+        udp_task.abort();
+        let _ = udp_task.await;
+    }
+    let line = state.lock().await.summary();
+    record(
+        "INFO",
+        "stopped",
+        format_args!("success={} {line}", result.is_ok()),
+    );
+    result
 }
 
 async fn client_loop(
@@ -178,11 +222,13 @@ async fn client_loop(
     config: Config,
     mut stopping: watch::Receiver<bool>,
 ) {
+    let stats = state.lock().await.stats.clone();
     let first = tokio::select! {
         result = tokio::time::timeout(config.handshake_timeout, read_tcp_message(&mut stream)) => result,
         _ = stopping.changed() => return,
     };
     let Ok(Ok(Message::Join { group })) = first else {
+        increment(&stats.handshake_rejected);
         let _ = write_tcp_message(
             &mut stream,
             &Message::Error("first message must be Join".into()),
@@ -205,10 +251,13 @@ async fn client_loop(
         )
     };
     let Ok(joined) = joined else {
+        increment(&stats.capacity_rejected);
         let _ = write_tcp_message(&mut stream, &Message::Error("relay is full".into())).await;
         return;
     };
     let (client_id, token, members, notices) = joined;
+    increment(&stats.joined);
+    record("INFO", "joined", format_args!("client={client_id}"));
     {
         let locked = state.lock().await;
         let _ = locked.enqueue(
@@ -226,12 +275,25 @@ async fn client_loop(
 
     let (reader, writer) = stream.into_split();
     let writer_stop = stopping.clone();
-    let writer_task = tokio::spawn(writer_loop(writer, receiver, writer_stop, closed.clone()));
+    let writer_task = tokio::spawn(writer_loop(
+        writer,
+        receiver,
+        writer_stop,
+        closed.clone(),
+        stats.clone(),
+    ));
     let mut reader = reader;
     loop {
         tokio::select! {
             message = read_tcp_message(&mut reader) => {
-                let Ok(message) = message else { break; };
+                let message = match message {
+                    Ok(message) => message,
+                    Err(error) => {
+                        if error.kind() != ErrorKind::UnexpectedEof { increment(&stats.io_failed); }
+                        record("INFO", "read_closed", format_args!("client={client_id} kind={:?}", error.kind()));
+                        break;
+                    }
+                };
                 let leave = handle_tcp_message(client_id, message, &state).await;
                 if leave { break; }
             }
@@ -257,6 +319,11 @@ async fn handle_tcp_message(client_id: u64, message: Message, state: &Arc<Mutex<
                 .bind(client_id, steam_id, epoch, Instant::now());
             match result {
                 Ok(notices) => {
+                    record(
+                        "INFO",
+                        "game_binding",
+                        format_args!("client={client_id} bound={}", steam_id != 0 && epoch != 0),
+                    );
                     let locked = state.lock().await;
                     for notice in notices {
                         let _ = locked.enqueue(notice.target, notice.message);
@@ -283,7 +350,11 @@ async fn handle_tcp_message(client_id: u64, message: Message, state: &Arc<Mutex<
             false
         }
         Message::Data(packet) => {
-            let action = state.lock().await.route_tcp(client_id, packet);
+            let action = {
+                let locked = state.lock().await;
+                increment(&locked.stats.tcp_data_received);
+                locked.route_tcp(client_id, packet)
+            };
             execute_route(client_id, action, state, None).await;
             false
         }
@@ -308,24 +379,39 @@ async fn udp_loop(
     state: Arc<Mutex<State>>,
     mut stopping: watch::Receiver<bool>,
 ) {
+    let stats = state.lock().await.stats.clone();
     let mut buffer = vec![0; netburrow_protocol::UDP_LIMIT + 1];
     loop {
         tokio::select! {
             received = udp.recv_from(&mut buffer) => {
-                let Ok((length, source)) = received else { return; };
-                let Ok(datagram) = decode_datagram(&buffer[..length]) else { continue; };
+                let (length, source) = match received {
+                    Ok(value) => value,
+                    Err(error) => {
+                        record("ERROR", "udp_receive_failed", format_args!("kind={:?}", error.kind()));
+                        return;
+                    }
+                };
+                let Ok(datagram) = decode_datagram(&buffer[..length]) else {
+                    increment(&stats.udp_invalid);
+                    continue;
+                };
                 match datagram {
                     Datagram::Bind { client_id, token } => {
                         let bound = state.lock().await.bind_udp(client_id, token, source);
                         if bound {
-                            if let Ok(reply) = encode_datagram(&Datagram::Bound { client_id }) { let _ = udp.send_to(&reply, source).await; }
+                            if let Ok(reply) = encode_datagram(&Datagram::Bound { client_id }) {
+                                if udp.send_to(&reply, source).await.is_err() { increment(&stats.io_failed); }
+                            }
+                        } else {
+                            increment(&stats.udp_bind_rejected);
                         }
                     }
                     Datagram::Data { client_id, token, packet } => {
+                        increment(&stats.udp_data_received);
                         let route = state.lock().await.route_udp(client_id, token, source, packet);
                         execute_route(client_id, route, &state, Some(&udp)).await;
                     }
-                    Datagram::Bound { .. } => {}
+                    Datagram::Bound { .. } => { increment(&stats.udp_invalid); }
                 }
             }
             changed = stopping.changed() => {
@@ -367,7 +453,13 @@ async fn execute_route(
             };
             match encode_datagram(&datagram) {
                 Ok(bytes) => {
-                    let _ = socket.send_to(&bytes, address).await;
+                    let result = socket.send_to(&bytes, address).await;
+                    let locked = state.lock().await;
+                    if result.is_ok() {
+                        increment(&locked.stats.udp_data_sent);
+                    } else {
+                        increment(&locked.stats.io_failed);
+                    }
                 }
                 Err(_) => send_error(client_id, state, "invalid UDP data").await,
             }
@@ -378,10 +470,9 @@ async fn execute_route(
 }
 
 async fn send_error(client_id: u64, state: &Arc<Mutex<State>>, text: &'static str) {
-    let _ = state
-        .lock()
-        .await
-        .enqueue(client_id, Message::Error(text.into()));
+    let locked = state.lock().await;
+    increment(&locked.stats.protocol_rejected);
+    let _ = locked.enqueue(client_id, Message::Error(text.into()));
 }
 
 async fn disconnect(client_id: u64, state: &Arc<Mutex<State>>) {
@@ -414,6 +505,7 @@ async fn writer_loop(
     mut receiver: mpsc::Receiver<Queued>,
     mut stopping: watch::Receiver<bool>,
     mut closed: watch::Receiver<bool>,
+    stats: Arc<Stats>,
 ) {
     loop {
         tokio::select! {
@@ -421,7 +513,12 @@ async fn writer_loop(
                 Some(mut queued) => {
                     let result = write_tcp_message(&mut writer, &queued.message).await;
                     queued.release();
-                    if result.is_err() { return; }
+                    if let Err(error) = result {
+                        increment(&stats.io_failed);
+                        record("WARN", "tcp_write_failed", format_args!("kind={:?}", error.kind()));
+                        return;
+                    }
+                    if matches!(queued.message, Message::Data(_)) { increment(&stats.tcp_data_written); }
                 }
                 None => return,
             },
@@ -440,6 +537,7 @@ struct State {
     clients: HashMap<u64, Client>,
     queued_total: Arc<AtomicUsize>,
     total_queue_limit: usize,
+    stats: Arc<Stats>,
 }
 
 struct Client {
@@ -519,7 +617,23 @@ impl State {
             clients: HashMap::new(),
             queued_total: Arc::new(AtomicUsize::new(0)),
             total_queue_limit,
+            stats: Arc::new(Stats::default()),
         }
+    }
+
+    fn summary(&self) -> String {
+        self.stats.summary(
+            self.clients.len(),
+            self.clients
+                .values()
+                .filter(|client| client.epoch != 0)
+                .count(),
+            self.clients
+                .values()
+                .filter(|client| client.udp_address.is_some())
+                .count(),
+            self.queued_total.load(Ordering::Relaxed),
+        )
     }
 
     fn count(&self) -> usize {
@@ -717,20 +831,26 @@ impl State {
 
     fn enqueue(&self, client_id: u64, message: Message) -> Result<(), QueueError> {
         let client = self.clients.get(&client_id).ok_or(QueueError::Closed)?;
-        enqueue(
+        let result = enqueue(
             &client.output,
             message,
             client.max_queued_bytes,
             client.queued_bytes.clone(),
             self.total_queue_limit,
             self.queued_total.clone(),
-        )
+        );
+        if result.is_err() {
+            increment(&self.stats.queue_failed);
+        }
+        result
     }
 
     fn remove(&mut self, client_id: u64, now: Instant) -> Vec<Notice> {
         let Some(client) = self.clients.remove(&client_id) else {
             return Vec::new();
         };
+        increment(&self.stats.disconnected);
+        record("INFO", "disconnected", format_args!("client={client_id}"));
         let _ = client.closing.send(true);
         let mut notices = self.notices_for_group(client.group, None);
         notices.extend(self.status_notices_for_group(client.group, now));
@@ -911,6 +1031,85 @@ mod tests {
         })
         .await;
         (stream, client_id, udp_token)
+    }
+
+    #[tokio::test]
+    async fn diagnostics_count_actual_writes_without_counting_control_messages() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut receiving = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (sending, _) = listener.accept().await.unwrap();
+        let (_, writer) = sending.into_split();
+        let mut state = State::new(4096);
+        let stats = state.stats.clone();
+        let (sender, receiver) = mpsc::channel(8);
+        let (closing, closed) = watch::channel(false);
+        let id = state
+            .add(
+                group(7),
+                "127.0.0.1".parse().unwrap(),
+                sender,
+                closing,
+                4096,
+                4,
+            )
+            .unwrap()
+            .0;
+        let (stopping, stopped) = watch::channel(false);
+        let writing = tokio::spawn(writer_loop(
+            writer,
+            receiver,
+            stopped,
+            closed,
+            stats.clone(),
+        ));
+        assert!(state.enqueue(id, Message::Pong(123)).is_ok());
+        assert!(
+            state
+                .enqueue(id, Message::Data(packet(1, 2, 3, 4, 0, b"not logged")))
+                .is_ok()
+        );
+        recv_until(&mut receiving, |message| {
+            matches!(message, Message::Data(_))
+        })
+        .await;
+        stopping.send(true).unwrap();
+        timeout(Duration::from_secs(1), writing)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.tcp_data_written.load(Ordering::Relaxed), 1);
+        assert_eq!(state.queued_total.load(Ordering::Relaxed), 0);
+
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let destination = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let shared = Arc::new(Mutex::new(state));
+        execute_route(
+            id,
+            Route::Udp {
+                target: id,
+                address: destination.local_addr().unwrap(),
+                datagram: Datagram::Data {
+                    client_id: id,
+                    token: [9; 16],
+                    packet: packet(1, 2, 3, 4, 0, b"not logged"),
+                },
+            },
+            &shared,
+            Some(&udp),
+        )
+        .await;
+        let mut bytes = [0; UDP_LIMIT];
+        timeout(Duration::from_secs(1), destination.recv(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.udp_data_sent.load(Ordering::Relaxed), 1);
+        let summary = shared.lock().await.summary();
+        assert!(summary.contains("tcp_data_written=1") && summary.contains("udp_data_sent=1"));
+        assert!(!summary.contains("not logged"));
+        assert!(!summary.contains("127.0.0.1"));
     }
     async fn bind(stream: &mut TcpStream, steam_id: u64, epoch: u64) {
         write_tcp_message(stream, &Message::Bind { steam_id, epoch })
