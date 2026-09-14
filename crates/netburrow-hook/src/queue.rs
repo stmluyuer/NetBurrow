@@ -147,12 +147,12 @@ impl Bridge {
         {
             return Some(false);
         }
-        if send_type == 1 && !peer.accepted {
-            return Some(true);
-        } // Steam's no-delay mode drops before establishment.
         if self.outbound.len() >= PACKET_LIMIT || self.out_bytes + bytes.len() > BYTE_LIMIT {
             return Some(false);
         }
+        // Relay binding already supplies the route. Sending also accepts the peer,
+        // including no-delay first packets: Isaac uses these to start communication.
+        // Dropping them until acceptance would leave both sides waiting forever.
         peer.accepted = true;
         peer.channels.insert(channel);
         peer.requested = None;
@@ -346,15 +346,69 @@ mod tests {
         assert_eq!(b.available(1), None);
     }
     #[test]
-    fn buffering_flush_order_and_no_delay_behavior() {
+    fn buffering_flush_order() {
         let mut b = bridge();
-        assert_eq!(b.send(20, b"drop", 1, 0), Some(true));
-        assert!(b.pop_outgoing().is_none());
         assert_eq!(b.send(20, b"a", 3, 0), Some(true));
         assert!(b.pop_outgoing().is_none());
         assert_eq!(b.send(20, b"b", 2, 0), Some(true));
         assert_eq!(b.pop_outgoing().unwrap().payload, b"a");
         assert_eq!(b.pop_outgoing().unwrap().payload, b"b");
+    }
+    #[test]
+    fn no_delay_peers_exchange_first_packets_without_callbacks() {
+        for receive_before_send in [false, true] {
+            let mut a = bridge();
+            let mut b = Bridge::new(20, 200);
+            b.members(&[Peer {
+                client_id: 1,
+                steam_id: 10,
+                epoch: 100,
+            }]);
+            b.active = true;
+            assert_eq!(a.send(20, b"first", 1, 0), Some(true));
+            let first = a
+                .pop_outgoing()
+                .expect("first no-delay packet must leave Hook");
+            assert_eq!(first.send_type, 1);
+            if receive_before_send {
+                assert!(b.receive(first.clone()));
+                assert_eq!(
+                    b.available(0),
+                    None,
+                    "unsolicited receive still needs acceptance"
+                );
+            }
+            assert_eq!(b.send(10, b"reply", 1, 0), Some(true));
+            let reply = b
+                .pop_outgoing()
+                .expect("peer must also send without a callback");
+            assert_eq!(reply.send_type, 1);
+            if !receive_before_send {
+                assert!(b.receive(first));
+            }
+            assert!(a.receive(reply));
+            assert_eq!(b.read(0).unwrap().payload, b"first");
+            assert_eq!(a.read(0).unwrap().payload, b"reply");
+            assert_eq!(a.session(20), Some((true, 0, 0)));
+            assert_eq!(b.session(10), Some((true, 0, 0)));
+            assert!(!b.needs_request(10));
+        }
+    }
+    #[test]
+    fn no_delay_send_keeps_readiness_and_size_limits() {
+        let mut b = bridge();
+        b.active = false;
+        assert_eq!(b.send(20, b"waiting", 1, 0), Some(false));
+        b.active = true;
+        assert_eq!(b.send(20, &vec![0; 1201], 1, 0), Some(false));
+        assert!(b.pop_outgoing().is_none());
+        assert_eq!(b.session(20), Some((false, 0, 0)));
+        assert_eq!(b.send(99, b"unknown", 1, 0), None);
+        b.members(&[]);
+        assert_eq!(b.send(20, b"offline", 1, 0), Some(false));
+        b.stop();
+        assert_eq!(b.send(20, b"stopped", 1, 0), Some(false));
+        assert!(b.pop_outgoing().is_none());
     }
     #[test]
     fn new_epoch_and_disconnect_discard_queued_data() {

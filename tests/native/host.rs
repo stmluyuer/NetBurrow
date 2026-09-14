@@ -250,6 +250,7 @@ unsafe fn run() {
         *mut u64,
         i32,
     ) -> bool = transmute(*patched.add(2));
+    let close: unsafe extern "thiscall" fn(*mut c_void, u64) -> bool = transmute(*patched.add(4));
     let object = (&mut *object as *mut usize).cast();
     let mut count = 0;
     assert!(!available(object, &mut count, 4));
@@ -267,7 +268,9 @@ unsafe fn run() {
     ));
     assert_eq!((small, count, remote), (*b"ab", 2, 202));
     assert!(!available(object, &mut count, 3));
-    eventually(|| send(object, 202, b"out".as_ptr().cast(), 3, 2, 9));
+    // Clear callback acceptance, then start solely with Isaac's no-delay send mode.
+    eventually(|| close(object, 202));
+    eventually(|| send(object, 202, b"out".as_ptr().cast(), 3, 1, 9));
     loop {
         match read_message(&mut socket).unwrap() {
             Message::Ping(n) => write_message(&mut socket, &Message::Pong(n)).unwrap(),
@@ -279,9 +282,10 @@ unsafe fn run() {
                         packet.source_epoch,
                         packet.target_epoch,
                         packet.channel,
+                        packet.send_type,
                         packet.payload
                     ),
-                    (101, 202, 11, 22, 9, b"out".to_vec())
+                    (101, 202, 11, 22, 9, 1, b"out".to_vec())
                 );
                 break;
             }
@@ -304,6 +308,6 @@ unsafe fn run() {
     SteamAPI_UnregisterCallback((&mut request as *mut Callback).cast());
     SteamAPI_UnregisterCallback((&mut failure as *mut Callback).cast());
     println!(
-        "PASS: x86 helper identity rejection, DLL load, IPC identity, callback acceptance, channel/truncated read, outgoing routing and stop without fallback"
+        "PASS: x86 helper identity rejection, DLL load, IPC identity, callback acceptance, channel/truncated read, no-delay first-packet routing and stop without fallback"
     );
 }
