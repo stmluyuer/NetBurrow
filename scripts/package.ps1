@@ -2,7 +2,10 @@
 [CmdletBinding()]
 param(
     [switch]$SkipBuild,
-    [switch]$ClientOnly
+    [switch]$ClientOnly,
+    [switch]$KeepVersion,
+    [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$')]
+    [string]$Version
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,10 +22,28 @@ $toolBin = Join-Path $rustupHome 'toolchains\1.97.0-x86_64-pc-windows-msvc\bin'
 $cargo = Join-Path $toolBin 'cargo.exe'
 $distRoot = Join-Path $repoRoot '.local\dist'
 $targetRoot = Join-Path $repoRoot '.local\target'
-$appStage = Join-Path $distRoot 'NetBurrow-win-x64'
-$relayStage = Join-Path $distRoot 'NetBurrow-relay-source'
-$appZip = Join-Path $distRoot 'NetBurrow-win-x64.zip'
-$relayZip = Join-Path $distRoot 'NetBurrow-relay-source.zip'
+
+if ($Version -and ($KeepVersion -or $SkipBuild)) {
+    throw '-Version 不能与 -KeepVersion 或 -SkipBuild 同时使用。'
+}
+$manifestPath = Join-Path $repoRoot 'Cargo.toml'
+$manifestText = [IO.File]::ReadAllText($manifestPath, [Text.Encoding]::UTF8)
+$versionPattern = '(?m)(^\[workspace\.package\]\r?\nversion = ")([0-9]+\.[0-9]+\.[0-9]+)(")'
+$versionMatch = [regex]::Match($manifestText, $versionPattern)
+if (-not $versionMatch.Success) { throw '无法读取 Cargo.toml 中的 workspace 版本。' }
+$currentVersion = $versionMatch.Groups[2].Value
+if (-not $Version) {
+    $Version = $currentVersion
+    if (-not ($KeepVersion -or $SkipBuild)) {
+        $parts = $currentVersion.Split('.')
+        $Version = '{0}.{1}.{2}' -f $parts[0], $parts[1], ([long]$parts[2] + 1)
+    }
+}
+if ([version]$Version -lt [version]$currentVersion) { throw '指定版本不能低于当前版本。' }
+$appZip = Join-Path $distRoot "NetBurrow-$Version-win-x64.zip"
+$relayZip = Join-Path $distRoot "NetBurrow-$Version-relay-source.zip"
+$appStage = Join-Path $distRoot "NetBurrow-$Version-win-x64"
+$relayStage = Join-Path $distRoot "NetBurrow-$Version-relay-source"
 
 if (-not (Test-Path -LiteralPath $cargo -PathType Leaf)) {
     throw "未找到仓库指定的 Rust 工具链：$cargo"
@@ -120,14 +141,32 @@ function Write-ThirdPartyNotices {
 
 New-Item -ItemType Directory -Force -Path $distRoot | Out-Null
 
-if (-not $SkipBuild) {
-    Invoke-Cargo build --release --locked --offline --target x86_64-pc-windows-msvc -p netburrow-app
-    Invoke-Cargo build --release --locked --offline --target i686-pc-windows-msvc -p netburrow-injector -p netburrow-hook
-}
-
 $appBinary = Join-Path $targetRoot 'x86_64-pc-windows-msvc\release\NetBurrow.exe'
 $injectorBinary = Join-Path $targetRoot 'i686-pc-windows-msvc\release\netburrow-injector.exe'
 $hookDll = Join-Path $targetRoot 'i686-pc-windows-msvc\release\netburrow_hook.dll'
+$buildRecord = Join-Path $targetRoot 'package-build.json'
+if ($Version -ne $currentVersion) {
+    $updatedManifest = [regex]::Replace($manifestText, $versionPattern, ('${1}' + $Version + '${3}'))
+    [IO.File]::WriteAllText($manifestPath, $updatedManifest, [Text.UTF8Encoding]::new($false))
+    Write-Host "版本：$currentVersion -> $Version（失败后可使用 -KeepVersion 重试）"
+}
+
+if (-not $SkipBuild) {
+    # Refresh workspace package versions in Cargo.lock without updating dependencies.
+    Invoke-Cargo metadata --offline --format-version 1 | Out-Null
+    Invoke-Cargo build --release --locked --offline --target x86_64-pc-windows-msvc -p netburrow-app
+    Invoke-Cargo build --release --locked --offline --target i686-pc-windows-msvc -p netburrow-injector -p netburrow-hook
+    $hashes = @($appBinary, $injectorBinary, $hookDll | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash })
+    @{ version = $Version; hashes = $hashes } | ConvertTo-Json | Set-Content -LiteralPath $buildRecord -Encoding UTF8
+} else {
+    if (-not (Test-Path -LiteralPath $buildRecord)) { throw '请先正常打包一次，再使用 -SkipBuild。' }
+    $record = Get-Content -LiteralPath $buildRecord -Raw -Encoding UTF8 | ConvertFrom-Json
+    $hashes = @($appBinary, $injectorBinary, $hookDll | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash })
+    if ($record.version -ne $Version -or ($record.hashes -join ',') -ne ($hashes -join ',')) {
+        throw '现有产物与记录的版本不一致，请使用 -KeepVersion 重新构建。'
+    }
+}
+
 foreach ($artifact in @($appBinary, $injectorBinary, $hookDll)) {
     if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
         throw "缺少构建产物：$artifact"
@@ -161,7 +200,7 @@ members = ["crates/netburrow-protocol", "crates/netburrow-relay"]
 default-members = ["crates/netburrow-relay"]
 
 [workspace.package]
-version = "0.1.0"
+version = "__PACKAGE_VERSION__"
 edition = "2024"
 rust-version = "1.97"
 publish = false
@@ -176,6 +215,7 @@ lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
 '@
+$relayManifest = $relayManifest.Replace('__PACKAGE_VERSION__', $Version)
 Set-Content -LiteralPath (Join-Path $relayStage 'Cargo.toml') -Value $relayManifest -Encoding UTF8
 $relayToolchain = @'
 [toolchain]

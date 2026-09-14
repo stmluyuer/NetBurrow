@@ -22,7 +22,11 @@ pub fn init(component: &'static str) {
     record(
         "INFO",
         "session",
-        &format!("started version=0.1.0 pid={}", std::process::id()),
+        &format!(
+            "started version={} pid={}",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id()
+        ),
     );
 }
 pub fn last_error() -> Option<String> {

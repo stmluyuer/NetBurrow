@@ -1,7 +1,10 @@
 ﻿# Requires Windows PowerShell 5.1 or newer. Keep this file UTF-8 with BOM.
 [CmdletBinding()]
 param(
-    [switch]$NonInteractive
+    [switch]$NonInteractive,
+    [switch]$KeepVersion,
+    [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$')]
+    [string]$Version
 )
 
 $ErrorActionPreference = 'Stop'
@@ -17,10 +20,12 @@ $exitCode = 0
 try {
     Write-Host '正在打包 NetBurrow 客户端，请等待编译和压缩完成……' -ForegroundColor Cyan
     Write-Host '首次构建可能较慢；后续运行会自动复用未变更的编译结果。'
-    & $packageScript -ClientOnly
+    $packageArgs = @{ ClientOnly = $true; KeepVersion = $KeepVersion }
+    if ($Version) { $packageArgs.Version = $Version }
+    & $packageScript @packageArgs
     Write-Host ''
-    Write-Host '打包成功！可分发文件：' -ForegroundColor Green
-    Write-Host (Join-Path $distRoot 'NetBurrow-win-x64.zip')
+    Write-Host '打包成功！文件路径见上方“已生成”，产物目录：' -ForegroundColor Green
+    Write-Host $distRoot
     if (-not $NonInteractive) {
         try {
             Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f $distRoot) | Out-Null

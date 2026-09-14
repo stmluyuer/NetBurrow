@@ -30,7 +30,7 @@ STAGE="/opt/netburrow/stage-$COMMIT"
 git -C "$SOURCE" worktree add --detach "$STAGE" "$COMMIT"
 ```
 
-`NetBurrow-relay-source.zip` 仍可用于离线交付；源码 ZIP 中已经裁剪为 Relay 和协议 workspace。GitHub 更新优先使用完整 workspace，因为下方检查需要在完整 workspace 中运行。使用 ZIP 时把解压根目录设为 `$STAGE`，仍显式使用 `TARGET_DIR="$STAGE/.local/target"` 和相同的 `cargo +1.97.0 ... --target-dir "$TARGET_DIR"` 命令。
+`NetBurrow-<版本>-relay-source.zip` 仍可用于离线交付；源码 ZIP 中已经裁剪为 Relay 和协议 workspace。GitHub 更新优先使用完整 workspace，因为下方检查需要在完整 workspace 中运行。使用 ZIP 时把解压根目录设为 `$STAGE`，仍显式使用 `TARGET_DIR="$STAGE/.local/target"` 和相同的 `cargo +1.97.0 ... --target-dir "$TARGET_DIR"` 命令。
 
 ## 先核查现有服务，再构建验证
 
