@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/netburrow-protocol",
+    "crates/netburrow-relay",
+    "crates/netburrow-core",
+    "crates/netburrow-app",
+    "crates/netburrow-injector",
+    "crates/netburrow-hook",
+]
+default-members = ["crates/netburrow-app", "crates/netburrow-relay"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+
+[workspace.dependencies]
+netburrow-protocol = { path = "crates/netburrow-protocol" }
+netburrow-core = { path = "crates/netburrow-core" }
+tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+getrandom = "=0.3.4"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation", "Win32_Security", "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp", "Win32_System_Diagnostics_Debug",
+    "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation", "Win32_System_SystemServices",
+    "Win32_System_Registry", "Win32_System_RemoteDesktop", "Win32_System_DataExchange", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell",
+    "Win32_Graphics_Gdi", "Win32_Storage_FileSystem",
+] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

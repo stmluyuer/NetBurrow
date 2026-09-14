@@ -1,0 +1,10 @@
+[package]
+name = "netburrow-relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+netburrow-protocol.workspace = true
+tokio.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "netburrow-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "NetBurrow"
+path = "src/main.rs"
+
+[dependencies]
+netburrow-core.workspace = true
+eframe = { version = "=0.35.0", default-features = false, features = ["default_fonts", "glow"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
