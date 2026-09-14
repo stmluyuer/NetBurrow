@@ -300,27 +300,6 @@ impl NetBurrowApp {
             ui.label(RichText::new("同组成员").font(bold(20.0)));
             ui.label(RichText::new(format!("{} 人", if show_members { self.last_snapshot.peers.len() } else { 0 })).color(MUTED));
         });
-        let detail = self.last_snapshot.detail.trim();
-        // A warning may keep the current phase (e.g. a peer disconnects while we stay Ready).
-        // Hide only routine messages already covered by the status label and launch hint.
-        let routine = matches!(detail,
-            "正在连接 Relay…"
-                | "Relay 已连接，请从 Steam 正常启动游戏"
-                | "游戏已退出，等待下次从 Steam 启动"
-                | "已发现游戏进程，正在加载自己的 Hook…"
-                | "游戏已接入 NetBurrow，可在游戏中邀请同组朋友"
-        );
-        if self.client.is_some() && !detail.is_empty() && !routine {
-            ui.label(RichText::new(detail).size(13.0).color(TEXT));
-        }
-        if matches!(self.current_phase(), Phase::Connecting | Phase::RestartRequired | Phase::Failed) {
-            if icons::button(ui, icons::Action::Log, "查看排查日志").clicked() {
-                self.view.page = Page::Diagnostics;
-            }
-        }
-        if self.client.as_ref().is_some_and(Client::is_finished) {
-            ui.label(RichText::new("请停止联机，处理问题后重新启用").color(Color32::from_rgb(151, 103, 37)));
-        }
         if !show_members || self.last_snapshot.peers.is_empty() {
             ui.add_space(14.0);
             ui.vertical_centered(|ui| {
@@ -398,6 +377,32 @@ impl NetBurrowApp {
                     }
                 });
             });
+        }
+        let detail = self.last_snapshot.detail.trim();
+        // A warning may keep the current phase (e.g. a peer disconnects while we stay Ready).
+        // Hide only routine messages already covered by the status label and launch hint.
+        let routine = matches!(detail,
+            "正在连接 Relay…"
+                | "Relay 已连接，请从 Steam 正常启动游戏"
+                | "游戏已退出，等待下次从 Steam 启动"
+                | "已发现游戏进程，正在加载自己的 Hook…"
+                | "游戏已接入 NetBurrow，可在游戏中邀请同组朋友"
+        );
+        let show_detail = self.client.is_some() && !detail.is_empty() && !routine;
+        let finished = self.client.as_ref().is_some_and(Client::is_finished);
+        if show_detail || finished {
+            ui.add_space(8.0);
+            if show_detail {
+                ui.add(egui::Label::new(RichText::new(detail).size(12.0).color(TEXT)).wrap());
+            }
+            if finished {
+                ui.label(RichText::new("请停止联机，处理问题后重新启用").size(12.0).color(Color32::from_rgb(151, 103, 37)));
+            }
+            if matches!(self.current_phase(), Phase::Connecting | Phase::RestartRequired | Phase::Failed) {
+                if icons::button(ui, icons::Action::Log, "查看排查日志").clicked() {
+                    self.view.page = Page::Diagnostics;
+                }
+            }
         }
     }
 
