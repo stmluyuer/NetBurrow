@@ -14,4 +14,4 @@ netburrow-core.workspace = true
 eframe = { version = "=0.35.0", default-features = false, features = ["default_fonts", "glow"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true
+windows-sys = { workspace = true, features = ["Win32_UI_Controls_Dialogs"] }
