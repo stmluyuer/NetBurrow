@@ -194,6 +194,23 @@ mod runtime {
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+    const GROUP_NOT_ALLOWED_HINT: &str = "该组码未获服务器授权，请联系管理员添加，或更换已授权组码后重新启用联机。";
+
+    #[derive(Debug)]
+    struct GroupNotAllowed;
+
+    impl std::fmt::Display for GroupNotAllowed {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("Relay group is not allowed")
+        }
+    }
+
+    impl std::error::Error for GroupNotAllowed {}
+
+    fn group_not_allowed(error: &io::Error) -> bool {
+        error.get_ref().is_some_and(|cause| cause.is::<GroupNotAllowed>())
+    }
+
     pub(super) async fn probe(settings: &Settings) -> Result<(), String> {
         let group = parse_group(&settings.group)?;
         let mut network = Network::connect(settings.server.trim(), group, Transport::Tcp).await
@@ -214,6 +231,9 @@ mod runtime {
     }
 
     fn connection_hint(error: &io::Error) -> &'static str {
+        if group_not_allowed(error) {
+            return GROUP_NOT_ALLOWED_HINT;
+        }
         match error.kind() {
             io::ErrorKind::TimedOut => "连接服务器超时，请检查地址、网络和防火墙；3 秒后重试。",
             io::ErrorKind::ConnectionRefused => "服务器拒绝连接，请检查服务是否启动、端口是否开放；3 秒后重试。",
@@ -278,6 +298,9 @@ mod runtime {
                 Message::Welcome { client_id, udp_token } => (client_id, udp_token),
                 Message::Error(reason) if reason == "relay is full" => {
                     return Err(io::Error::new(io::ErrorKind::WouldBlock, "Relay is full"));
+                }
+                Message::Error(reason) if reason == "group is not allowed" => {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, GroupNotAllowed));
                 }
                 Message::Error(_) => {
                     return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Relay rejected join"));
@@ -566,6 +589,21 @@ mod runtime {
                 Ok(n) => n,
                 Err(error) => {
                     log("WARN", "relay connect", &error.to_string());
+                    if group_not_allowed(&error) {
+                        change(&state, |s| {
+                            s.peers.clear();
+                            s.ping_ms = None;
+                            s.rtt_samples.clear();
+                            s.last_pong_at = None;
+                        });
+                        let detail = if seen.is_empty() {
+                            GROUP_NOT_ALLOWED_HINT.to_owned()
+                        } else {
+                            format!("{GROUP_NOT_ALLOWED_HINT} 已运行的游戏请退出后重开。")
+                        };
+                        status(&state, Phase::Failed, detail);
+                        return;
+                    }
                     status(
                         &state,
                         Phase::Connecting,
@@ -970,9 +1008,58 @@ mod runtime {
         }
 
         #[tokio::test]
+        async fn unauthorized_group_fails_probe_and_finishes_without_retry() {
+            let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut settings = Settings {
+                server: server.local_addr().unwrap().to_string(),
+                group: crate::new_group().unwrap(),
+                game_path: "netburrow-authorization-test-no-game.exe".into(),
+                ..Settings::default()
+            };
+            let task = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (mut socket, _) = server.accept().await.unwrap();
+                    assert!(matches!(read(&mut socket).await.unwrap(), Message::Join { .. }));
+                    write(&mut socket, &Message::Error("group is not allowed".into())).await.unwrap();
+                }
+                // A fresh manual attempt can still use the same server after rejection.
+                let (mut socket, _) = server.accept().await.unwrap();
+                assert!(matches!(read(&mut socket).await.unwrap(), Message::Join { .. }));
+                write(&mut socket, &Message::Welcome { client_id: 1, udp_token: [8; 16] }).await.unwrap();
+                assert!(matches!(read(&mut socket).await.unwrap(), Message::Status(_)));
+                write(&mut socket, &Message::Statuses(vec![])).await.unwrap();
+                assert!(matches!(read(&mut socket).await.unwrap(), Message::Leave));
+            });
+            assert_eq!(timeout(Duration::from_secs(2), probe(&settings)).await.unwrap().unwrap_err(), GROUP_NOT_ALLOWED_HINT);
+            let state = Arc::new(Mutex::new(Snapshot {
+                ping_ms: Some(42),
+                last_pong_at: Some(std::time::Instant::now()),
+                rtt_samples: [42].into(),
+                peers: vec![PeerInfo { client_id: 2, game_epoch: 1, steam_id: 2, ready: true, is_self: false, status: None, status_updated: None }],
+                ..Snapshot::default()
+            }));
+            let (_stop, stopped) = watch::channel(false);
+            // Finishing before the existing three-second retry proves this is terminal.
+            timeout(Duration::from_secs(2), run(settings.clone(), PathBuf::new(), stopped, state.clone())).await.unwrap();
+            {
+                let snapshot = state.lock().unwrap();
+                assert_eq!(snapshot.phase, Phase::Failed);
+                assert_eq!(snapshot.detail, GROUP_NOT_ALLOWED_HINT);
+                assert!(snapshot.peers.is_empty());
+                assert!(snapshot.ping_ms.is_none());
+                assert!(snapshot.rtt_samples.is_empty());
+                assert!(snapshot.last_pong_at.is_none());
+            }
+            settings.group = crate::new_group().unwrap();
+            timeout(Duration::from_secs(2), probe(&settings)).await.unwrap().unwrap();
+            task.await.unwrap();
+        }
+
+        #[tokio::test]
         async fn handshake_errors_have_distinct_safe_guidance() {
             for (reply, expected, hint) in [
                 (Message::Error("relay is full".into()), io::ErrorKind::WouldBlock, "服务器已满"),
+                (Message::Error("group is not allowed".into()), io::ErrorKind::PermissionDenied, GROUP_NOT_ALLOWED_HINT),
                 (Message::Error("untrusted secret text".into()), io::ErrorKind::PermissionDenied, "服务器拒绝加入"),
                 (Message::Pong(0), io::ErrorKind::InvalidData, "服务器协议不匹配"),
             ] {
@@ -986,6 +1073,7 @@ mod runtime {
                 let error = Network::connect(&endpoint, [5; 32], Transport::Tcp).await.err().unwrap();
                 assert_eq!(error.kind(), expected);
                 assert!(connection_hint(&error).contains(hint));
+                assert_eq!(group_not_allowed(&error), hint == GROUP_NOT_ALLOWED_HINT);
                 assert!(!error.to_string().contains("untrusted secret text"));
                 task.await.unwrap();
             }
