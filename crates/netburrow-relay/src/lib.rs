@@ -472,6 +472,11 @@ async fn execute_route(
 async fn send_error(client_id: u64, state: &Arc<Mutex<State>>, text: &'static str) {
     let locked = state.lock().await;
     increment(&locked.stats.protocol_rejected);
+    record(
+        "WARN",
+        "protocol_rejected",
+        format_args!("client_id={client_id} reason={text}"),
+    );
     let _ = locked.enqueue(client_id, Message::Error(text.into()));
 }
 
@@ -735,7 +740,9 @@ impl State {
             .last_status_at
             .is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(1))
         {
-            return Err("status reports are limited to once per second");
+            // TCP may deliver periodic reports in a burst. Keep the last accepted
+            // snapshot and its timestamp without treating telemetry as a protocol error.
+            return Ok(Vec::new());
         }
         if status.phase == 3 && client.steam_id == 0 {
             status.phase = 1;
@@ -1229,11 +1236,23 @@ mod tests {
             state
                 .report_status(
                     one,
-                    member_status("one", 3, 0),
+                    member_status("ignored", 3, 0),
                     now + Duration::from_millis(999)
                 )
-                .is_err()
+                .unwrap()
+                .is_empty()
         );
+        let client = &state.clients[&one];
+        assert_eq!(client.last_status_at, Some(now));
+        assert_eq!(client.reported_status.as_ref().unwrap().status.name, "one");
+        let accepted = state
+            .report_status(
+                one,
+                member_status("updated", 3, 0),
+                now + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(statuses_for(&accepted, two)[0].status.name, "updated");
 
         let rebound = state
             .bind(one, 11, 112, now + Duration::from_secs(1))
@@ -1247,6 +1266,48 @@ mod tests {
         let cleared = state.remove(two, now + Duration::from_secs(2));
         assert_eq!(status_targets(&cleared), vec![one]);
         assert!(statuses_for(&cleared, one).is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_burst_keeps_heartbeat_and_reliable_data_working() {
+        let relay = spawn(Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            ..Config::default()
+        })
+        .await
+        .unwrap();
+        let (mut one, _, _) = connect(relay.local_addr(), group(7)).await;
+        let (mut two, _, _) = connect(relay.local_addr(), group(7)).await;
+        bind(&mut one, 11, 111).await;
+        bind(&mut two, 22, 222).await;
+        recv_until(&mut one, |message| {
+            matches!(message, Message::Members(peers) if peers.iter().any(|peer| peer.steam_id == 22))
+        })
+        .await;
+        for _ in 0..3 {
+            write_tcp_message(&mut one, &Message::Status(member_status("one", 3, 0)))
+                .await
+                .unwrap();
+        }
+        let data = Message::Data(packet(11, 22, 111, 222, 3, b"after status burst"));
+        write_tcp_message(&mut one, &data).await.unwrap();
+        write_tcp_message(&mut one, &Message::Ping(12345)).await.unwrap();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                match read_tcp_message(&mut one).await.unwrap() {
+                    Message::Pong(12345) => break,
+                    Message::Members(_) | Message::Statuses(_) => {},
+                    other => panic!("unexpected response after status burst: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            recv_until(&mut two, |message| matches!(message, Message::Data(_))).await,
+            data
+        );
+        relay.shutdown().await.unwrap();
     }
 
     #[tokio::test]
