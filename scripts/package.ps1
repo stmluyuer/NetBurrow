@@ -180,9 +180,6 @@ Copy-Item -LiteralPath $appBinary -Destination (Join-Path $appStage 'NetBurrow.e
 Copy-Item -LiteralPath $injectorBinary -Destination (Join-Path $appStage 'netburrow-injector.exe') -Force
 Copy-Item -LiteralPath $hookDll -Destination (Join-Path $appStage 'netburrow_hook.dll') -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot 'README.md') -Destination (Join-Path $appStage 'README.md') -Force
-New-Item -ItemType Directory -Force -Path (Join-Path $appStage 'docs') | Out-Null
-Copy-Item -LiteralPath (Join-Path $repoRoot 'docs\server-ai-handoff.md') -Destination (Join-Path $appStage 'docs\server-ai-handoff.md') -Force
-Write-ThirdPartyNotices -ManifestPath (Join-Path $repoRoot 'Cargo.toml') -Destination (Join-Path $appStage 'LICENSES')
 Get-ChildItem -LiteralPath $appStage -File -Recurse | Where-Object { $_.LastWriteTime.Year -lt 1980 -or $_.LastWriteTime.Year -gt 2107 } | ForEach-Object { $_.LastWriteTime = Get-Date }
 Write-PortableZip -Source $appStage -Destination $appZip
 Write-Output "已生成：$appZip"
