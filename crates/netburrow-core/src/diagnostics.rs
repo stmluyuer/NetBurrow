@@ -33,21 +33,27 @@ pub fn last_error() -> Option<String> {
     LAST_ERROR.lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 pub fn record(level: &str, event: &str, message: &str) {
+    record_batch(level, std::iter::once((event, message)));
+}
+
+/// Append a bounded caller-owned snapshot with one file open, retaining per-line cleaning.
+pub fn record_batch<'a>(level: &str, records: impl IntoIterator<Item = (&'a str, &'a str)>) {
     let Some(component) = COMPONENT.get() else {
         return;
     };
     let _lock = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let line = format!(
-        "{} [{}] pid={} {}: {}\n",
-        timestamp(),
-        level,
-        std::process::id(),
-        event,
-        clean(message)
-    );
+    let stamp = timestamp();
+    let mut lines = String::new();
+    for (event, message) in records {
+        lines.push_str(&format!(
+            "{stamp} [{level}] pid={} {event}: {}\n",
+            std::process::id(),
+            clean(message)
+        ));
+    }
     let result = append(
         &directory().join(format!("{component}.log")),
-        line.as_bytes(),
+        lines.as_bytes(),
         LIMIT,
     );
     if let Err(error) = result {

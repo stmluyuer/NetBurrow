@@ -166,7 +166,10 @@ where
         tokio::select! {
             _ = &mut shutdown => break Ok(()),
             _ = summary.tick() => {
-                let line = state.lock().await.summary();
+                let mut locked=state.lock().await;
+                let expired:Vec<_>=locked.clients.iter().filter(|(_,c)|c.detached_until.is_some_and(|t|Instant::now()>=t)).map(|(id,_)|*id).collect();
+                for id in expired {for notice in locked.remove(id,Instant::now()){let _=locked.enqueue(notice.target,notice.message);}}
+                let line = locked.summary();
                 record("INFO", "summary", format_args!("{line}"));
             }
             result = &mut udp_task => {
@@ -177,7 +180,7 @@ where
             accepted = tcp.accept() => match accepted {
                 Ok((stream, address)) => {
                     increment(&stats.accepted);
-                    if state.lock().await.count() >= config.max_clients {
+                    if clients.len() >= config.max_clients.saturating_mul(2) {
                         increment(&stats.capacity_rejected);
                         drop(stream);
                     } else {
@@ -237,7 +240,7 @@ async fn client_loop(
         result = tokio::time::timeout(config.handshake_timeout, read_tcp_message(&mut stream)) => result,
         _ = stopping.changed() => return,
     };
-    let Ok(Ok(Message::Join { group })) = first else {
+    let Ok(Ok(first)) = first else {
         increment(&stats.handshake_rejected);
         let _ = write_tcp_message(
             &mut stream,
@@ -248,35 +251,52 @@ async fn client_loop(
     };
 
     let (sender, receiver) = mpsc::channel(config.outgoing_messages);
-    let (closing, mut closed) = watch::channel(false);
-    let joined = {
+    let (closing, _) = watch::channel(false);
+    let resumed = matches!(first,Message::Resume{..});
+    let joined = if let Message::Resume {client_id,key,received} = first {
+        let mut locked=state.lock().await;
+        locked.resume(client_id,key,received,Instant::now())
+    } else if let Message::Join {group}=first {
         let mut locked = state.lock().await;
-        locked.add(
+        let added=locked.add(
             group,
             remote.ip(),
             sender.clone(),
             closing,
             config.outgoing_bytes,
             config.max_clients,
-        )
+        );
+        if let Ok((id,..))=&added {locked.clients.get_mut(id).unwrap().receiver=Some(Arc::new(Mutex::new(receiver)));}
+        added
+    } else {
+        Err(invalid("first message must be Join or Resume"))
     };
-    let Ok(joined) = joined else {
+    let joined = match joined {Ok(joined)=>joined,Err(error)=>{
         increment(&stats.capacity_rejected);
-        let _ = write_tcp_message(&mut stream, &Message::Error("relay is full".into())).await;
+        let reason=if resumed {if error.kind()==ErrorKind::WouldBlock {"session resume pending"}else{"session resume rejected"}} else {"relay is full"};
+        let _ = write_tcp_message(&mut stream, &Message::Error(reason.into())).await;
         return;
-    };
+    }};
     let (client_id, token, members, notices) = joined;
-    increment(&stats.joined);
-    record("INFO", "joined", format_args!("client={client_id}"));
+    let (receiver,window,enabled,failed,generation,mut closed)={
+        let locked=state.lock().await;
+        let client=&locked.clients[&client_id];
+        (client.receiver.as_ref().unwrap().clone(),client.window.clone(),client.recovery_enabled.clone(),client.resume_failed.clone(),client.generation,client.closing.subscribe())
+    };
+    if resumed {
+        let received=window.lock().unwrap_or_else(|p|p.into_inner()).received_through();
+        if write_tcp_message(&mut stream,&Message::Resumed {client_id,received}).await.is_err() {detach(client_id,generation,&state).await;return;}
+    }
+    if !resumed {increment(&stats.joined);record("INFO", "joined", format_args!("client={client_id}"));}
     {
         let locked = state.lock().await;
-        let _ = locked.enqueue(
+        if !resumed {let _ = locked.enqueue(
             client_id,
             Message::Welcome {
                 client_id,
                 udp_token: token,
             },
-        );
+        );}
         let _ = locked.enqueue(client_id, Message::Members(members));
         for notice in notices {
             let _ = locked.enqueue(notice.target, notice.message);
@@ -285,39 +305,68 @@ async fn client_loop(
 
     let (reader, writer) = stream.into_split();
     let writer_stop = stopping.clone();
-    let writer_task = tokio::spawn(writer_loop(
+    let mut writer_task = tokio::spawn(resumable_writer_loop(
         writer,
         receiver,
         writer_stop,
         closed.clone(),
         stats.clone(),
+        window.clone(),enabled.clone(),failed.clone(),
     ));
     let mut reader = reader;
+    let mut terminal=false;
     loop {
         tokio::select! {
+            _ = &mut writer_task => {terminal=failed.load(Ordering::Acquire);break;},
             message = read_tcp_message(&mut reader) => {
-                let message = match message {
+                let mut message = match message {
                     Ok(message) => message,
                     Err(error) => {
                         if error.kind() != ErrorKind::UnexpectedEof { increment(&stats.io_failed); }
                         record("INFO", "read_closed", format_args!("client={client_id} kind={:?}", error.kind()));
+                        terminal=matches!(error.kind(),ErrorKind::InvalidData|ErrorKind::InvalidInput);
                         break;
                     }
                 };
+                // A replacement socket owns the session; the previous reader cannot mutate it.
+                if !state.lock().await.clients.get(&client_id).is_some_and(|c|c.generation==generation) {break;}
+                let mut sequence=None;
+                match &message {
+                    Message::SessionAck(n)=>{
+                        if window.lock().unwrap_or_else(|p|p.into_inner()).acknowledge(*n).is_err(){terminal=true;break;}
+                        continue;
+                    }
+                    Message::SessionFrame {sequence:n,body}=>{
+                        if !enabled.load(Ordering::Acquire){terminal=true;break;}
+                        let classification=window.lock().unwrap_or_else(|p|p.into_inner()).classify(*n);
+                        match classification {
+                            Ok(false)=>{let through=window.lock().unwrap_or_else(|p|p.into_inner()).received_through();let _=state.lock().await.enqueue(client_id,Message::SessionAck(through));continue;}
+                            Ok(true)=>{},Err(_)=>{terminal=true;break;}
+                        }
+                        sequence=Some(*n);
+                        match netburrow_protocol::decode_session_body(body) {Ok(inner)=>message=inner,Err(_)=>{terminal=true;break;}}
+                    }
+                    _=>{}
+                }
                 let leave = handle_tcp_message(client_id, message, &state).await;
-                if leave { break; }
+                if let Some(n)=sequence {
+                    if window.lock().unwrap_or_else(|p|p.into_inner()).received(n).is_err(){terminal=true;break;}
+                    let _=state.lock().await.enqueue(client_id,Message::SessionAck(n));
+                }
+                if leave { terminal=true;break; }
             }
             changed = stopping.changed() => {
                 if changed.is_ok() && *stopping.borrow() { break; }
             }
             changed = closed.changed() => {
-                if changed.is_ok() && *closed.borrow() { break; }
+                if changed.is_ok() && *closed.borrow() { terminal=true;break; }
             }
         }
     }
-    writer_task.abort();
-    let _ = writer_task.await;
-    disconnect(client_id, &state).await;
+    if !writer_task.is_finished(){writer_task.abort();let _ = writer_task.await;}
+    if state.lock().await.clients.get(&client_id).is_some_and(|c|c.generation==generation) {
+        if terminal {disconnect(client_id,&state).await;} else {detach(client_id,generation,&state).await;}
+    }
 }
 
 async fn handle_tcp_message(client_id: u64, message: Message, state: &Arc<Mutex<State>>) -> bool {
@@ -369,7 +418,32 @@ async fn handle_tcp_message(client_id: u64, message: Message, state: &Arc<Mutex<
             false
         }
         Message::Ping(value) => {
-            let _ = state.lock().await.enqueue(client_id, Message::Pong(value));
+            let mut locked = state.lock().await;
+            let _ = locked.enqueue(client_id, Message::Pong(value));
+            if value == netburrow_protocol::RECOVERY_PING {
+                if let Some(client)=locked.clients.get_mut(&client_id) {
+                    if client.resume_key.is_none() {client.resume_key=netburrow_protocol::random_token().ok();}
+                    if let Some(key)=client.resume_key {let _=locked.enqueue(client_id,Message::RecoveryOffer(key));}
+                }
+            }
+            if value == netburrow_protocol::DIAGNOSTICS_PING {
+                if let Some(client) = locked.clients.get_mut(&client_id) {
+                    let changed = !client.diagnostics;
+                    client.diagnostics = true;
+                    let group = client.group;
+                    if changed {
+                        for notice in locked.diagnostic_notices(group) { let _ = locked.enqueue(notice.target, notice.message); }
+                    }
+                }
+            }
+            false
+        }
+        Message::PeerProbe(probe) => {
+            let mut locked = state.lock().await;
+            // Probe overload is lossy telemetry, never a reason to fail a game peer.
+            if let Some(target) = locked.probe_target(client_id, &probe, Instant::now()) {
+                let _ = locked.enqueue(target, Message::PeerProbe(probe));
+            }
             false
         }
         Message::Leave => true,
@@ -503,6 +577,49 @@ async fn disconnect(client_id: u64, state: &Arc<Mutex<State>>) {
         let _ = locked.enqueue(notice.target, notice.message);
     }
 }
+async fn detach(client_id:u64,generation:u64,state:&Arc<Mutex<State>>) {
+    let mut locked=state.lock().await;
+    if let Some(client)=locked.clients.get_mut(&client_id) {
+        if client.generation!=generation {return;}
+        if client.recovery_enabled.load(Ordering::Acquire) {
+            client.detached_until=Some(Instant::now()+netburrow_protocol::RECOVERY_TIMEOUT);
+            client.udp_address=None;
+            record("WARN","session_detached",format_args!("client={client_id} recovery_seconds=120"));
+            return;
+        }
+    }
+    for notice in locked.remove(client_id,Instant::now()){let _=locked.enqueue(notice.target,notice.message);}
+}
+
+async fn resumable_writer_loop(mut writer:tokio::net::tcp::OwnedWriteHalf,receiver:Arc<Mutex<mpsc::Receiver<Queued>>>,mut stopping:watch::Receiver<bool>,mut closed:watch::Receiver<bool>,stats:Arc<Stats>,window:Arc<std::sync::Mutex<ReplayWindow>>,enabled:Arc<std::sync::atomic::AtomicBool>,failed:Arc<std::sync::atomic::AtomicBool>) {
+    let replay=window.lock().unwrap_or_else(|p|p.into_inner()).pending();
+    for (sequence,body) in replay {
+        if !matches!(tokio::time::timeout(Duration::from_secs(15),write_tcp_message(&mut writer,&Message::SessionFrame{sequence,body})).await,Ok(Ok(()))){return;}
+    }
+    loop {
+        let next=async {receiver.lock().await.recv().await};
+        tokio::select! {
+            item=next=>{
+                let Some(mut queued)=item else{return;};
+                let offer=matches!(queued.message,Message::RecoveryOffer(_));
+                let message=if enabled.load(Ordering::Acquire)&&netburrow_protocol::replayable(&queued.message) {
+                    let Ok(body)=encode(&queued.message) else{return;};
+                    let sequence=match window.lock().unwrap_or_else(|p|p.into_inner()).retain(body.clone()) {Ok(n)=>n,Err(_)=>{failed.store(true,Ordering::Release);return;}};
+                    // Transfer the existing queue reservation to replay storage until ACK/drop.
+                    queued.released=true;
+                    Message::SessionFrame{sequence,body}
+                } else {queued.message.clone()};
+                let result=tokio::time::timeout(Duration::from_secs(15),write_tcp_message(&mut writer,&message)).await;
+                queued.release();
+                if !matches!(result,Ok(Ok(()))){return;}
+                if offer {enabled.store(true,Ordering::Release);}
+                if matches!(queued.message,Message::Data(_)){increment(&stats.tcp_data_written);}
+            }
+            _=stopping.changed()=>return,
+            _=closed.changed()=>return,
+        }
+    }
+}
 
 async fn read_tcp_message<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Message> {
     let length = reader.read_u32().await? as usize;
@@ -521,38 +638,6 @@ async fn write_tcp_message<W: AsyncWrite + Unpin>(
     writer.write_all(&encode(message)?).await
 }
 
-async fn writer_loop(
-    mut writer: tokio::net::tcp::OwnedWriteHalf,
-    mut receiver: mpsc::Receiver<Queued>,
-    mut stopping: watch::Receiver<bool>,
-    mut closed: watch::Receiver<bool>,
-    stats: Arc<Stats>,
-) {
-    loop {
-        tokio::select! {
-            queued = receiver.recv() => match queued {
-                Some(mut queued) => {
-                    let result = write_tcp_message(&mut writer, &queued.message).await;
-                    queued.release();
-                    if let Err(error) = result {
-                        increment(&stats.io_failed);
-                        record("WARN", "tcp_write_failed", format_args!("kind={:?}", error.kind()));
-                        return;
-                    }
-                    if matches!(queued.message, Message::Data(_)) { increment(&stats.tcp_data_written); }
-                }
-                None => return,
-            },
-            changed = stopping.changed() => {
-                if changed.is_ok() && *stopping.borrow() { return; }
-            }
-            changed = closed.changed() => {
-                if changed.is_ok() && *closed.borrow() { return; }
-            }
-        }
-    }
-}
-
 struct State {
     next_client_id: u64,
     clients: HashMap<u64, Client>,
@@ -561,7 +646,34 @@ struct State {
     stats: Arc<Stats>,
 }
 
+struct ReplayWindow {
+    frames:netburrow_protocol::resume::Window,
+    budget:Arc<AtomicUsize>,
+    total:Arc<AtomicUsize>,
+}
+impl ReplayWindow {
+    fn new(budget:Arc<AtomicUsize>,total:Arc<AtomicUsize>)->Self{Self{frames:Default::default(),budget,total}}
+    fn acknowledge(&mut self,n:u64)->io::Result<()> {
+        let before=self.frames.pending_bytes();self.frames.acknowledge(n)?;
+        let released=before-self.frames.pending_bytes();
+        self.budget.fetch_sub(released,Ordering::AcqRel);self.total.fetch_sub(released,Ordering::AcqRel);Ok(())
+    }
+}
+impl std::ops::Deref for ReplayWindow {type Target=netburrow_protocol::resume::Window;fn deref(&self)->&Self::Target{&self.frames}}
+impl std::ops::DerefMut for ReplayWindow {fn deref_mut(&mut self)->&mut Self::Target{&mut self.frames}}
+impl Drop for ReplayWindow {fn drop(&mut self){let bytes=self.frames.pending_bytes();self.budget.fetch_sub(bytes,Ordering::AcqRel);self.total.fetch_sub(bytes,Ordering::AcqRel);}}
+
 struct Client {
+    receiver: Option<Arc<Mutex<mpsc::Receiver<Queued>>>>,
+    window: Arc<std::sync::Mutex<ReplayWindow>>,
+    recovery_enabled: Arc<std::sync::atomic::AtomicBool>,
+    resume_failed: Arc<std::sync::atomic::AtomicBool>,
+    resume_key: Option<Token>,
+    detached_until: Option<Instant>,
+    generation: u64,
+    diagnostics: bool,
+    probe_window: Option<Instant>,
+    probe_count: u32,
     group: Group,
     token: Token,
     ip: IpAddr,
@@ -659,10 +771,6 @@ impl State {
         )
     }
 
-    fn count(&self) -> usize {
-        self.clients.len()
-    }
-
     fn add(
         &mut self,
         group: Group,
@@ -681,9 +789,15 @@ impl State {
             .ok_or_else(|| invalid("client id exhausted"))?;
         let client_id = self.next_client_id;
         let token = random_token()?;
+        let queued_bytes=Arc::new(AtomicUsize::new(0));
+        let window=Arc::new(std::sync::Mutex::new(ReplayWindow::new(queued_bytes.clone(),self.queued_total.clone())));
         self.clients.insert(
             client_id,
             Client {
+                receiver:None,window,recovery_enabled:Default::default(),resume_failed:Default::default(),resume_key:None,detached_until:None,generation:0,
+                diagnostics: false,
+                probe_window: None,
+                probe_count: 0,
                 group,
                 token,
                 ip,
@@ -691,7 +805,7 @@ impl State {
                 epoch: 0,
                 udp_address: None,
                 output,
-                queued_bytes: Arc::new(AtomicUsize::new(0)),
+                queued_bytes,
                 max_queued_bytes,
                 closing,
                 status_subscribed: false,
@@ -702,6 +816,18 @@ impl State {
         let members = self.members(group);
         let notices = self.notices_for_group(group, Some(client_id));
         Ok((client_id, token, members, notices))
+    }
+
+    fn resume(&mut self,id:u64,key:Token,received:u64,now:Instant)->io::Result<(u64,Token,Vec<Peer>,Vec<Notice>)> {
+        let client=self.clients.get_mut(&id).ok_or_else(||invalid("unknown resume session"))?;
+        if client.resume_key!=Some(key)||!client.recovery_enabled.load(Ordering::Acquire)||client.resume_failed.load(Ordering::Acquire) {return Err(invalid("invalid resume session"));}
+        match client.detached_until {None=>return Err(io::Error::new(ErrorKind::WouldBlock,"session still attached")),Some(deadline) if now>=deadline=>return Err(invalid("expired resume session")),_=>{}}
+        client.window.lock().unwrap_or_else(|p|p.into_inner()).acknowledge(received)?;
+        client.detached_until=None;
+        client.generation=client.generation.checked_add(1).ok_or_else(||invalid("session generation exhausted"))?;
+        let token=client.token;let group=client.group;
+        record("INFO","session_resumed",format_args!("client={id}"));
+        Ok((id,token,self.members(group),self.diagnostic_notices(group)))
     }
 
     fn bind(
@@ -858,11 +984,35 @@ impl State {
         if target.epoch != packet.target_epoch {
             return Err(Route::TargetEpochExpired);
         }
+        if packet.delivery.is_some() && (!source.diagnostics || !target.diagnostics) {
+            return Err(Route::Rejected("packet diagnostics were not negotiated"));
+        }
         Ok(*id)
+    }
+
+    fn probe_target(&mut self, client_id: u64, p: &netburrow_protocol::PeerProbe, now: Instant) -> Option<u64> {
+        let source = self.clients.get_mut(&client_id)?;
+        if !source.diagnostics || p.from != client_id || p.to == client_id || p.source_epoch != source.epoch || source.epoch == 0 || p.id == 0 { return None; }
+        if source.probe_window.is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_secs(1)) {
+            source.probe_window = Some(now);
+            source.probe_count = 0;
+        }
+        if source.probe_count >= 32 { return None; }
+        source.probe_count += 1;
+        let group = source.group;
+        let target = self.clients.get(&p.to)?;
+        (target.group == group && target.diagnostics && target.epoch != 0 && target.epoch == p.target_epoch).then_some(p.to)
+    }
+
+    fn diagnostic_notices(&self, group: Group) -> Vec<Notice> {
+        let mut peers: Vec<_> = self.clients.iter().filter(|(_, c)| c.group == group && c.diagnostics).map(|(id, _)| *id).collect();
+        peers.sort_unstable();
+        peers.iter().map(|id| Notice { target: *id, message: Message::DiagnosticsPeers(peers.clone()) }).collect()
     }
 
     fn enqueue(&self, client_id: u64, message: Message) -> Result<(), QueueError> {
         let client = self.clients.get(&client_id).ok_or(QueueError::Closed)?;
+        if client.detached_until.is_some() && !netburrow_protocol::replayable(&message) {return Ok(());}
         let result = enqueue(
             &client.output,
             message,
@@ -886,6 +1036,7 @@ impl State {
         let _ = client.closing.send(true);
         let mut notices = self.notices_for_group(client.group, None);
         notices.extend(self.status_notices_for_group(client.group, now));
+        notices.extend(self.diagnostic_notices(client.group));
         notices
     }
 
@@ -1006,6 +1157,110 @@ mod tests {
     use netburrow_protocol::{Group, UDP_LIMIT};
     use tokio::time::{Duration, timeout};
 
+    #[tokio::test]
+    async fn replay_keeps_queue_budget_charged_until_ack_or_session_drop() {
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut receiving=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (socket,_)=listener.accept().await.unwrap();let(_,writer)=socket.into_split();
+        let mut state=State::new(128);
+        let(sender,receiver)=mpsc::channel(8);let(closing,closed)=watch::channel(false);
+        let id=state.add(group(1),"127.0.0.1".parse().unwrap(),sender,closing,128,8).unwrap().0;
+        let window=state.clients[&id].window.clone();
+        let enabled=Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (stop,stopped)=watch::channel(false);
+        let task=tokio::spawn(resumable_writer_loop(writer,Arc::new(Mutex::new(receiver)),stopped,closed,state.stats.clone(),window.clone(),enabled,Default::default()));
+        let message=Message::Data(packet(11,22,111,222,2,&[1;40]));
+        assert!(state.enqueue(id,message.clone()).is_ok());
+        let frame=timeout(Duration::from_secs(1),read_tcp_message(&mut receiving)).await.unwrap().unwrap();
+        let Message::SessionFrame{sequence,..}=frame else{panic!("expected replay frame")};
+        assert_eq!(state.queued_total.load(Ordering::Acquire),encode(&message).unwrap().len());
+        assert!(matches!(state.enqueue(id,message.clone()),Err(QueueError::Full)));
+        window.lock().unwrap().acknowledge(sequence).unwrap();
+        assert_eq!(state.queued_total.load(Ordering::Acquire),0);
+        assert!(state.enqueue(id,message).is_ok());
+        assert!(matches!(timeout(Duration::from_secs(1),read_tcp_message(&mut receiving)).await.unwrap().unwrap(),Message::SessionFrame{..}));
+        stop.send(true).unwrap();task.await.unwrap();drop(window);state.remove(id,Instant::now());
+        assert_eq!(state.queued_total.load(Ordering::Acquire),0);
+    }
+
+    #[tokio::test]
+    async fn session_resume_rejects_wrong_key_expiry_and_invalid_ack_without_rebinding() {
+        let mut state=State::new(4096);let id=add_state_client(&mut state,group(1));let now=Instant::now();
+        state.bind(id,11,111,now).unwrap();
+        let peer=state.clients.get_mut(&id).unwrap();peer.resume_key=Some([7;16]);peer.recovery_enabled.store(true,Ordering::Release);peer.detached_until=Some(now+Duration::from_secs(2));
+        peer.window.lock().unwrap().retain(vec![]).unwrap();
+        assert!(state.resume(id,[8;16],0,now).is_err());
+        assert!(state.resume(id,[7;16],2,now).is_err());
+        assert!(state.resume(id,[7;16],0,now+Duration::from_secs(2)).is_err());
+        assert_eq!(state.clients[&id].generation,0);
+        let (resumed,_,members,_)=state.resume(id,[7;16],1,now).unwrap();
+        assert_eq!(resumed,id);assert_eq!((members[0].steam_id,members[0].epoch),(11,111));
+        assert_eq!(state.clients[&id].generation,1);
+        assert_eq!(state.clients[&id].window.lock().unwrap().pending_len(),0);
+        assert!(state.resume(id,[7;16],1,now).is_err());
+        state.remove(id,now);assert!(state.resume(id,[7;16],1,now).is_err());
+    }
+
+    #[tokio::test]
+    async fn diagnostics_probe_enforces_group_identity_epoch_capability_and_rate() {
+        let mut state = State::new(4096);
+        let a = add_state_client(&mut state, group(1));
+        let b = add_state_client(&mut state, group(1));
+        let c = add_state_client(&mut state, group(2));
+        let now = Instant::now();
+        for (id, steam, epoch) in [(a,11,111),(b,22,222),(c,33,333)] { state.bind(id,steam,epoch,now).unwrap(); }
+        let mut probe = netburrow_protocol::PeerProbe { from:a,to:b,source_epoch:111,target_epoch:222,id:1,reply:false };
+        assert_eq!(state.probe_target(a,&probe,now),None);
+        for id in [a,b,c] { state.clients.get_mut(&id).unwrap().diagnostics = true; }
+        assert_eq!(state.probe_target(a,&probe,now),Some(b));
+        probe.from = b; assert_eq!(state.probe_target(a,&probe,now),None); probe.from = a;
+        probe.source_epoch = 110; assert_eq!(state.probe_target(a,&probe,now),None); probe.source_epoch = 111;
+        probe.target_epoch = 223; assert_eq!(state.probe_target(a,&probe,now),None);
+        probe.to = c; probe.target_epoch = 333; assert_eq!(state.probe_target(a,&probe,now),None);
+        probe.to = b; probe.target_epoch = 222;
+        for _ in 0..32 { state.probe_target(a,&probe,now); }
+        assert_eq!(state.probe_target(a,&probe,now),None);
+        assert_eq!(state.probe_target(a,&probe,now + Duration::from_secs(1)),Some(b));
+        let mut p = packet(11,22,111,222,2,b"tracked");
+        p.delivery = Some(netburrow_protocol::Delivery { stream:1,sequence:2 });
+        assert!(matches!(state.route_tcp(a,p.clone()),Route::Tcp { message: Message::Data(got), .. } if got == p));
+        state.clients.get_mut(&b).unwrap().diagnostics = false;
+        assert!(matches!(state.route_tcp(a,p),Route::Rejected(_)));
+        assert!(state.diagnostic_notices(group(1)).iter().all(|n| n.target == a));
+    }
+
+    #[tokio::test]
+    async fn negotiated_clients_exchange_metadata_and_probes_while_legacy_stays_compatible() {
+        let relay = spawn(Config { bind: "127.0.0.1:0".parse().unwrap(), ..Config::default() }).await.unwrap();
+        let (mut a, aid, _) = connect(relay.local_addr(), group(1)).await;
+        let (mut b, bid, _) = connect(relay.local_addr(), group(1)).await;
+        let (mut old, _, _) = connect(relay.local_addr(), group(1)).await;
+        bind(&mut a,11,111).await; bind(&mut b,22,222).await; bind(&mut old,33,333).await;
+        for socket in [&mut a,&mut b] { write_tcp_message(socket,&Message::Ping(netburrow_protocol::DIAGNOSTICS_PING)).await.unwrap(); }
+        for socket in [&mut a,&mut b] {
+            recv_until(socket,|m| matches!(m,Message::DiagnosticsPeers(p) if p.contains(&aid) && p.contains(&bid))).await;
+        }
+        let mut p = packet(11,22,111,222,2,b"payload unchanged");
+        p.delivery = Some(netburrow_protocol::Delivery { stream:1,sequence:3 });
+        let expected = Message::Data(p);
+        write_tcp_message(&mut a,&expected).await.unwrap();
+        assert_eq!(recv_until(&mut b,|m| matches!(m,Message::Data(_))).await,expected);
+        let request = netburrow_protocol::PeerProbe { from:aid,to:bid,source_epoch:111,target_epoch:222,id:9,reply:false };
+        write_tcp_message(&mut a,&Message::PeerProbe(request.clone())).await.unwrap();
+        assert_eq!(recv_until(&mut b,|m| matches!(m,Message::PeerProbe(_))).await,Message::PeerProbe(request));
+        let reply = Message::PeerProbe(netburrow_protocol::PeerProbe { from:bid,to:aid,source_epoch:222,target_epoch:111,id:9,reply:true });
+        write_tcp_message(&mut b,&reply).await.unwrap();
+        assert_eq!(recv_until(&mut a,|m| matches!(m,Message::PeerProbe(_))).await,reply);
+        let legacy = Message::Data(packet(11,33,111,333,2,b"legacy"));
+        write_tcp_message(&mut a,&legacy).await.unwrap();
+        let got = recv_until(&mut old,|m| {
+            assert!(!matches!(m,Message::DiagnosticsPeers(_) | Message::PeerProbe(_)));
+            matches!(m,Message::Data(_))
+        }).await;
+        assert_eq!(got,legacy);
+        relay.shutdown().await.unwrap();
+    }
+
     fn group(byte: u8) -> Group {
         [byte; 32]
     }
@@ -1018,6 +1273,7 @@ mod tests {
         payload: &[u8],
     ) -> Packet {
         Packet {
+            delivery: None,
             from,
             to,
             source_epoch,
@@ -1089,12 +1345,13 @@ mod tests {
             .unwrap()
             .0;
         let (stopping, stopped) = watch::channel(false);
-        let writing = tokio::spawn(writer_loop(
+        let writing = tokio::spawn(resumable_writer_loop(
             writer,
-            receiver,
+            Arc::new(Mutex::new(receiver)),
             stopped,
             closed,
             stats.clone(),
+            state.clients[&id].window.clone(),Default::default(),Default::default(),
         ));
         assert!(state.enqueue(id, Message::Pong(123)).is_ok());
         assert!(

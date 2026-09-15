@@ -1,12 +1,41 @@
 //! A controlled x86 process named isaac-ng.exe, with our test ABI DLL only.
 //! Exercises the real helper and Hook without opening Steam or touching game files.
 #![allow(unsafe_op_in_unsafe_fn)]
-use netburrow_protocol::{Message, Packet, Peer, read_message, write_message};
+use netburrow_protocol::{Message, Packet, Peer};
+static SESSION:std::sync::Mutex<Option<netburrow_protocol::resume::Window>>=std::sync::Mutex::new(None);
+fn write_message(socket:&mut std::net::TcpStream,message:&Message)->std::io::Result<()> {
+    let mut session=SESSION.lock().unwrap();
+    if matches!(message,Message::IpcAccepted(_)){*session=Some(Default::default());}
+    let message=if netburrow_protocol::replayable(message)&&session.is_some(){
+        let body=netburrow_protocol::encode(message)?;
+        let sequence=session.as_mut().unwrap().retain(body.clone())?;
+        Message::SessionFrame{sequence,body}
+    }else{message.clone()};
+    netburrow_protocol::write_message(socket,&message)
+}
+fn read_message(socket:&mut std::net::TcpStream)->std::io::Result<Message> {
+    loop {
+        let message=netburrow_protocol::read_message(socket)?;
+        match message {
+            Message::SessionAck(n)=>{SESSION.lock().unwrap().as_mut().unwrap().acknowledge(n)?;}
+            Message::SessionFrame{sequence,body}=>{
+                let mut session=SESSION.lock().unwrap();let session=session.as_mut().unwrap();
+                let fresh=session.classify(sequence)?;
+                let message=netburrow_protocol::decode_session_body(&body)?;
+                session.received(sequence)?;
+                netburrow_protocol::write_message(socket,&Message::SessionAck(session.received_through()))?;
+                if fresh{return Ok(message);}
+            }
+            _=>return Ok(message),
+        }
+    }
+}
 use std::{
     ffi::c_void,
     io::Write,
     mem::transmute,
     net::TcpListener,
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     process::{Command, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
@@ -20,6 +49,13 @@ unsafe extern "C" {
 }
 #[link(name = "kernel32", kind = "raw-dylib")]
 unsafe extern "system" {
+    fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> *mut c_void;
+    fn Thread32First(snapshot: *mut c_void, entry: *mut ThreadEntry) -> i32;
+    fn Thread32Next(snapshot: *mut c_void, entry: *mut ThreadEntry) -> i32;
+    fn OpenThread(access: u32, inherit: i32, id: u32) -> *mut c_void;
+    fn GetThreadDescription(thread: *mut c_void, description: *mut *mut u16) -> i32;
+    fn LocalFree(memory: *mut c_void) -> *mut c_void;
+    fn WaitForSingleObject(handle: *mut c_void, millis: u32) -> u32;
     fn GetCurrentProcess() -> *mut c_void;
     fn GetProcessTimes(
         process: *mut c_void,
@@ -28,6 +64,53 @@ unsafe extern "system" {
         kernel: *mut u64,
         user: *mut u64,
     ) -> i32;
+}
+#[repr(C)]
+struct ThreadEntry {
+    size: u32,
+    usage: u32,
+    id: u32,
+    owner: u32,
+    base_priority: i32,
+    delta_priority: i32,
+    flags: u32,
+}
+
+// Capture existing, named Hook threads. Waiting on their OS handles tests actual
+// completion; a stopped session alone does not mean DLL threads have finished.
+unsafe fn hook_workers() -> Vec<OwnedHandle> {
+    let raw = CreateToolhelp32Snapshot(4, 0);
+    assert_ne!(raw as isize, -1);
+    let snapshot = OwnedHandle::from_raw_handle(raw);
+    let mut entry: ThreadEntry = std::mem::zeroed();
+    entry.size = std::mem::size_of::<ThreadEntry>() as u32;
+    let mut found = Vec::new();
+    let mut valid = Thread32First(snapshot.as_raw_handle(), &mut entry);
+    while valid != 0 {
+        if entry.owner == std::process::id() {
+            let raw = OpenThread(0x0010_0800, 0, entry.id);
+            if !raw.is_null() {
+                let thread = OwnedHandle::from_raw_handle(raw);
+                let mut description = std::ptr::null_mut();
+                if GetThreadDescription(thread.as_raw_handle(), &mut description) >= 0
+                    && !description.is_null()
+                {
+                    let mut len = 0;
+                    while *description.add(len) != 0 {
+                        len += 1;
+                    }
+                    let name =
+                        String::from_utf16_lossy(std::slice::from_raw_parts(description, len));
+                    LocalFree(description.cast());
+                    if matches!(name.as_str(), "netburrow-hook" | "netburrow-ipc-read") {
+                        found.push(thread);
+                    }
+                }
+            }
+        }
+        valid = Thread32Next(snapshot.as_raw_handle(), &mut entry);
+    }
+    found
 }
 static NATIVE_SENDS: AtomicUsize = AtomicUsize::new(0);
 static REQUESTS: AtomicUsize = AtomicUsize::new(0);
@@ -198,6 +281,11 @@ unsafe fn run() {
         Message::Diagnostic(_)
     ));
     assert_eq!(read_message(&mut socket).unwrap(), Message::IpcReady);
+    let mut workers = Vec::new();
+    eventually(|| {
+        workers = hook_workers();
+        workers.len() == 2
+    });
     println!("IPC ready; verifying receive without synthetic callbacks");
     let callback_table = [
         callback_run as *const () as usize,
@@ -229,6 +317,7 @@ unsafe fn run() {
     .unwrap();
     write_message(&mut socket, &Message::IpcReady).unwrap();
     let incoming = Packet {
+        delivery: None,
         from: 202,
         to: 101,
         source_epoch: 22,
@@ -302,7 +391,58 @@ unsafe fn run() {
     }
     assert!(send(object, 303, b"native".as_ptr().cast(), 6, 2, 0));
     assert_eq!(NATIVE_SENDS.load(Ordering::SeqCst), 1);
+    // Validate the actual x86 ABI and IPC path, including buffering across channels.
+    for (payload, kind, channel) in [(b"a", 3, 4), (b"b", 3, 5), (b"c", 2, 4)] {
+        assert!(send(object, 202, payload.as_ptr().cast(), 1, kind, channel));
+    }
+    for (expected, kind, channel) in [(b"a", 3, 4), (b"b", 3, 5), (b"c", 2, 4)] {
+        loop {
+            match read_message(&mut socket).unwrap() {
+                Message::Ping(n) => write_message(&mut socket, &Message::Pong(n)).unwrap(),
+                Message::IpcHealth(_) => {}
+                Message::Data(packet) => {
+                    assert_eq!(packet.payload, expected);
+                    assert_eq!((packet.send_type, packet.channel), (kind, channel));
+                    break;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    println!(
+        "PASS: mixed buffered reliable packets preserve order across channels through x86 Hook/IPC"
+    );
     // Real-time consumption pause: Hook stays live while the game does not call ReadP2PPacket.
+    let mut retained=incoming.clone();retained.channel=7;retained.payload=b"r".to_vec();
+    write_message(&mut socket,&Message::Data(retained)).unwrap();
+    let duplicate=SESSION.lock().unwrap().as_ref().unwrap().pending().last().unwrap().clone();
+    eventually(||available(object,&mut count,7));
+    socket.shutdown(std::net::Shutdown::Both).unwrap();drop(socket);
+    let mut replacement=None;
+    eventually(||{replacement=listener.accept().ok().map(|p|p.0);replacement.is_some()});
+    let mut socket=replacement.unwrap();socket.set_nonblocking(false).unwrap();socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    match netburrow_protocol::read_message(&mut socket).unwrap() {
+        Message::IpcResume{nonce,pid,steam_id,epoch,received}=>{
+            assert_eq!((nonce,pid,steam_id,epoch),([7;16],std::process::id(),101,11));
+            SESSION.lock().unwrap().as_mut().unwrap().acknowledge(received).unwrap();
+        }
+        other=>panic!("expected original IPC session resume, got {other:?}"),
+    }
+    let through=SESSION.lock().unwrap().as_ref().unwrap().received_through();
+    netburrow_protocol::write_message(&mut socket,&Message::SessionAck(through)).unwrap();
+    for (sequence,body) in SESSION.lock().unwrap().as_ref().unwrap().pending(){netburrow_protocol::write_message(&mut socket,&Message::SessionFrame{sequence,body}).unwrap();}
+    netburrow_protocol::write_message(&mut socket,&Message::SessionFrame{sequence:duplicate.0,body:duplicate.1}).unwrap();
+    assert!(matches!(read_message(&mut socket).unwrap(),Message::Diagnostic(_)));
+    assert_eq!(read_message(&mut socket).unwrap(),Message::IpcReady);
+    let mut data=[0u8;1];
+    assert!(read(object,data.as_mut_ptr().cast(),1,&mut count,&mut remote,7));assert_eq!(data,*b"r");
+    // Wait for a ping after replay processing before asserting duplicate suppression.
+    loop {match read_message(&mut socket).unwrap(){Message::Ping(n)=>{write_message(&mut socket,&Message::Pong(n)).unwrap();break;},Message::IpcHealth(_)=>{},other=>panic!("unexpected recovery message {other:?}")}}
+    assert!(!available(object,&mut count,7));
+    eventually(||{workers=hook_workers();workers.len()==2});
+    assert!(send(object,202,b"resume".as_ptr().cast(),6,2,8));
+    loop {match read_message(&mut socket).unwrap(){Message::Data(p)=>{assert_eq!(p.payload,b"resume");break;},Message::Ping(n)=>write_message(&mut socket,&Message::Pong(n)).unwrap(),Message::IpcHealth(_)=>{},other=>panic!("unexpected {other:?}")}}
+    println!("PASS: original x86 Hook survives IPC reconnect, preserves queued reliable data and suppresses replay duplicates");
     println!("Starting 20s no-read backlog test (three peers, 90% dominant traffic)");
     write_message(
         &mut socket,
@@ -346,6 +486,7 @@ unsafe fn run() {
             write_message(
                 &mut socket,
                 &Message::Data(Packet {
+                    delivery: None,
                     from: peer,
                     to: 101,
                     source_epoch: epoch,
@@ -412,6 +553,13 @@ unsafe fn run() {
     );
     SteamAPI_UnregisterCallback((&mut request as *mut Callback).cast());
     SteamAPI_UnregisterCallback((&mut failure as *mut Callback).cast());
+    for worker in workers {
+        assert_eq!(
+            WaitForSingleObject(worker.as_raw_handle(), 4_000),
+            0,
+            "Hook thread did not terminate after Stop"
+        );
+    }
     println!(
         "PASS: x86 helper identity rejection, DLL load, IPC identity, receive-first acceptance without synthetic callbacks, channel/truncated read, no-delay first-packet routing and stop without fallback"
     );

@@ -10,6 +10,7 @@ pub enum Quality {
 }
 
 pub fn connection_quality(snapshot: &Snapshot, now: Instant) -> (Quality, &'static str) {
+    if snapshot.relay_recovering {return (Quality::Abnormal,"正在恢复原 Relay 会话，暂时保留游戏接入");}
     if snapshot.phase == Phase::Stopped {
         return (Quality::Pending, "启用后开始测量");
     }

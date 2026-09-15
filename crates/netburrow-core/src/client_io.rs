@@ -7,7 +7,7 @@ use std::{
     io,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -17,6 +17,18 @@ use tokio::{
     sync::Notify,
     task::JoinHandle,
 };
+
+#[derive(Clone, Default)]
+pub(crate) struct Session {
+    pub window: Arc<Mutex<netburrow_protocol::resume::Window>>,
+    pub enabled: Arc<AtomicBool>,
+}
+impl Session {
+    pub fn enabled(&self) -> bool {self.enabled.load(Ordering::Acquire)}
+    pub fn enable(&self) {self.enabled.store(true,Ordering::Release);}
+    pub fn received(&self)->u64 {self.window.lock().unwrap_or_else(|p|p.into_inner()).received_through()}
+    pub fn acknowledge(&self,n:u64)->io::Result<()> {self.window.lock().unwrap_or_else(|p|p.into_inner()).acknowledge(n)}
+}
 
 struct State {
     frames: Frames,
@@ -35,6 +47,10 @@ pub(crate) struct Mailbox {
     budget: Budget,
 }
 impl Mailbox {
+    pub fn reopen(&self) {
+        let mut s=self.state.lock().unwrap_or_else(|p|p.into_inner());
+        s.closed=false;s.error=None;s.active=Instant::now();s.pong=s.active;s.writing_since=None;
+    }
     #[cfg(test)]
     pub fn new(by_source: bool) -> Self {
         Self::with_budget(by_source, Budget::default())
@@ -178,15 +194,17 @@ impl Mailbox {
 }
 
 pub(crate) struct Writer {
+    pub session: Session,
     pub queue: Mailbox,
     pub completed: Arc<AtomicU64>,
     pub udp_completed: Arc<AtomicU64>,
-    failure: Arc<Mutex<Option<String>>>,
+    failure: Arc<Mutex<Option<(io::ErrorKind,String)>>>,
+    deadline: Duration,
     task: JoinHandle<()>,
 }
 impl Writer {
     pub fn with_budget(
-        mut socket: OwnedWriteHalf,
+        socket: OwnedWriteHalf,
         by_source: bool,
         deadline: Duration,
         budget: Budget,
@@ -196,15 +214,73 @@ impl Writer {
         let completed = Arc::new(AtomicU64::new(0));
         let done = completed.clone();
         let failure = Arc::new(Mutex::new(None));
-        let error = failure.clone();
         let udp_completed = Arc::new(AtomicU64::new(0));
-        let udp_done = udp_completed.clone();
-        let task = tokio::spawn(async move {
+        let session=Session::default();
+        let task=spawn_writer(socket,input,done,udp_completed.clone(),failure.clone(),deadline,session.clone());
+        Self {session,queue,completed,udp_completed,failure,deadline,task}
+    }
+    pub async fn suspend(&mut self) {
+        self.task.abort();
+        // Cancellation must finish before a replacement snapshots the replay window.
+        let _ = (&mut self.task).await;
+    }
+    pub fn rebind(&mut self,socket:OwnedWriteHalf) {
+        self.task.abort();self.queue.reopen();
+        *self.failure.lock().unwrap_or_else(|p|p.into_inner())=None;
+        self.task=spawn_writer(socket,self.queue.clone(),self.completed.clone(),self.udp_completed.clone(),self.failure.clone(),self.deadline,self.session.clone());
+    }
+    pub fn send(&self, message: Message) -> io::Result<Admission> {
+        if !self.session.enabled() {self.check()?;}
+        self.queue.post(message)
+    }
+    pub fn check(&self) -> io::Result<()> {
+        match self.failure.lock().unwrap_or_else(|p|p.into_inner()).as_ref() {
+            Some((kind,e)) => Err(io::Error::new(*kind,e.clone())), None => Ok(())
+        }
+    }
+    pub fn report_failure(&self, error: io::Error) {
+        *self.failure.lock().unwrap_or_else(|p| p.into_inner()) = Some((error.kind(),error.to_string()));
+        self.task.abort();
+        self.queue.close(None);
+    }
+    pub fn count(&self) -> u64 { self.completed.load(Ordering::Relaxed) }
+    pub fn slow(&self) -> bool {
+        self.queue.state.lock().unwrap_or_else(|p| p.into_inner()).writing_since.is_some_and(|t| t.elapsed() >= netburrow_protocol::local::IPC_WARNING)
+    }
+    pub fn udp_count(&self) -> u64 {self.udp_completed.load(Ordering::Relaxed)}
+    pub fn send_data(&self, message: Message, udp: bool) -> io::Result<Admission> {
+        if !self.session.enabled() {self.check()?;}
+        self.queue.post_tagged(message, udp)
+    }
+    pub async fn drain(&self) -> io::Result<()> {
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                self.check()?;
+                let idle = {let state = self.queue.state.lock().unwrap_or_else(|p| p.into_inner());state.writing_since.is_none() && state.frames.is_empty()};
+                if idle {return Ok(());}
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control drain deadline"))?
+    }
+}
+
+fn spawn_writer(mut socket:OwnedWriteHalf,input:Mailbox,done:Arc<AtomicU64>,udp_done:Arc<AtomicU64>,error:Arc<Mutex<Option<(io::ErrorKind,String)>>>,deadline:Duration,session:Session)->JoinHandle<()> {
+    tokio::spawn(async move {
+        let result=async {
+            let replay=session.window.lock().unwrap_or_else(|p|p.into_inner()).pending();
+            for (sequence,body) in replay {
+                let bytes=encode(&Message::SessionFrame {sequence,body})?;
+                tokio::time::timeout(deadline,socket.write_all(&bytes)).await.map_err(|_|io::Error::new(io::ErrorKind::TimedOut,"replay write deadline"))??;
+            }
             while let Some(message) = input.next(false).await {
                 let result = async {
                     let (message, udp) = message?;
                     let data = matches!(message, Message::Data(_));
-                    let bytes = encode(&message)?;
+                    let bytes = if session.enabled() && netburrow_protocol::replayable(&message) {
+                        let body=encode(&message)?;
+                        let sequence=session.window.lock().unwrap_or_else(|p|p.into_inner()).retain(body.clone()).map_err(|e|io::Error::new(io::ErrorKind::InvalidData,format!("resume buffer exhausted: {e}")))?;
+                        encode(&Message::SessionFrame {sequence,body})?
+                    } else {encode(&message)?};
                     drop(message);
                     tokio::time::timeout(deadline, socket.write_all(&bytes))
                         .await
@@ -221,9 +297,7 @@ impl Writer {
                 }
                 .await;
                 if let Err(e) = result {
-                    *error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e.to_string());
-                    input.close(None);
-                    return;
+                    return Err(e);
                 }
                 input
                     .state
@@ -231,70 +305,13 @@ impl Writer {
                     .unwrap_or_else(|p| p.into_inner())
                     .writing_since = None;
             }
-        });
-        Self {
-            queue,
-            completed,
-            udp_completed,
-            failure,
-            task,
+            Ok::<_,io::Error>(())
+        }.await;
+        if let Err(e)=result {
+            *error.lock().unwrap_or_else(|p|p.into_inner())=Some((e.kind(),e.to_string()));
+            if !session.enabled() {input.close(None);}
         }
-    }
-    pub fn send(&self, message: Message) -> io::Result<Admission> {
-        self.check()?;
-        self.queue.post(message)
-    }
-    pub fn check(&self) -> io::Result<()> {
-        match self
-            .failure
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-        {
-            Some(e) => Err(io::Error::other(e.clone())),
-            None => Ok(()),
-        }
-    }
-    pub fn report_failure(&self, error: io::Error) {
-        *self.failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.to_string());
-        self.task.abort();
-        self.queue.close(None);
-    }
-    pub fn count(&self) -> u64 {
-        self.completed.load(Ordering::Relaxed)
-    }
-    pub fn slow(&self) -> bool {
-        self.queue
-            .state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .writing_since
-            .is_some_and(|t| t.elapsed() >= netburrow_protocol::local::IPC_WARNING)
-    }
-    pub fn udp_count(&self) -> u64 {
-        self.udp_completed.load(Ordering::Relaxed)
-    }
-    pub fn send_data(&self, message: Message, udp: bool) -> io::Result<Admission> {
-        self.check()?;
-        self.queue.post_tagged(message, udp)
-    }
-    pub async fn drain(&self) -> io::Result<()> {
-        tokio::time::timeout(Duration::from_millis(250), async {
-            loop {
-                self.check()?;
-                let idle = {
-                    let state = self.queue.state.lock().unwrap_or_else(|p| p.into_inner());
-                    state.writing_since.is_none() && state.frames.is_empty()
-                };
-                if idle {
-                    return Ok(());
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control drain deadline"))?
-    }
+    })
 }
 impl Drop for Writer {
     fn drop(&mut self) {
@@ -303,16 +320,43 @@ impl Drop for Writer {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn reader(
-    mut socket: impl AsyncRead + Unpin + Send + 'static,
+    socket: impl AsyncRead + Unpin + Send + 'static,
     queue: Mailbox,
     ipc: bool,
 ) -> JoinHandle<()> {
+    reader_inner(socket,queue,ipc,None)
+}
+pub(crate) fn reader_resumable(socket:impl AsyncRead+Unpin+Send+'static,queue:Mailbox,ipc:bool,session:Session,ack_queue:Mailbox)->JoinHandle<()> {
+    reader_inner(socket,queue,ipc,Some((session,ack_queue)))
+}
+fn reader_inner(mut socket:impl AsyncRead+Unpin+Send+'static,queue:Mailbox,ipc:bool,session:Option<(Session,Mailbox)>)->JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let result = read_frame(&mut socket, ipc).await;
             match result {
-                Ok(message) => {
+                Ok(mut message) => {
+                    let mut sequence=None;
+                    if let Some((link,ack))=&session {
+                        let result=(||->io::Result<bool>{
+                            match &message {
+                                Message::SessionAck(n)=>{link.acknowledge(*n)?;return Ok(false);}
+                                Message::RecoveryOffer(_)=>link.enable(),
+                                Message::SessionFrame {sequence:n,body}=>{
+                                    if !link.enabled(){return Err(io::Error::new(io::ErrorKind::InvalidData,"resume frame before negotiation"));}
+                                    if !link.window.lock().unwrap_or_else(|p|p.into_inner()).classify(*n)? {
+                                        ack.post(Message::SessionAck(link.received()))?;return Ok(false);
+                                    }
+                                    sequence=Some(*n);
+                                    message=netburrow_protocol::decode_session_body(body)?;
+                                }
+                                _=>{}
+                            }
+                            Ok(true)
+                        })();
+                        match result {Ok(false)=>continue,Ok(true)=>{},Err(e)=>{queue.close(Some(e));return;}}
+                    }
                     if !ipc
                         && matches!(
                             message,
@@ -329,6 +373,10 @@ pub(crate) fn reader(
                     if let Err(e) = queue.post(message) {
                         queue.close(Some(e));
                         return;
+                    }
+                    if let (Some(n),Some((link,ack)))=(sequence,&session) {
+                        let result=link.window.lock().unwrap_or_else(|p|p.into_inner()).received(n);
+                        if let Err(e)=result.and_then(|_|ack.post(Message::SessionAck(link.received())).map(|_|())) {queue.close(Some(e));return;}
                     }
                 }
                 Err(e) => {
@@ -382,6 +430,7 @@ mod tests {
         let writer = Writer::with_budget(write, false, IPC_TIMEOUT, Budget::default());
         for n in 0u8..8 {
             let m = Message::Data(netburrow_protocol::Packet {
+                delivery: None,
                 from: 10,
                 to: 20 + u64::from(n % 3),
                 source_epoch: 100,
@@ -415,6 +464,7 @@ mod tests {
         let second = Mailbox::with_budget(true, budget);
         let packet = || {
             Message::Data(netburrow_protocol::Packet {
+                delivery: None,
                 from: 20,
                 to: 10,
                 source_epoch: 200,
@@ -485,6 +535,7 @@ mod tests {
         let q = Mailbox::new(true);
         for n in 0..4096 {
             q.post(Message::Data(netburrow_protocol::Packet {
+                delivery: None,
                 from: 20 + n % 3,
                 to: 10,
                 source_epoch: 200 + n % 3,

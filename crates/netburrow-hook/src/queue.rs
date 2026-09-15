@@ -12,12 +12,14 @@ const BYTE_LIMIT: usize = 4 * 1024 * 1024;
 const PACKET_LIMIT: usize = 1024;
 
 struct Remote {
+    member: u64,
     epoch: u64,
     online: bool,
     accepted: bool,
     channels: HashSet<i32>,
     failed: bool,
     health: HookPeerHealth,
+    last_session: Option<(bool, u8)>,
 }
 struct Incoming {
     packet: Packet,
@@ -116,6 +118,7 @@ pub struct Bridge {
     in_bytes: usize,
     pub health: HookHealth,
     pub send_rejections: SendRejections,
+    pub telemetry: crate::telemetry::Telemetry,
     faults: VecDeque<(u64, u64)>,
     read_cursors: BTreeMap<i32, (u64, u64)>,
 }
@@ -133,6 +136,7 @@ impl Bridge {
             in_bytes: 0,
             health: HookHealth::default(),
             send_rejections: SendRejections::default(),
+            telemetry: crate::telemetry::Telemetry::default(),
             faults: VecDeque::new(),
             read_cursors: BTreeMap::new(),
         }
@@ -148,7 +152,7 @@ impl Bridge {
                 .find(|p| p.steam_id == id && p.epoch != 0)
                 .map(|p| p.epoch);
             if epoch != Some(peer.epoch) {
-                if peer.accepted {
+                if peer.online {
                     changed.push(id);
                 }
                 peer.online = false;
@@ -157,27 +161,39 @@ impl Bridge {
             }
         }
         for id in changed {
-            self.drop_peer_packets(id, None);
+            self.drop_peer_packets(id, None, "member_unbound_or_rebound");
         }
         for peer in peers
             .iter()
             .filter(|p| p.steam_id != 0 && p.steam_id != self.steam_id && p.epoch != 0)
         {
+            if !self.remotes.contains_key(&peer.steam_id) {
+                self.telemetry
+                    .event(peer.client_id, "member_bound", None, 0, 0);
+            }
             let remote = self.remotes.entry(peer.steam_id).or_insert_with(|| Remote {
+                member: peer.client_id,
                 epoch: peer.epoch,
                 online: true,
                 accepted: false,
                 channels: HashSet::new(),
                 failed: false,
                 health: HookPeerHealth::default(),
+                last_session: None,
             });
+            if remote.epoch != peer.epoch || !remote.online {
+                self.telemetry
+                    .event(peer.client_id, "member_bound", None, 0, 0);
+            }
             if remote.epoch != peer.epoch {
                 remote.health = HookPeerHealth::default();
+                remote.last_session = None;
                 remote.failed = false;
                 remote.accepted = false;
                 remote.channels.clear();
             }
             remote.epoch = peer.epoch;
+            remote.member = peer.client_id;
             remote.online = true;
         }
         // Keep only packets from the current remote incarnation, including unaccepted queues.
@@ -199,6 +215,10 @@ impl Bridge {
         }
         self.active = false;
         self.stopped = true;
+        let peers: Vec<_> = self.remotes.keys().copied().collect();
+        for id in peers {
+            self.drop_peer_packets(id, None, "hook_stopped");
+        }
         for remote in self.remotes.values_mut() {
             remote.online = false;
             remote.accepted = false;
@@ -215,6 +235,15 @@ impl Bridge {
         if let Some(peer) = self.remotes.get_mut(&to) {
             peer.health.send_calls += 1;
             peer.health.send_rejected += u64::from(result == Some(false));
+            if let Some(flow) = self.telemetry.flow(peer.member, channel, send_type) {
+                if result == Some(true) {
+                    flow.sent += 1;
+                    flow.sent_bytes += bytes.len() as u64;
+                    flow.last_send = Some(Instant::now());
+                } else {
+                    flow.rejected += 1;
+                }
+            }
         }
         if result == Some(false) {
             self.health.send_rejected += 1;
@@ -262,6 +291,7 @@ impl Bridge {
         // Dropping them until acceptance would leave both sides waiting forever.
         outbound.push(Outgoing {
             packet: Packet {
+                delivery: None,
                 from: self.steam_id,
                 to,
                 source_epoch: self.epoch,
@@ -282,6 +312,7 @@ impl Bridge {
     }
     pub fn receive(&mut self, packet: Packet) -> Admission {
         let id = packet.from;
+        let (channel, kind, bytes) = (packet.channel, packet.send_type, packet.payload.len());
         let current = packet.to == self.steam_id
             && packet.target_epoch == self.epoch
             && self
@@ -289,6 +320,17 @@ impl Bridge {
                 .get(&id)
                 .is_some_and(|p| p.epoch == packet.source_epoch);
         let result = self.receive_inner(packet);
+        if let Some(peer) = self.remotes.get(&id) {
+            if let Some(flow) = self.telemetry.flow(peer.member, channel, kind) {
+                flow.received += 1;
+                flow.received_bytes += bytes as u64;
+                flow.stale_received += u64::from(!current);
+                flow.last_receive = Some(Instant::now());
+                if result != Admission::Queued {
+                    flow.dropped += 1;
+                }
+            }
+        }
         if current {
             if let Some(peer) = self.remotes.get_mut(&id) {
                 peer.health.received += 1;
@@ -362,6 +404,12 @@ impl Bridge {
                 self.health.dropped += 1;
                 if let Some(peer) = self.remotes.get_mut(&removed.from) {
                     peer.health.dropped += 1;
+                    if let Some(flow) =
+                        self.telemetry
+                            .flow(peer.member, removed.channel, removed.send_type)
+                    {
+                        flow.dropped += 1;
+                    }
                 }
             }
         }
@@ -385,9 +433,12 @@ impl Bridge {
         });
         Admission::Queued
     }
-    pub fn available(&self, channel: i32) -> Option<usize> {
-        self.read_index(channel)
-            .map(|i| self.inbound[i].payload.len())
+    pub fn available(&mut self, channel: i32) -> Option<usize> {
+        let result = self
+            .read_index(channel)
+            .map(|i| self.inbound[i].payload.len());
+        self.telemetry.poll(channel, false, result.is_some());
+        result
     }
     fn read_index(&self, channel: i32) -> Option<usize> {
         fair_index(
@@ -400,7 +451,9 @@ impl Bridge {
     }
     pub fn read(&mut self, channel: i32) -> Option<Packet> {
         self.health.read_calls += 1;
-        let index = self.read_index(channel)?;
+        let index = self.read_index(channel);
+        self.telemetry.poll(channel, true, index.is_some());
+        let index = index?;
         let packet = self.inbound.remove(index)?;
         self.read_cursors
             .insert(channel, (packet.from, packet.source_epoch));
@@ -411,14 +464,25 @@ impl Bridge {
         self.health.consumed += 1;
         if let Some(peer) = self.remotes.get_mut(&packet.from) {
             peer.health.consumed += 1;
+            if let Some(flow) = self
+                .telemetry
+                .flow(peer.member, packet.channel, packet.send_type)
+            {
+                flow.consumed += 1;
+                flow.consumed_bytes += packet.payload.len() as u64;
+                flow.last_read = Some(Instant::now());
+            }
         }
         Some(packet.packet)
     }
     pub fn accept(&mut self, id: u64) -> Option<bool> {
         let peer = self.remotes.get_mut(&id)?;
         if !self.active || !peer.online || peer.failed {
+            self.telemetry
+                .event(peer.member, "accept_rejected", None, 0, 0);
             return Some(false);
         }
+        self.telemetry.event(peer.member, "accept", None, 0, 0);
         peer.accepted = true;
         Some(true)
     }
@@ -432,7 +496,7 @@ impl Bridge {
         if peer.channels.is_empty() {
             peer.accepted = false;
         }
-        self.drop_peer_packets(id, channel);
+        self.drop_peer_packets(id, channel, "game_close");
         Some(true)
     }
     pub fn session(&self, id: u64) -> Option<(bool, usize, usize)> {
@@ -458,6 +522,29 @@ impl Bridge {
     pub fn peer_failed(&self, id: u64) -> bool {
         self.remotes.get(&id).is_some_and(|p| p.failed)
     }
+    pub fn observe_session(&mut self, id: u64, active: bool, error: u8) {
+        self.telemetry.session_calls += 1;
+        self.telemetry.session_inactive += u64::from(!active);
+        self.telemetry.session_failed += u64::from(error != 0);
+        if let Some(peer) = self.remotes.get_mut(&id) {
+            if peer.last_session != Some((active, error)) {
+                self.telemetry.event(
+                    peer.member,
+                    if error != 0 {
+                        "session_failed"
+                    } else if active {
+                        "session_active"
+                    } else {
+                        "session_inactive"
+                    },
+                    None,
+                    0,
+                    0,
+                );
+                peer.last_session = Some((active, error));
+            }
+        }
+    }
     pub fn fail_peer(&mut self, id: u64, epoch: u64) {
         let Some(peer) = self.remotes.get_mut(&id) else {
             return;
@@ -467,7 +554,7 @@ impl Bridge {
         }
         peer.failed = true;
         peer.accepted = false;
-        self.drop_peer_packets(id, None);
+        self.drop_peer_packets(id, None, "peer_failed");
         self.faults.push_back((id, epoch));
     }
     pub fn pop_fault(&mut self) -> Option<(u64, u64)> {
@@ -518,7 +605,7 @@ impl Bridge {
             .retain(|channel, _| self.inbound.iter().any(|p| p.channel == *channel));
         self.in_bytes = self.inbound.iter().map(|p| p.payload.len()).sum();
     }
-    fn drop_peer_packets(&mut self, id: u64, channel: Option<i32>) {
+    fn drop_peer_packets(&mut self, id: u64, channel: Option<i32>, reason: &'static str) {
         let discarded = self
             .inbound
             .iter()
@@ -526,11 +613,46 @@ impl Bridge {
             .count();
         if let Some(peer) = self.remotes.get_mut(&id) {
             peer.health.discarded += discarded as u64;
+            for packet in self
+                .inbound
+                .iter()
+                .filter(|p| p.from == id && channel.is_none_or(|c| p.channel == c))
+            {
+                if let Some(flow) =
+                    self.telemetry
+                        .flow(peer.member, packet.channel, packet.send_type)
+                {
+                    flow.cleared_in += 1;
+                }
+            }
+            let mut outgoing = self
+                .outbound
+                .queue
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let mut cleared_out = 0;
+            for item in outgoing
+                .packets
+                .iter()
+                .filter(|p| p.packet.to == id && channel.is_none_or(|c| p.packet.channel == c))
+            {
+                cleared_out += 1;
+                if let Some(flow) =
+                    self.telemetry
+                        .flow(peer.member, item.packet.channel, item.packet.send_type)
+                {
+                    flow.cleared_out += 1;
+                }
+            }
+            self.telemetry
+                .event(peer.member, reason, channel, discarded, cleared_out);
+            outgoing
+                .packets
+                .retain(|p| p.packet.to != id || channel.is_some_and(|c| p.packet.channel != c));
+            outgoing.recount();
         }
         self.inbound
             .retain(|p| p.from != id || channel.is_some_and(|c| p.channel != c));
-        self.outbound
-            .retain(|p| p.packet.to != id || channel.is_some_and(|c| p.packet.channel != c));
         self.recount();
     }
 }
@@ -539,6 +661,107 @@ impl Bridge {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+    #[test]
+    fn diagnostics_distinguish_polling_consumption_stale_data_and_session_cleanup() {
+        let mut b = bridge();
+        assert_eq!(b.send(20, b"one", 2, 1), Some(true));
+        assert_eq!(b.send(20, b"two", 1, 2), Some(true));
+        assert_eq!(b.receive(incoming(1)), Admission::Queued);
+        assert_eq!(b.receive(incoming(1)), Admission::Queued);
+        let mut stale = incoming(1);
+        stale.source_epoch += 1;
+        assert_eq!(b.receive(stale), Admission::Dropped);
+        assert_eq!(b.available(7), None);
+        assert_eq!(b.read(7), None);
+        assert_eq!(b.available(1), Some(3));
+        assert!(b.read(1).is_some());
+        b.observe_session(20, true, 0);
+        b.close(20, Some(1));
+        // Closing one channel must preserve the other queued outgoing packet.
+        assert_eq!(b.pop_outgoing().unwrap().channel, 2);
+        assert!(b.pop_outgoing().is_none());
+        b.fail_peer(20, 200);
+        b.observe_session(20, false, 4);
+        assert_eq!(b.send(20, b"bad", 2, 1), Some(false));
+        let lines = b.telemetry.take_snapshot().lines();
+        let flow = lines
+            .iter()
+            .find(|s| s.starts_with("flow member=2 channel=1 kind=2 "))
+            .unwrap();
+        assert!(flow.contains("sent=1 sent_bytes=3 rejected=1 received=3 received_bytes=9 consumed=1 consumed_bytes=3 dropped=1 stale_received=1 cleared_in=1 cleared_out=1"), "{flow}");
+        assert!(lines.iter().any(|s| s.contains(
+            "poll channel=7 available_calls=1 available_empty=1 read_calls=1 read_empty=1"
+        )));
+        assert!(
+            lines
+                .iter()
+                .any(|s| s.contains("reason=game_close channel=1 cleared_in=1 cleared_out=1"))
+        );
+        assert!(lines.iter().any(|s| s.contains("reason=session_failed")));
+        assert!(
+            lines
+                .iter()
+                .any(|s| s.contains("session_calls=2 session_inactive=1 session_failed=1"))
+        );
+        assert!(
+            !b.telemetry
+                .take_snapshot()
+                .lines()
+                .iter()
+                .any(|s| s.starts_with("event "))
+        );
+    }
+
+    #[test]
+    fn mixed_buffered_reliable_packets_flush_in_order_across_channels_and_peers() {
+        let mut b = bridge();
+        b.members(&[
+            Peer {
+                client_id: 2,
+                steam_id: 20,
+                epoch: 200,
+            },
+            Peer {
+                client_id: 3,
+                steam_id: 30,
+                epoch: 300,
+            },
+        ]);
+        for peer in [20, 30] {
+            for seq in 0..12u8 {
+                assert_eq!(
+                    b.send(
+                        peer,
+                        &[seq],
+                        if seq == 11 { 2 } else { 3 },
+                        i32::from(seq % 2)
+                    ),
+                    Some(true)
+                );
+            }
+        }
+        let mut sequences = BTreeMap::<u64, Vec<u8>>::new();
+        while let Some(packet) = b.pop_outgoing() {
+            sequences
+                .entry(packet.to)
+                .or_default()
+                .push(packet.payload[0]);
+        }
+        assert_eq!(sequences.len(), 2);
+        for sequence in sequences.values() {
+            assert_eq!(*sequence, (0..12u8).collect::<Vec<_>>());
+        }
+        assert_eq!(b.health().dropped, 0);
+        b.members(&[Peer {
+            client_id: 2,
+            steam_id: 20,
+            epoch: 201,
+        }]);
+        b.fail_peer(20, 200);
+        assert_eq!(b.send(20, b"new epoch", 2, 0), Some(true));
+        assert_eq!(b.pop_outgoing().unwrap().target_epoch, 201);
+        assert_eq!(b.session(20).unwrap().0, true);
+    }
     #[test]
     fn idle_poll_and_buffered_flush_work_without_pending_flag() {
         let mut b = bridge();
@@ -901,6 +1124,7 @@ mod tests {
     }
     fn incoming(channel: i32) -> Packet {
         Packet {
+            delivery: None,
             from: 20,
             to: 10,
             source_epoch: 200,

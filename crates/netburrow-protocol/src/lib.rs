@@ -6,7 +6,8 @@
 use std::io::{self, ErrorKind, Read, Write};
 
 pub mod local;
-pub const IPC_CAPABILITIES: u32 = 3;
+pub mod resume;
+pub const IPC_CAPABILITIES: u32 = 7;
 pub const MAX_HEALTH_PEERS: usize = 1024;
 
 /// Loopback-only identity. Logs/exports map it to a temporary member slot.
@@ -46,6 +47,28 @@ pub struct HookHealth {
 pub const MAX_PAYLOAD: usize = 1024 * 1024;
 pub const MAX_FRAME: usize = MAX_PAYLOAD + 256;
 pub const UDP_LIMIT: usize = 1200;
+
+/// Opt in using an existing Ping so old Relays safely reply with only Pong.
+/// New Relays send DiagnosticsPeers only to clients that used this value.
+pub const DIAGNOSTICS_PING: u64 = 0x4e42_4449_4147_0001;
+pub const RECOVERY_PING: u64 = 0x4e42_5253_554d_0001;
+pub const RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Delivery {
+    pub stream: u64,
+    pub sequence: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerProbe {
+    pub from: u64,
+    pub to: u64,
+    pub source_epoch: u64,
+    pub target_epoch: u64,
+    pub id: u64,
+    pub reply: bool,
+}
 
 pub type Token = [u8; 16];
 pub type Group = [u8; 32];
@@ -87,6 +110,8 @@ pub struct Peer {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Packet {
+    /// Network-only metadata; removed before delivery to the game Hook.
+    pub delivery: Option<Delivery>,
     pub from: u64,
     pub to: u64,
     pub source_epoch: u64,
@@ -148,6 +173,14 @@ pub enum Message {
     Diagnostic(String),
     Status(MemberStatus),
     Statuses(Vec<PeerStatus>),
+    DiagnosticsPeers(Vec<u64>),
+    PeerProbe(PeerProbe),
+    RecoveryOffer(Token),
+    Resume { client_id: u64, key: Token, received: u64 },
+    Resumed { client_id: u64, received: u64 },
+    SessionFrame { sequence: u64, body: Vec<u8> },
+    SessionAck(u64),
+    IpcResume { nonce: Token, pid: u32, steam_id: u64, epoch: u64, received: u64 },
     // Loopback-only messages. Existing public NBP1 tags/layouts are unchanged.
     IpcHelloV2 {
         nonce: Token,
@@ -253,7 +286,7 @@ pub fn encode(message: &Message) -> io::Result<Vec<u8>> {
             }
         }
         Message::Data(packet) => {
-            put_type(&mut body, DATA);
+            put_type(&mut body, if packet.delivery.is_some() { 20 } else { DATA });
             encode_packet(&mut body, packet)?;
         }
         Message::Ping(value) => {
@@ -372,6 +405,22 @@ pub fn encode(message: &Message) -> io::Result<Vec<u8>> {
             put_u64(&mut body, *peer);
             put_u64(&mut body, *epoch);
         }
+        Message::DiagnosticsPeers(peers) => {
+            put_type(&mut body, 21);
+            put_u16(&mut body, u16::try_from(peers.len()).map_err(|_| invalid("too many diagnostic peers"))?);
+            for id in peers { put_u64(&mut body, *id); }
+        }
+        Message::PeerProbe(p) => {
+            put_type(&mut body, 22);
+            for value in [p.from, p.to, p.source_epoch, p.target_epoch, p.id] { put_u64(&mut body, value); }
+            body.push(u8::from(p.reply));
+        }
+        Message::RecoveryOffer(key) => { put_type(&mut body,23); body.extend_from_slice(key); }
+        Message::Resume {client_id,key,received} => {put_type(&mut body,24);put_u64(&mut body,*client_id);body.extend_from_slice(key);put_u64(&mut body,*received);}
+        Message::Resumed {client_id,received} => {put_type(&mut body,25);put_u64(&mut body,*client_id);put_u64(&mut body,*received);}
+        Message::SessionFrame {sequence,body:inner} => {put_type(&mut body,26);put_u64(&mut body,*sequence);body.extend_from_slice(inner);}
+        Message::SessionAck(received) => {put_type(&mut body,27);put_u64(&mut body,*received);}
+        Message::IpcResume {nonce,pid,steam_id,epoch,received} => {put_type(&mut body,28);body.extend_from_slice(nonce);put_u32(&mut body,*pid);for n in [steam_id,epoch,received] {put_u64(&mut body,*n);}}
     }
     check_frame_body(&body)?;
     let body_len = u32::try_from(body.len()).map_err(|_| invalid("frame is too large"))?;
@@ -412,6 +461,28 @@ pub fn decode(body: &[u8]) -> io::Result<Message> {
             Message::Members(peers)
         }
         DATA => Message::Data(decode_packet(&mut reader)?),
+        20 => {
+            let mut packet = decode_packet(&mut reader)?;
+            packet.delivery = Some(decode_delivery(&mut reader)?);
+            Message::Data(packet)
+        }
+        21 => {
+            let count = reader.u16()? as usize;
+            if count > (reader.bytes.len() - reader.position) / 8 { return Err(invalid("truncated diagnostic peers")); }
+            let mut peers = Vec::with_capacity(count);
+            for _ in 0..count { peers.push(reader.u64()?); }
+            Message::DiagnosticsPeers(peers)
+        }
+        22 => Message::PeerProbe(PeerProbe {
+            from: reader.u64()?, to: reader.u64()?, source_epoch: reader.u64()?, target_epoch: reader.u64()?, id: reader.u64()?,
+            reply: match reader.u8()? { 0 => false, 1 => true, _ => return Err(invalid("invalid probe reply flag")) },
+        }),
+        23 => Message::RecoveryOffer(reader.take_array()?),
+        24 => Message::Resume {client_id:reader.u64()?,key:reader.take_array()?,received:reader.u64()?},
+        25 => Message::Resumed {client_id:reader.u64()?,received:reader.u64()?},
+        26 => {let sequence=reader.u64()?;let body=reader.bytes(reader.bytes.len()-reader.position)?.to_vec();Message::SessionFrame {sequence,body}},
+        27 => Message::SessionAck(reader.u64()?),
+        28 => Message::IpcResume {nonce:reader.take_array()?,pid:reader.u32()?,steam_id:reader.u64()?,epoch:reader.u64()?,received:reader.u64()?},
         PING => Message::Ping(reader.u64()?),
         PONG => Message::Pong(reader.u64()?),
         LEAVE => Message::Leave,
@@ -592,7 +663,7 @@ pub fn encode_datagram(datagram: &Datagram) -> io::Result<Vec<u8>> {
             if is_reliable(packet.send_type) {
                 return Err(invalid("reliable packets are TCP-only"));
             }
-            put_type(&mut bytes, UDP_DATA);
+            put_type(&mut bytes, if packet.delivery.is_some() { 4 } else { UDP_DATA });
             put_u64(&mut bytes, *client_id);
             bytes.extend_from_slice(token);
             encode_packet(&mut bytes, packet)?;
@@ -620,10 +691,11 @@ pub fn decode_datagram(bytes: &[u8]) -> io::Result<Datagram> {
         UDP_BOUND => Datagram::Bound {
             client_id: reader.u64()?,
         },
-        UDP_DATA => {
+        kind @ (UDP_DATA | 4) => {
             let client_id = reader.u64()?;
             let token = reader.take_array()?;
-            let packet = decode_packet(&mut reader)?;
+            let mut packet = decode_packet(&mut reader)?;
+            if kind == 4 { packet.delivery = Some(decode_delivery(&mut reader)?); }
             if is_reliable(packet.send_type) {
                 return Err(invalid("reliable packets are TCP-only"));
             }
@@ -657,7 +729,35 @@ fn encode_packet(bytes: &mut Vec<u8>, packet: &Packet) -> io::Result<()> {
         u32::try_from(packet.payload.len()).map_err(|_| invalid("payload is too large"))?;
     put_u32(bytes, length);
     bytes.extend_from_slice(&packet.payload);
+    if let Some(d) = packet.delivery {
+        if d.stream == 0 || d.sequence == 0 { return Err(invalid("zero delivery identifier")); }
+        put_u64(bytes, d.stream);
+        put_u64(bytes, d.sequence);
+    }
     Ok(())
+}
+
+/// Only game-reliable data and identity/terminal barriers require replay.
+pub fn replayable(message: &Message) -> bool {
+    matches!(message, Message::Data(p) if is_reliable(p.send_type)) || matches!(message,
+        Message::Bind{..} | Message::Members(_) | Message::IpcReady | Message::IpcPeerFault{..} | Message::Leave | Message::Stop)
+}
+
+pub fn decode_session_body(body: &[u8]) -> io::Result<Message> {
+    if body.len()<9 || u32::from_be_bytes(body[..4].try_into().unwrap()) as usize != body.len()-4 {
+        return Err(invalid("invalid resumed frame length"));
+    }
+    // No recursive envelopes or unsequenced/handshake records inside an envelope.
+    if matches!(body[8],23..=28) {return Err(invalid("nested recovery record"));}
+    let message=decode(&body[4..])?;
+    if !replayable(&message) {return Err(invalid("invalid recovery record kind"));}
+    Ok(message)
+}
+
+fn decode_delivery(reader: &mut SliceReader<'_>) -> io::Result<Delivery> {
+    let d = Delivery { stream: reader.u64()?, sequence: reader.u64()? };
+    if d.stream == 0 || d.sequence == 0 { return Err(invalid("zero delivery identifier")); }
+    Ok(d)
 }
 
 fn decode_packet(reader: &mut SliceReader<'_>) -> io::Result<Packet> {
@@ -669,6 +769,7 @@ fn decode_packet(reader: &mut SliceReader<'_>) -> io::Result<Packet> {
     let send_type = reader.u8()?;
     let payload_length = reader.u32()? as usize;
     let packet = Packet {
+        delivery: None,
         from,
         to,
         source_epoch,
@@ -779,6 +880,51 @@ impl<'a> SliceReader<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_records_roundtrip_and_refuse_nested_or_truncated_payloads() {
+        let data=Message::Data(packet(&vec![7;MAX_PAYLOAD],2));
+        let body=encode(&data).unwrap();
+        let frame=Message::SessionFrame{sequence:1,body:body.clone()};
+        let wire=encode(&frame).unwrap();
+        assert_eq!(decode(&wire[4..]).unwrap(),frame);
+        assert_eq!(decode_session_body(&body).unwrap(),data);
+        assert!(decode_session_body(&body[..body.len()-1]).is_err());
+        assert!(decode_session_body(&wire).is_err());
+        assert!(decode_session_body(&encode(&Message::SessionAck(0)).unwrap()).is_err());
+        for message in [Message::RecoveryOffer([7;16]),Message::Resume{client_id:1,key:[7;16],received:4},Message::Resumed{client_id:1,received:4},Message::SessionAck(4),Message::IpcResume{nonce:[8;16],pid:42,steam_id:11,epoch:111,received:3}] {
+            let bytes=encode(&message).unwrap();assert_eq!(decode(&bytes[4..]).unwrap(),message);
+            assert!(decode(&bytes[4..bytes.len()-1]).is_err());
+        }
+    }
+    #[test]
+    fn diagnostic_extension_preserves_legacy_frames_and_rejects_bad_metadata() {
+        let legacy = Message::Data(packet(b"payload", 0));
+        let old = encode(&legacy).unwrap();
+        assert_eq!(old[8], DATA);
+        assert_eq!(decode(&old[4..]).unwrap(), legacy);
+        let Message::Data(mut p) = legacy else { unreachable!() };
+        p.delivery = Some(Delivery { stream: 9, sequence: 3 });
+        let extended = Message::Data(p.clone());
+        let bytes = encode(&extended).unwrap();
+        assert_eq!(bytes.len(), old.len() + 16);
+        assert_eq!(&bytes[9..old.len()], &old[9..]);
+        assert_eq!(decode(&bytes[4..]).unwrap(), extended);
+        assert!(decode(&bytes[4..bytes.len()-1]).is_err());
+        let udp = Datagram::Data { client_id: 2, token: [1; 16], packet: p.clone() };
+        assert_eq!(decode_datagram(&encode_datagram(&udp).unwrap()).unwrap(), udp);
+        p.delivery.as_mut().unwrap().sequence = 0;
+        assert!(encode(&Message::Data(p)).is_err());
+        let mut bad = bytes;
+        let end = bad.len();
+        bad[end-8..].fill(0);
+        assert!(decode(&bad[4..]).is_err());
+        for m in [Message::DiagnosticsPeers(vec![1, 2]), Message::PeerProbe(PeerProbe { from: 1, to: 2, source_epoch: 10, target_epoch: 20, id: 7, reply: false })] {
+            let encoded = encode(&m).unwrap();
+            assert_eq!(decode(&encoded[4..]).unwrap(), m);
+            assert!(decode(&encoded[4..encoded.len()-1]).is_err());
+        }
+    }
+
     use super::*;
     use std::io::Cursor;
 
@@ -825,6 +971,7 @@ mod tests {
 
     fn packet(payload: &[u8], send_type: u8) -> Packet {
         Packet {
+            delivery: None,
             from: 11,
             to: 22,
             source_epoch: 33,

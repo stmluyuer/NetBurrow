@@ -36,6 +36,10 @@ impl PeerInfo {
 
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
+    pub relay_recovering: bool,
+    pub relay_recoveries: u64,
+    pub ipc_recoveries: u64,
+    pub path_diagnostics: crate::PathDiagnostics,
     pub phase: Phase,
     pub detail: String,
     pub peers: Vec<PeerInfo>,
@@ -186,7 +190,7 @@ impl Drop for Client {
 #[cfg(windows)]
 mod runtime {
     use super::*;
-    use crate::client_io::{Budget, Mailbox, Writer as SocketWriter, reader as socket_reader};
+    use crate::client_io::{Budget, Mailbox, Writer as SocketWriter, reader_resumable as socket_reader};
     use crate::diagnostics::record as log;
     use crate::{
         Transport,
@@ -323,6 +327,7 @@ mod runtime {
         Udp(Packet),
         UdpBound,
         Closed,
+        Fault(io::Error),
     }
     struct NetworkEvents {
         tcp: Mailbox,
@@ -331,12 +336,15 @@ mod runtime {
     impl NetworkEvents {
         async fn recv(&mut self) -> Option<NetworkEvent> {
             tokio::select! {
-                value=self.tcp.recv()=>Some(match value {Some(Ok(m))=>NetworkEvent::Tcp(m),_=>NetworkEvent::Closed}),
+                value=self.tcp.recv()=>Some(match value {Some(Ok(m))=>NetworkEvent::Tcp(m),Some(Err(e))=>NetworkEvent::Fault(e),_=>NetworkEvent::Closed}),
                 value=self.udp.recv()=>Some(match value {Some(Ok(Message::Data(p)))=>NetworkEvent::Udp(p),Some(Ok(Message::IpcReady))=>NetworkEvent::UdpBound,Some(Ok(m))=>NetworkEvent::Tcp(m),_=>NetworkEvent::Closed}),
             }
         }
     }
     struct Network {
+        resume_key: Option<Token>,
+        recovering: bool,
+        diagnostics: crate::path_diagnostics::Tracker,
         writer: SocketWriter,
         events: NetworkEvents,
         tasks: Vec<Task<()>>,
@@ -400,7 +408,8 @@ mod runtime {
                 tcp: Mailbox::with_budget(true, incoming_budget.clone()),
                 udp: Mailbox::with_budget(true, incoming_budget.clone()),
             };
-            let reader = socket_reader(input, events.tcp.clone(), false);
+            let writer=SocketWriter::with_budget(writer,false,IO_TIMEOUT,outgoing_budget.clone());
+            let reader = socket_reader(input, events.tcp.clone(), false,writer.session.clone(),writer.queue.clone());
             let mut tasks = vec![reader];
             let udp = if transport == Transport::Udp {
                 let socket = Arc::new(
@@ -438,12 +447,9 @@ mod runtime {
                 None
             };
             Ok(Self {
-                writer: SocketWriter::with_budget(
-                    writer,
-                    false,
-                    IO_TIMEOUT,
-                    outgoing_budget.clone(),
-                ),
+                resume_key:None,recovering:false,
+                diagnostics: Default::default(),
+                writer,
                 events,
                 tasks,
                 udp,
@@ -456,6 +462,7 @@ mod runtime {
             })
         }
         async fn send(&mut self, message: &Message) -> io::Result<()> {
+            if self.recovering && !netburrow_protocol::replayable(message) {return Ok(());}
             if matches!(message, Message::Bind { .. }) {
                 self.udp_bound = false;
             }
@@ -475,7 +482,9 @@ mod runtime {
             }
             Ok(())
         }
-        async fn packet(&mut self, packet: Packet) -> io::Result<bool> {
+        async fn packet(&mut self, mut packet: Packet) -> io::Result<bool> {
+            if self.recovering && packet.send_type<=1 {return Ok(false);}
+            self.diagnostics.assign(&mut packet);
             if self.udp_bound && packet.send_type <= 1 {
                 if let Some(socket) = &self.udp {
                     if let Ok(bytes) = encode_datagram(&Datagram::Data {
@@ -494,6 +503,51 @@ mod runtime {
             }
             self.send(&Message::Data(packet)).await?;
             Ok(false)
+        }
+    }
+
+    fn recoverable(error:&io::Error)->bool {
+        !matches!(error.kind(),io::ErrorKind::InvalidData|io::ErrorKind::InvalidInput|io::ErrorKind::PermissionDenied|io::ErrorKind::Unsupported)
+    }
+    impl Network {
+        async fn begin_resume(&mut self,server:String,mut stop:watch::Receiver<bool>)->io::Result<Task<io::Result<(TcpStream,u64)>>> {
+            let key=self.resume_key.ok_or_else(||io::Error::new(io::ErrorKind::ConnectionReset,"Relay disconnected; original session recovery unavailable"))?;
+            self.recovering=true;self.udp_bound=false;
+            for task in &self.tasks {task.abort();}
+            self.writer.suspend().await;
+            // No old reader may advance the receive watermark after the handshake snapshot.
+            for task in &mut self.tasks {let _ = task.await;}
+            // Old UDP binding replies carry no generation. Resume on TCP until next enable.
+            self.udp=None;
+            self.tasks.truncate(1);
+            let received=self.writer.session.received();let client_id=self.client_id;
+            Ok(tokio::spawn(async move {
+                let deadline=Instant::now()+netburrow_protocol::RECOVERY_TIMEOUT;
+                loop {
+                    if *stop.borrow(){return Err(io::Error::new(io::ErrorKind::Interrupted,"recovery stopped"));}
+                    if Instant::now()>=deadline{return Err(io::Error::new(io::ErrorKind::TimedOut,"Relay session recovery exhausted"));}
+                    let attempt=async {
+                        let mut socket=TcpStream::connect(&server).await?;socket.set_nodelay(true)?;
+                        write(&mut socket,&Message::Resume{client_id,key,received}).await?;
+                        match read(&mut socket).await? {
+                            Message::Resumed {client_id:id,received} if id==client_id=>Ok((socket,received)),
+                            Message::Error(reason) if reason=="session resume pending"=>Err(io::Error::new(io::ErrorKind::WouldBlock,"waiting for old connection to detach")),
+                            _=>Err(io::Error::new(io::ErrorKind::PermissionDenied,"Relay rejected original session recovery")),
+                        }
+                    };
+                    let attempt_limit=Duration::from_secs(5).min(deadline.saturating_duration_since(Instant::now()));
+                    let result=tokio::select!{_=stop.changed()=>return Err(io::Error::new(io::ErrorKind::Interrupted,"recovery stopped")),r=timeout(attempt_limit,attempt)=>r};
+                    match result {Ok(Ok(result))=>return Ok(result),Ok(Err(e)) if !recoverable(&e)=>return Err(e),_=>{}}
+                    if Instant::now()>=deadline {return Err(io::Error::new(io::ErrorKind::TimedOut,"Relay session recovery exhausted"));}
+                    tokio::select!{_=stop.changed()=>return Err(io::Error::new(io::ErrorKind::Interrupted,"recovery stopped")),_=tokio::time::sleep(Duration::from_millis(250))=>{}}
+                }
+            }))
+        }
+        fn finish_resume(&mut self,socket:TcpStream,received:u64)->io::Result<()> {
+            self.writer.session.acknowledge(received)?;
+            let(input,output)=socket.into_split();self.events.tcp.reopen();self.writer.rebind(output);
+            self.tasks[0]=socket_reader(input,self.events.tcp.clone(),false,self.writer.session.clone(),self.writer.queue.clone());
+            self.recovering=false;Ok(())
         }
     }
 
@@ -518,6 +572,9 @@ mod runtime {
         }
     }
     struct Hook {
+        pid:u32,
+        nonce:Token,
+        recovering_since:Option<Instant>,
         writer: SocketWriter,
         input: Mailbox,
         reader: Task<()>,
@@ -536,6 +593,29 @@ mod runtime {
         }
     }
     impl Hook {
+        async fn begin_resume(&mut self) {
+            if self.recovering_since.is_none(){
+                self.recovering_since=Some(Instant::now());
+                self.reader.abort();
+                self.writer.suspend().await;
+                let _ = (&mut self.reader).await;
+            }
+        }
+        async fn resume_candidate(mut socket:TcpStream,pid:u32,nonce:Token,steam_id:u64,epoch:u64,session:crate::client_io::Session)->io::Result<TcpStream> {
+            timeout(Duration::from_millis(500),async {
+                match read(&mut socket).await? {
+                    Message::IpcResume{nonce:n,pid:p,steam_id:s,epoch:e,received} if n==nonce&&p==pid&&s==steam_id&&e==epoch=>session.acknowledge(received)?,
+                    _=>return Err(io::Error::new(io::ErrorKind::PermissionDenied,"IPC resume identity mismatch")),
+                }
+                write(&mut socket,&Message::SessionAck(session.received())).await?;
+                Ok(socket)
+            }).await.map_err(|_|io::Error::new(io::ErrorKind::TimedOut,"IPC resume handshake timeout"))?
+        }
+        fn finish_resume(&mut self,socket:TcpStream) {
+            let(input,output)=socket.into_split();self.input.reopen();self.writer.rebind(output);
+            self.reader=socket_reader(input,self.input.clone(),true,self.writer.session.clone(),self.writer.queue.clone());
+            self.recovering_since=None;
+        }
         async fn accept(
             mut socket: TcpStream,
             expected_pid: u32,
@@ -571,10 +651,13 @@ mod runtime {
             write(&mut socket, &Message::IpcAccepted(IPC_CAPABILITIES)).await?;
             let (input, writer) = socket.into_split();
             let rx = Mailbox::with_budget(false, outgoing_budget);
-            let reader = socket_reader(input, rx.clone(), true);
+            let writer=SocketWriter::with_budget(writer,true,IPC_TIMEOUT,incoming_budget);
+            writer.session.enable();
+            let reader = socket_reader(input, rx.clone(), true,writer.session.clone(),writer.queue.clone());
             Ok(Self {
-                writer: SocketWriter::with_budget(writer, true, IPC_TIMEOUT, incoming_budget),
+                writer,
                 input: rx,
+                pid:expected_pid,nonce:expected_nonce,recovering_since:None,
                 reader,
                 steam_id,
                 epoch,
@@ -761,6 +844,7 @@ mod runtime {
             );
             change(&state, |s| {
                 s.peers.clear();
+                s.path_diagnostics = Default::default();
                 s.ping_ms = None;
                 s.rtt_samples.clear();
                 s.last_pong_at = None;
@@ -872,15 +956,28 @@ mod runtime {
         let mut candidate: Option<Task<io::Result<Hook>>> = None;
         let mut discovery: Option<Task<io::Result<Vec<GameProcess>>>> = None;
         let mut next_discovery = Instant::now();
+        let mut relay_recovery:Option<Task<io::Result<(TcpStream,u64)>>>=None;
+        let mut ipc_recovery:Option<Task<io::Result<TcpStream>>>=None;
         let result = async {
+            network.send(&Message::Ping(netburrow_protocol::DIAGNOSTICS_PING)).await?;
+            network.send(&Message::Ping(netburrow_protocol::RECOVERY_PING)).await?;
             loop {
                 tokio::select! {
                     _ = stop.changed() => return Ok(()),
-                    event = network.events.recv() => {
+                    recovered=async {match relay_recovery.as_mut(){Some(task)=>task.await,None=>std::future::pending().await}}=>{
+                        relay_recovery=None;
+                        let(socket,received)=recovered.map_err(io::Error::other)??;
+                        network.finish_resume(socket,received)?;network.bind_udp().await?;
+                        change(state,|s|{s.relay_recovering=false;s.relay_recoveries+=1;s.ping_ms=None;s.rtt_samples.clear();});
+                        log("INFO","relay recovery","original session resumed; pending reliable frames replayed with duplicate suppression");
+                        status(state,if hook.as_ref().is_some_and(|h|h.acknowledged){Phase::Ready}else{Phase::WaitingForGame},"原 Relay 会话已恢复；请确认游戏是否继续推进");
+                    }
+                    event = network.events.recv(), if relay_recovery.is_none() => {
                         match event {
                             Some(NetworkEvent::Tcp(Message::Members(members))) => {
                                 log("INFO", "members", &format!("online={} game_bound={}", members.len(), members.iter().filter(|p| p.steam_id != 0).count()));
                                 peers = members;
+                                network.diagnostics.members(network.client_id, &peers);
                                 change(state, |s| {
                                     let old = std::mem::take(&mut s.peers);
                                     s.peers = peers.iter().map(|p| {
@@ -902,8 +999,21 @@ mod runtime {
                                 status_supported = true;
                                 change(state, |s| apply_statuses(&mut s.peers, &reports));
                             }
-                            Some(NetworkEvent::Tcp(Message::Data(packet))) => deliver(packet, false, &peers, &mut hook, state).await?,
-                            Some(NetworkEvent::Udp(packet)) => deliver(packet, true, &peers, &mut hook, state).await?,
+                            Some(NetworkEvent::Tcp(Message::DiagnosticsPeers(members))) => network.diagnostics.capabilities(members),
+                            Some(NetworkEvent::Tcp(Message::RecoveryOffer(key)))=>{network.resume_key=Some(key);log("INFO","relay recovery","original session recovery negotiated");}
+                            Some(NetworkEvent::Tcp(Message::PeerProbe(probe))) => {
+                                if let Some(reply) = network.diagnostics.probe(probe, std::time::Instant::now()) { network.send(&Message::PeerProbe(reply)).await?; }
+                            }
+                            Some(NetworkEvent::Tcp(Message::Data(packet))) => {
+                                network.diagnostics.receive(&packet);
+                                deliver(packet, false, &peers, &mut hook, state).await?;
+                            }
+                            Some(NetworkEvent::Udp(packet)) => {
+                                network.diagnostics.receive(&packet);
+                                deliver(packet, true, &peers, &mut hook, state).await?;
+                            }
+                            Some(NetworkEvent::Tcp(Message::Pong(netburrow_protocol::DIAGNOSTICS_PING))) => {},
+                            Some(NetworkEvent::Tcp(Message::Pong(netburrow_protocol::RECOVERY_PING))) => {},
                             Some(NetworkEvent::Tcp(Message::Pong(sequence))) => {
                                 change(state, |s| {
                                     let ping = (since.elapsed().as_millis() as u64).saturating_sub(sequence);
@@ -914,7 +1024,8 @@ mod runtime {
                                 });
                             }
                             Some(NetworkEvent::Tcp(Message::Ping(value))) => network.send(&Message::Pong(value)).await?,
-                            Some(NetworkEvent::UdpBound) => { network.udp_bound = true; log("INFO", "udp", "endpoint bound; unreliable packets may use UDP"); }
+                            Some(NetworkEvent::UdpBound) if network.udp.is_some() => { network.udp_bound = true; log("INFO", "udp", "endpoint bound; unreliable packets may use UDP"); }
+                            Some(NetworkEvent::UdpBound)=>{},
                             Some(NetworkEvent::Tcp(Message::IpcPeerFault {peer,epoch})) => {
                                 if peers.iter().any(|p|p.steam_id==peer && p.epoch==epoch) {
                                     if let Some(h)=hook.as_mut() { h.fail_peer(peer,epoch)?; }
@@ -944,13 +1055,27 @@ mod runtime {
                                     "服务器拒绝游戏数据：请查看排查日志中的具体原因，再重开游戏并重新启用联机。"
                                 }); return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Relay rejected state"));
                             }
-                            Some(NetworkEvent::Closed) | None => return Err(io::Error::other("Relay disconnected")),
+                            Some(NetworkEvent::Closed) | None => {
+                                relay_recovery=Some(network.begin_resume(settings.server.clone(),stop.clone()).await?);
+                                change(state,|s|{s.relay_recovering=true;s.disconnects+=1;s.last_disconnect_at=Some(std::time::Instant::now());});
+                                status(state,Phase::Connecting,"连接中断，正在恢复原会话；暂时保留游戏接入");
+                            }
+                            Some(NetworkEvent::Fault(e))=>{
+                                if !recoverable(&e){return Err(e);}
+                                relay_recovery=Some(network.begin_resume(settings.server.clone(),stop.clone()).await?);
+                                change(state,|s|{s.relay_recovering=true;s.disconnects+=1;s.last_disconnect_at=Some(std::time::Instant::now());});
+                                status(state,Phase::Connecting,"连接中断，正在恢复原会话；暂时保留游戏接入");
+                            }
                             _ => return Err(io::Error::other("unexpected Relay message")),
                         }
                     }
                     incoming = listener.accept() => {
                         let (socket, address) = incoming?;
-                        if !address.ip().is_loopback() || hook.is_some() || candidate.is_some() { continue; }
+                        if !address.ip().is_loopback() || candidate.is_some() || ipc_recovery.is_some() { continue; }
+                        if let Some(h)=hook.as_mut() {
+                            if h.recovering_since.is_some() {ipc_recovery=Some(tokio::spawn(Hook::resume_candidate(socket,h.pid,h.nonce,h.steam_id,h.epoch,h.writer.session.clone())));}
+                            continue;
+                        }
                         if let Some(p) = pending.as_ref() {
                             let (pid,nonce,epoch)=(p.game.pid,p.nonce,p.epoch);
                             candidate=Some(tokio::spawn(Hook::accept(socket,pid,nonce,epoch,network.incoming_budget.clone(),network.outgoing_budget.clone())));
@@ -975,7 +1100,11 @@ mod runtime {
                                 }
                             }
                     }
-                    message = async { match hook.as_mut() { Some(h) => h.input.recv().await, None => std::future::pending().await } } => {
+                    recovered=async {match ipc_recovery.as_mut(){Some(task)=>task.await,None=>std::future::pending().await}}=>{
+                        ipc_recovery=None;
+                        if let Ok(Ok(socket))=recovered {if let Some(h)=hook.as_mut(){h.finish_resume(socket);change(state,|s|s.ipc_recoveries+=1);log("INFO","ipc recovery","original Hook session resumed");}}
+                    }
+                    message = async { match hook.as_mut() { Some(h) if h.recovering_since.is_none() => h.input.recv().await, _ => std::future::pending().await } } => {
                         match message {
                             Some(Ok(Message::IpcReady)) => {
                                 log("INFO", "hook ready", "received adapter readiness; awaiting/confirming Relay binding");
@@ -1007,28 +1136,41 @@ mod runtime {
                             Some(Ok(Message::Diagnostic(text))) => { log("INFO", "hook", &text); change(state, |s| { s.logs.push(text); if s.logs.len() > 64 { s.logs.remove(0); } }); },
                             Some(Ok(Message::Ping(value))) => { if let Some(h) = hook.as_mut() { h.send(&Message::Pong(value)).await?; } }
                             ended @ (Some(Ok(Message::Stop)) | Some(Err(_)) | None) => {
+                                let recover=match &ended {Some(Ok(Message::Stop))=>false,Some(Err(e))=>recoverable(e),_=>true};
                                 if let Some(Err(error)) = ended { log("ERROR", "ipc disconnected", &error.to_string()); }
                                 else { log("INFO", "ipc disconnected", "Hook stopped or reader channel closed"); }
-                                disconnect_hook(&mut hook, &mut pending, network).await;
-                                status(state, Phase::RestartRequired, "游戏接入已断开，请退出游戏后重开");
+                                if recover {if let Some(h)=hook.as_mut(){h.begin_resume().await;}log("WARN","ipc recovery","waiting up to 3s for original Hook to reconnect");}
+                                else {disconnect_hook(&mut hook, &mut pending, network).await;status(state, Phase::RestartRequired, "游戏接入已停止，请退出游戏后重开");}
                             }
                             _ => return Err(io::Error::other("unexpected Hook message")),
                         }
                     }
                     _ = clock.tick() => {
-                        network.writer.check()?;
+                        if !network.recovering {for probe in network.diagnostics.tick(std::time::Instant::now()) { network.send(&Message::PeerProbe(probe)).await?; }}
+                        change(state, |s| s.path_diagnostics = network.diagnostics.snapshot(std::time::Instant::now()));
+                        if relay_recovery.is_none() {
+                            if let Err(e)=network.writer.check() {
+                                if !recoverable(&e){return Err(e);}
+                                relay_recovery=Some(network.begin_resume(settings.server.clone(),stop.clone()).await?);
+                                change(state,|s|{s.relay_recovering=true;s.disconnects+=1;s.last_disconnect_at=Some(std::time::Instant::now());});
+                                status(state,Phase::Connecting,"发送中断，正在恢复原会话；暂时保留游戏接入");
+                            }
+                        }
                         while let Some((peer,epoch))=network.writer.queue.fault() { if let Some(h)=hook.as_mut() {h.fail_peer(peer,epoch)?;} }
-                        let ipc_error=hook.as_ref().and_then(|h|h.writer.check().err().map(|e|e.to_string()).or_else(||(h.input.age()>=IPC_TIMEOUT).then(||"IPC liveness deadline".into())));
+                        let ipc_error=hook.as_ref().filter(|h|h.recovering_since.is_none()).and_then(|h|h.writer.check().err().or_else(||(h.input.age()>=IPC_TIMEOUT).then(||io::Error::new(io::ErrorKind::TimedOut,"IPC liveness deadline"))));
                         if let Some(error)=ipc_error {
-                            log("ERROR","ipc stopped",&error);
+                            log("ERROR","ipc interrupted",&error.to_string());
+                            if recoverable(&error) {if let Some(h)=hook.as_mut(){h.begin_resume().await;}}
+                            else {disconnect_hook(&mut hook,&mut pending,network).await;status(state,Phase::RestartRequired,"游戏接入出现不可恢复错误，请退出游戏后重开");}
+                        }
+                        if hook.as_ref().is_some_and(|h|h.recovering_since.is_some_and(|t|t.elapsed()>=Duration::from_secs(3))) {
+                            if let Some(task)=ipc_recovery.take(){task.abort();}
                             disconnect_hook(&mut hook,&mut pending,network).await;
-                            change(state,|s|{s.ipc_slow=false;s.hook_health=None;s.process_unknown=false;s.peer_faults=0;});
-                            status(state,Phase::RestartRequired,"游戏接入已断开，请退出游戏后重开；Relay 保持连接");
-                            continue;
+                            status(state,Phase::RestartRequired,"本地连接恢复超时，请退出游戏后重开");
                         }
                         if let Some(h)=hook.as_mut() {
                             while let Some((peer,epoch))=h.writer.queue.fault() {h.fail_peer(peer,epoch)?;}
-                            change(state,|s| {s.received=h.received_base+h.writer.count();s.udp_received=h.udp_received_base+h.writer.udp_count();s.ipc_slow=h.input.age()>=IPC_WARNING || h.writer.slow();s.peer_faults=h.failed.len() as u64;});
+                            change(state,|s| {s.received=h.received_base+h.writer.count();s.udp_received=h.udp_received_base+h.writer.udp_count();s.ipc_slow=h.recovering_since.is_some() || h.input.age()>=IPC_WARNING || h.writer.slow();s.peer_faults=h.failed.len() as u64;});
                         } else {
                             change(state,|s| {s.ipc_slow=false;s.hook_health=None;s.process_unknown=false;s.peer_faults=0;});
                         }
@@ -1050,13 +1192,17 @@ mod runtime {
                             if let Some(h)=health {log("INFO","hook health",&format!("send_calls={} rejected={} read_calls={} consumed={} dropped={} lock_busy={} queued_packets={} queued_bytes={} oldest_ms={} interface_changed={}",h.send_calls,h.send_rejected,h.read_calls,h.consumed,h.dropped,h.lock_busy,h.queued_packets,h.queued_bytes,h.oldest_ms,h.interface_changed));}
                             let peer_lines=super::peer_diagnostic_lines(&state.lock().unwrap_or_else(|p|p.into_inner()));
                             for line in peer_lines {log("INFO","peer health",&line);}
+                            let path_lines = network.diagnostics.snapshot(std::time::Instant::now()).lines();
+                            crate::diagnostics::record_batch("INFO", path_lines.iter().map(|line| ("network diagnostics", line.as_str())));
                             let drops=network.events.tcp.dropped()+network.events.udp.dropped()+network.writer.queue.dropped()+hook.as_ref().map_or(0,|h|h.input.dropped()+h.writer.queue.dropped());
                             log("INFO","local handoff",&format!("unreliable_dropped={drops}"));
                             last_stats = Instant::now();
                         }
-                        if network.events.tcp.pong_age() > Duration::from_secs(15) {
+                        if relay_recovery.is_none() && network.events.tcp.pong_age() > Duration::from_secs(15) {
                             change(state, |s| s.heartbeat_timeouts += 1);
-                            return Err(io::Error::new(io::ErrorKind::TimedOut, "Relay heartbeat timeout"));
+                            relay_recovery=Some(network.begin_resume(settings.server.clone(),stop.clone()).await?);
+                            change(state,|s|{s.relay_recovering=true;s.disconnects+=1;s.last_disconnect_at=Some(std::time::Instant::now());});
+                            status(state,Phase::Connecting,"心跳超时，正在恢复原会话；暂时保留游戏接入");
                         }
                         if last_ping.elapsed() >= Duration::from_secs(1) {
                             network.send(&Message::Ping(since.elapsed().as_millis() as u64)).await?;
@@ -1130,6 +1276,9 @@ mod runtime {
         if let Some(task) = discovery {
             task.abort();
         }
+        if let Some(task)=relay_recovery {task.abort();}
+        if let Some(task)=ipc_recovery {task.abort();}
+        change(state,|s|s.relay_recovering=false);
         disconnect_hook(&mut hook, &mut pending, network).await;
         result
     }
@@ -1178,7 +1327,7 @@ mod runtime {
     }
 
     async fn deliver(
-        packet: Packet,
+        mut packet: Packet,
         udp: bool,
         peers: &[Peer],
         hook: &mut Option<Hook>,
@@ -1193,6 +1342,7 @@ mod runtime {
                     p.steam_id == packet.from && p.epoch == packet.source_epoch && p.steam_id != 0
                 })
             {
+                packet.delivery = None;
                 if let Err(error) = h.writer.send_data(Message::Data(packet), udp) {
                     h.writer.report_failure(error);
                 }
@@ -1206,6 +1356,143 @@ mod runtime {
     mod tests {
         use super::*;
         use netburrow_relay::{Config, spawn};
+
+        #[tokio::test]
+        async fn hook_resume_keeps_pending_frames_and_rejects_changed_identity() {
+            let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut game=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (server,_) = listener.accept().await.unwrap();
+            write(&mut game,&Message::IpcHelloV2{nonce:[7;16],pid:42,steam_id:101,epoch:1001,capabilities:IPC_CAPABILITIES}).await.unwrap();
+            let mut hook=Hook::accept(server,42,[7;16],1001,Budget::default(),Budget::default()).await.unwrap();
+            assert_eq!(read(&mut game).await.unwrap(),Message::IpcAccepted(IPC_CAPABILITIES));
+            let expected=Message::Data(packet(202,101,2002,1001,2));
+            hook.send(&expected).await.unwrap();
+            let Message::SessionFrame{sequence,body}=read(&mut game).await.unwrap() else{panic!("expected reliable IPC envelope");};
+            assert_eq!(netburrow_protocol::decode_session_body(&body).unwrap(),expected);
+            hook.begin_resume().await;drop(game);
+            let mut bad=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();let(server,_)=listener.accept().await.unwrap();
+            write(&mut bad,&Message::IpcResume{nonce:[8;16],pid:42,steam_id:101,epoch:1001,received:0}).await.unwrap();
+            assert!(Hook::resume_candidate(server,42,[7;16],101,1001,hook.writer.session.clone()).await.is_err());
+            let mut game=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();let(server,_)=listener.accept().await.unwrap();
+            write(&mut game,&Message::IpcResume{nonce:[7;16],pid:42,steam_id:101,epoch:1001,received:0}).await.unwrap();
+            let server=Hook::resume_candidate(server,42,[7;16],101,1001,hook.writer.session.clone()).await.unwrap();
+            assert_eq!(read(&mut game).await.unwrap(),Message::SessionAck(0));hook.finish_resume(server);
+            assert_eq!(read(&mut game).await.unwrap(),Message::SessionFrame{sequence,body});
+            write(&mut game,&Message::SessionAck(sequence)).await.unwrap();
+            timeout(Duration::from_secs(1),async{while hook.writer.session.window.lock().unwrap().pending_len()!=0 {tokio::task::yield_now().await;}}).await.unwrap();
+            assert!(hook.recovering_since.is_none());
+        }
+
+        #[tokio::test]
+        async fn relay_resume_preserves_identity_queues_and_unacknowledged_reliable_data() {
+            let relay=spawn(Config{bind:"127.0.0.1:0".parse().unwrap(),..Config::default()}).await.unwrap();
+            let address=relay.local_addr().to_string();
+            let mut a=Network::connect(&address,[9;32],Transport::Tcp).await.unwrap();
+            let mut b=Network::connect(&address,[9;32],Transport::Tcp).await.unwrap();
+            a.send(&Message::Bind{steam_id:101,epoch:1001}).await.unwrap();
+            b.send(&Message::Bind{steam_id:202,epoch:2002}).await.unwrap();
+            wait_member(&mut a,202,2002).await;wait_member(&mut b,101,1001).await;
+            for n in [&mut a,&mut b] {
+                n.send(&Message::Ping(netburrow_protocol::RECOVERY_PING)).await.unwrap();
+                timeout(Duration::from_secs(2),async{loop{if let Some(NetworkEvent::Tcp(Message::RecoveryOffer(key)))=n.events.recv().await{n.resume_key=Some(key);break;}}}).await.unwrap();
+            }
+            let original_id=a.client_id;
+            // Lose ACKs without losing the application's outbound reliable frames.
+            a.tasks[0].abort();
+            for i in 0..8 {let mut p=packet(101,202,1001,2002,2);p.payload=vec![i];a.packet(p).await.unwrap();}
+            for i in 0..8 {assert_eq!(wait_packet(&mut b,false).await.payload,vec![i]);}
+            assert!(a.writer.session.window.lock().unwrap().pending_len()>0);
+            let (_stop,stopped)=watch::channel(false);
+            let recovery=a.begin_resume(address.clone(),stopped).await.unwrap();
+            for _ in 0..256 {a.send(&Message::Ping(123)).await.unwrap();}
+            // The source can keep accepting game data while its connection is being restored.
+            for i in 8..16 {let mut p=packet(101,202,1001,2002,3);p.payload=vec![i];a.packet(p).await.unwrap();}
+            let mut incoming=packet(202,101,2002,1001,2);incoming.payload=b"during recovery".to_vec();
+            b.packet(incoming.clone()).await.unwrap();
+            let (socket,received)=timeout(Duration::from_secs(3),recovery).await.unwrap().unwrap().unwrap();
+            a.finish_resume(socket,received).unwrap();
+            assert_eq!(a.client_id,original_id);
+            for i in 8..16 {assert_eq!(wait_packet(&mut b,false).await.payload,vec![i]);}
+            assert_eq!(wait_packet(&mut a,false).await,incoming);
+            // A control reply after all frames proves no replay duplicate is left in the data queue.
+            b.send(&Message::Ping(987654)).await.unwrap();
+            timeout(Duration::from_secs(2),async{loop{match b.events.recv().await{Some(NetworkEvent::Tcp(Message::Data(_)))=>panic!("duplicate delivered"),Some(NetworkEvent::Tcp(Message::Pong(987654)))=>break,_=>{}}}}).await.unwrap();
+            drop(a);drop(b);relay.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn network_diagnostics_follow_tcp_udp_fallback_and_real_peer_echo() {
+            let relay = spawn(Config { bind: "127.0.0.1:0".parse().unwrap(), ..Config::default() }).await.unwrap();
+            let address = relay.local_addr().to_string();
+            let mut a = Network::connect(&address, [8;32], Transport::Udp).await.unwrap();
+            let mut b = Network::connect(&address, [8;32], Transport::Udp).await.unwrap();
+            for (n, steam, epoch) in [(&mut a,101,1001),(&mut b,202,2002)] {
+                n.send(&Message::Bind { steam_id:steam,epoch }).await.unwrap();
+                n.send(&Message::Ping(netburrow_protocol::DIAGNOSTICS_PING)).await.unwrap();
+            }
+            for n in [&mut a, &mut b] {
+                timeout(Duration::from_secs(2), async {
+                    loop {
+                        match n.events.recv().await {
+                            Some(NetworkEvent::Tcp(Message::Members(peers))) => n.diagnostics.members(n.client_id,&peers),
+                            Some(NetworkEvent::Tcp(Message::DiagnosticsPeers(peers))) => n.diagnostics.capabilities(peers),
+                            _ => {}
+                        }
+                        let snapshot = n.diagnostics.snapshot(std::time::Instant::now());
+                        if snapshot.peers.len() == 1 && snapshot.peers[0].supported { break; }
+                    }
+                }).await.unwrap();
+            }
+            // Only the source is UDP-bound: Relay must preserve metadata during TCP fallback.
+            a.bind_udp().await.unwrap(); wait_udp_bound(&mut a).await;
+            assert!(a.packet(packet(101,202,1001,2002,0)).await.unwrap());
+            let first = wait_packet(&mut b,false).await;
+            assert_eq!(first.delivery.unwrap().sequence,1); b.diagnostics.receive(&first);
+            b.bind_udp().await.unwrap(); wait_udp_bound(&mut b).await;
+            assert!(a.packet(packet(101,202,1001,2002,1)).await.unwrap());
+            let second = wait_packet(&mut b,true).await;
+            assert_eq!(second.delivery.unwrap().sequence,2); b.diagnostics.receive(&second);
+            assert!(!a.packet(packet(101,202,1001,2002,2)).await.unwrap());
+            let reliable = wait_packet(&mut b,false).await;
+            assert_eq!(reliable.delivery.unwrap().sequence,1);
+            assert_ne!(reliable.delivery.unwrap().stream,first.delivery.unwrap().stream);
+            b.diagnostics.receive(&reliable);
+            let now = std::time::Instant::now();
+            let request = a.diagnostics.tick(now).remove(0);
+            a.send(&Message::PeerProbe(request)).await.unwrap();
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(NetworkEvent::Tcp(Message::PeerProbe(probe))) = b.events.recv().await {
+                        let reply = b.diagnostics.probe(probe,std::time::Instant::now()).unwrap();
+                        b.send(&Message::PeerProbe(reply)).await.unwrap(); break;
+                    }
+                }
+                loop {
+                    if let Some(NetworkEvent::Tcp(Message::PeerProbe(probe))) = a.events.recv().await {
+                        a.diagnostics.probe(probe,std::time::Instant::now()); break;
+                    }
+                }
+            }).await.unwrap();
+            assert_eq!(a.diagnostics.snapshot(std::time::Instant::now()).peers[0].probe_received,1);
+            assert_eq!(b.diagnostics.snapshot(std::time::Instant::now()).peers[0].flows[0].missing_window,0);
+            // Production delivery strips the extension before writing IPC to the Hook.
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let game = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (mut receiver,_) = listener.accept().await.unwrap();
+            write(&mut receiver,&Message::IpcHelloV2 { nonce:[7;16],pid:42,steam_id:202,epoch:2002,capabilities:IPC_CAPABILITIES }).await.unwrap();
+            let mut h = Hook::accept(game,42,[7;16],2002,Budget::default(),Budget::default()).await.unwrap();
+            assert_eq!(read(&mut receiver).await.unwrap(),Message::IpcAccepted(IPC_CAPABILITIES));
+            h.acknowledged = true;
+            let mut hook = Some(h);
+            let shared = Arc::new(Mutex::new(Snapshot::default()));
+            let peers = vec![Peer { client_id:a.client_id,steam_id:101,epoch:1001 }];
+            let mut expected = reliable.clone(); expected.delivery = None;
+            deliver(reliable,false,&peers,&mut hook,&shared).await.unwrap();
+            let Message::SessionFrame {sequence,body}=timeout(Duration::from_secs(2),read(&mut receiver)).await.unwrap().unwrap() else {panic!("expected resumable IPC data");};
+            assert_eq!(netburrow_protocol::decode_session_body(&body).unwrap(),Message::Data(expected));
+            write(&mut receiver,&Message::SessionAck(sequence)).await.unwrap();
+            relay.shutdown().await.unwrap();
+        }
         use tokio::time::{Duration, timeout};
 
         #[tokio::test]
@@ -1506,6 +1793,7 @@ mod runtime {
             send_type: u8,
         ) -> Packet {
             Packet {
+                delivery: None,
                 from,
                 to,
                 source_epoch,

@@ -241,7 +241,7 @@ impl Frames {
             // Replace snapshots/probes only inside the current barrier segment.
             if matches!(
                 message,
-                Message::IpcHealth(_) | Message::Status(_) | Message::Ping(_)
+                Message::IpcHealth(_) | Message::Status(_) | Message::Ping(_) | Message::SessionAck(_)
             ) {
                 let kind = std::mem::discriminant(&message);
                 let start = self
@@ -428,6 +428,7 @@ mod tests {
     use std::io::{self, Read, Write};
     fn packet(peer: u64) -> Message {
         Message::Data(Packet {
+            delivery: None,
             from: peer,
             to: 10,
             source_epoch: peer * 10,

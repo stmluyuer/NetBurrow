@@ -49,6 +49,65 @@ static SEND_LOCK_BUSY: AtomicUsize = AtomicUsize::new(0);
 static SEND_INVALID: AtomicUsize = AtomicUsize::new(0);
 static INTERFACE_CHANGED: AtomicBool = AtomicBool::new(false);
 static CALLBACK_TICKS: AtomicUsize = AtomicUsize::new(0);
+// Indices follow the SteamNetworking006 vtable: send, available, read, accept,
+// close session, close channel, session state. Atomic updates only on game threads.
+static API_CALLS: [AtomicUsize; 7] = [const { AtomicUsize::new(0) }; 7];
+static API_BUSY: [AtomicUsize; 7] = [const { AtomicUsize::new(0) }; 7];
+static API_INVALID: [AtomicUsize; 7] = [const { AtomicUsize::new(0) }; 7];
+static API_NATIVE: [AtomicUsize; 7] = [const { AtomicUsize::new(0) }; 7];
+static NATIVE_DISCARDED: AtomicUsize = AtomicUsize::new(0);
+static READ_TRUNCATED: AtomicUsize = AtomicUsize::new(0);
+
+fn record_telemetry(shared: &Shared) {
+    let snapshot = shared
+        .bridge
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .telemetry
+        .take_snapshot();
+    // No Bridge/Outbox lock held during formatting or file writes.
+    let mut records: Vec<_> = snapshot
+        .lines()
+        .into_iter()
+        .map(|line| ("game diagnostics", line))
+        .collect();
+    for (index, name) in [
+        "send",
+        "available",
+        "read",
+        "accept",
+        "close",
+        "close_channel",
+        "session",
+    ]
+    .iter()
+    .enumerate()
+    {
+        records.push((
+            "game api",
+            format!(
+                "operation={name} calls={} lock_busy={} invalid={} native_calls={}",
+                API_CALLS[index].load(Ordering::Relaxed),
+                API_BUSY[index].load(Ordering::Relaxed),
+                API_INVALID[index].load(Ordering::Relaxed),
+                API_NATIVE[index].load(Ordering::Relaxed)
+            ),
+        ));
+    }
+    records.push((
+        "game api",
+        format!(
+            "callback_ticks={} native_discarded={} read_truncated={}",
+            CALLBACK_TICKS.load(Ordering::Relaxed),
+            NATIVE_DISCARDED.load(Ordering::Relaxed),
+            READ_TRUNCATED.load(Ordering::Relaxed)
+        ),
+    ));
+    crate::diagnostics::record_batch(
+        "INFO",
+        records.iter().map(|(event, line)| (*event, line.as_str())),
+    );
+}
 struct Steam {
     original: [usize; 22],
     object: usize,
@@ -139,7 +198,7 @@ fn initialize(init: HookInit) -> io::Result<()> {
                 crate::diagnostics::record(
                     "INFO",
                     "callbacks",
-                    "Steam callback imports intercepted; previously registered callbacks are not captured",
+                    "SteamAPI_RunCallbacks observed; Steam retains callback registration and dispatch",
                 );
             }
             if let Some(info) = unsafe { steam_interface(module) } {
@@ -172,30 +231,54 @@ fn initialize(init: HookInit) -> io::Result<()> {
         "Steam identity acquired and networking vtable installed",
     );
     let endpoint = SocketAddr::from(([127, 0, 0, 1], init.port as u16));
-    let mut socket = TcpStream::connect_timeout(&endpoint, Duration::from_secs(3))?;
-    socket.set_nodelay(true)?;
-    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
-    socket.set_write_timeout(Some(Duration::from_secs(5)))?;
-    write_message(
-        &mut socket,
-        &Message::IpcHelloV2 {
-            nonce: init.nonce,
-            pid: init.pid,
-            steam_id,
-            epoch: init.epoch,
-            capabilities: IPC_CAPABILITIES,
-        },
-    )?;
-    if read_message(&mut socket)? != Message::IpcAccepted(IPC_CAPABILITIES) {
-        return Err(io::Error::other(
-            "IPC capability mismatch; update the complete client package",
-        ));
+    let window=Arc::new(Mutex::new(netburrow_protocol::resume::Window::default()));
+    let mut connected_once=false;
+    let mut disconnected_at=Instant::now();
+    loop {
+        let connection=(||->io::Result<TcpStream>{
+            let mut socket=TcpStream::connect_timeout(&endpoint,Duration::from_millis(100))?;
+            socket.set_nodelay(true)?;
+            socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+            socket.set_write_timeout(Some(Duration::from_millis(500)))?;
+            if connected_once {
+                let received=window.lock().unwrap_or_else(|p|p.into_inner()).received_through();
+                write_message(&mut socket,&Message::IpcResume{nonce:init.nonce,pid:init.pid,steam_id,epoch:init.epoch,received})?;
+                match read_message(&mut socket)? {
+                    Message::SessionAck(n)=>window.lock().unwrap_or_else(|p|p.into_inner()).acknowledge(n)?,
+                    _=>return Err(io::Error::new(io::ErrorKind::InvalidData,"IPC resume rejected")),
+                }
+            } else {
+                write_message(&mut socket,&Message::IpcHelloV2{nonce:init.nonce,pid:init.pid,steam_id,epoch:init.epoch,capabilities:IPC_CAPABILITIES})?;
+                if read_message(&mut socket)?!=Message::IpcAccepted(IPC_CAPABILITIES){return Err(io::Error::new(io::ErrorKind::InvalidData,"IPC capability mismatch; update complete package"));}
+            }
+            Ok(socket)
+        })();
+        let socket=match connection {
+            Ok(socket)=>socket,
+            Err(e)=>{
+                if matches!(e.kind(),io::ErrorKind::InvalidData|io::ErrorKind::InvalidInput)||disconnected_at.elapsed()>=Duration::from_secs(3){return Err(e);}
+                std::thread::sleep(Duration::from_millis(50));continue;
+            }
+        };
+        if connected_once {crate::diagnostics::record("INFO","ipc recovery","original client session resumed");}
+        connected_once=true;
+        match ipc_connection(socket,shared.clone(),window.clone()) {
+            Ok(())=>return Ok(()),
+            Err(e) if matches!(e.kind(),io::ErrorKind::InvalidData|io::ErrorKind::InvalidInput)=>return Err(e),
+            Err(e)=>{disconnected_at=Instant::now();crate::diagnostics::record("WARN","ipc recovery",&format!("connection interrupted; retrying for 3s: {e}"));}
+        }
     }
+}
+
+fn ipc_connection(mut socket:TcpStream,shared:Arc<Shared>,window:Arc<Mutex<netburrow_protocol::resume::Window>>)->io::Result<()> {
+    let broken=Arc::new(AtomicBool::new(false));
+    let read_broken=broken.clone();
+    socket.set_nodelay(true)?;
     write_message(
         &mut socket,
         &Message::Diagnostic("自己的 SteamNetworking006 接口与回调入口已接入".into()),
     )?;
-    write_message(&mut socket, &Message::IpcReady)?;
+    write_message(&mut socket,&Message::IpcReady)?;
     socket.set_read_timeout(None)?;
     socket.set_write_timeout(None)?;
     socket.set_nonblocking(true)?;
@@ -206,12 +289,13 @@ fn initialize(init: HookInit) -> io::Result<()> {
     );
     let mut input = socket.try_clone()?;
     let receive_shared = shared.clone();
+    let receive_window=window.clone();
     let reader = std::thread::Builder::new()
         .name("netburrow-ipc-read".into())
         .spawn(move || {
             let mut decoder = Reader::default();
             loop {
-                let message = match decoder.poll(&mut input) {
+                let mut message = match decoder.poll(&mut input) {
                     Ok(Some(message)) => message,
                     Ok(None) => {
                         std::thread::sleep(Duration::from_millis(1));
@@ -219,9 +303,25 @@ fn initialize(init: HookInit) -> io::Result<()> {
                     }
                     Err(error) => {
                         crate::diagnostics::record("ERROR", "ipc read", &error.to_string());
+                        if matches!(error.kind(),io::ErrorKind::InvalidData|io::ErrorKind::InvalidInput){receive_shared.stopped.store(true,Ordering::Release);}
                         break;
                     }
                 };
+                let mut sequence=None;
+                match &message {
+                    Message::SessionAck(n)=>{
+                        if receive_window.lock().unwrap_or_else(|p|p.into_inner()).acknowledge(*n).is_err(){receive_shared.stopped.store(true,Ordering::Release);break;}
+                        continue;
+                    }
+                    Message::SessionFrame{sequence:n,body}=>{
+                        match receive_window.lock().unwrap_or_else(|p|p.into_inner()).classify(*n) {
+                            Ok(false)=>continue,Ok(true)=>{},Err(_)=>{receive_shared.stopped.store(true,Ordering::Release);break;}
+                        }
+                        sequence=Some(*n);
+                        match netburrow_protocol::decode_session_body(body){Ok(m)=>message=m,Err(_)=>{receive_shared.stopped.store(true,Ordering::Release);break;}}
+                    }
+                    _=>{}
+                }
                 // Logging can touch disk; keep it outside the game send lock.
                 match &message {
                     Message::IpcReady => crate::diagnostics::record(
@@ -269,7 +369,9 @@ fn initialize(init: HookInit) -> io::Result<()> {
                     _ => false,
                 };
                 drop(bridge);
+                if valid {if let Some(n)=sequence {let _=receive_window.lock().unwrap_or_else(|p|p.into_inner()).received(n);}}
                 if !valid {
+                    receive_shared.stopped.store(true,Ordering::Release);
                     crate::diagnostics::record(
                         "INFO",
                         "ipc",
@@ -278,18 +380,16 @@ fn initialize(init: HookInit) -> io::Result<()> {
                     break;
                 }
             }
-            receive_shared
-                .bridge
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .stop();
-            receive_shared.stopped.store(true, Ordering::Release);
+            if receive_shared.stopped.load(Ordering::Acquire){receive_shared.bridge.lock().unwrap_or_else(|p|p.into_inner()).stop();}
+            read_broken.store(true,Ordering::Release);
             receive_shared.wake.unpark();
         })?;
     let mut ping = Instant::now() - Duration::from_secs(2);
     let mut callback_report = Instant::now() - Duration::from_secs(10);
     let mut health_report = Instant::now();
     let mut pending: Option<PendingWrite> = None;
+    let mut replay:std::collections::VecDeque<_>=window.lock().unwrap_or_else(|p|p.into_inner()).pending().into();
+    let mut last_ack=u64::MAX;
     let outbound = shared
         .bridge
         .lock()
@@ -300,6 +400,7 @@ fn initialize(init: HookInit) -> io::Result<()> {
         if shared.stopped.load(Ordering::Acquire) {
             break Ok(());
         }
+        if broken.load(Ordering::Acquire){break Err(io::Error::new(io::ErrorKind::ConnectionReset,"IPC reader disconnected"));}
         if let Some(frame) = pending.as_mut() {
             match frame.poll(&mut socket) {
                 Ok(true) => pending = None,
@@ -330,8 +431,12 @@ fn initialize(init: HookInit) -> io::Result<()> {
                 ),
             );
             callback_report = Instant::now();
+            record_telemetry(&shared);
         }
-        let message = if ping.elapsed() >= Duration::from_secs(2) {
+        let received=window.lock().unwrap_or_else(|p|p.into_inner()).received_through();
+        let message = if received!=last_ack {last_ack=received;Some(Message::SessionAck(received))}
+        else if let Some((sequence,body))=replay.pop_front(){Some(Message::SessionFrame{sequence,body})}
+        else if ping.elapsed() >= Duration::from_secs(2) {
             ping = Instant::now();
             Some(Message::Ping(0))
         } else if shared.faults.load(Ordering::Acquire) {
@@ -359,6 +464,11 @@ fn initialize(init: HookInit) -> io::Result<()> {
             None
         };
         if let Some(message) = message {
+            let message=if netburrow_protocol::replayable(&message) {
+                let body=match netburrow_protocol::encode(&message) {Ok(body)=>body,Err(e)=>break Err(e)};
+                let sequence=match window.lock().unwrap_or_else(|p|p.into_inner()).retain(body.clone()) {Ok(n)=>n,Err(e)=>break Err(io::Error::new(io::ErrorKind::InvalidData,format!("IPC resume buffer exhausted: {e}")))};
+                Message::SessionFrame{sequence,body}
+            }else{message};
             match PendingWrite::new(&message) {
                 Ok(frame) => pending = Some(frame),
                 Err(e) => break Err(e),
@@ -367,13 +477,9 @@ fn initialize(init: HookInit) -> io::Result<()> {
             std::thread::park_timeout(Duration::from_millis(10));
         }
     };
-    shared
-        .bridge
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .stop();
     let _ = socket.shutdown(Shutdown::Both);
     let _ = reader.join();
+    record_telemetry(&shared);
     result
 }
 
@@ -527,7 +633,9 @@ unsafe extern "thiscall" fn send(
     kind: i32,
     channel: i32,
 ) -> bool {
+    API_CALLS[0].fetch_add(1, Ordering::Relaxed);
     if length as usize > MAX_PAYLOAD || !(0..=3).contains(&kind) || (length > 0 && data.is_null()) {
+        API_INVALID[0].fetch_add(1, Ordering::Relaxed);
         SEND_INVALID.fetch_add(1, Ordering::Relaxed);
         return false;
     }
@@ -551,14 +659,18 @@ unsafe extern "thiscall" fn send(
     }
     let f: unsafe extern "thiscall" fn(*mut c_void, u64, *const c_void, u32, i32, i32) -> bool =
         transmute(address);
+    API_NATIVE[0].fetch_add(1, Ordering::Relaxed);
     f(this, remote, data, length, kind, channel)
 }
 unsafe extern "thiscall" fn available(this: *mut c_void, size: *mut u32, channel: i32) -> bool {
+    API_CALLS[1].fetch_add(1, Ordering::Relaxed);
     if size.is_null() {
+        API_INVALID[1].fetch_add(1, Ordering::Relaxed);
         return false;
     }
     if let Some(shared) = BRIDGE.get() {
-        let Ok(bridge) = shared.bridge.try_lock() else {
+        let Ok(mut bridge) = shared.bridge.try_lock() else {
+            API_BUSY[1].fetch_add(1, Ordering::Relaxed);
             LOCK_BUSY.fetch_add(1, Ordering::Relaxed);
             return false;
         };
@@ -572,6 +684,7 @@ unsafe extern "thiscall" fn available(this: *mut c_void, size: *mut u32, channel
         return false;
     }
     let f: unsafe extern "thiscall" fn(*mut c_void, *mut u32, i32) -> bool = transmute(address);
+    API_NATIVE[1].fetch_add(1, Ordering::Relaxed);
     f(this, size, channel)
 }
 unsafe extern "thiscall" fn read(
@@ -582,11 +695,14 @@ unsafe extern "thiscall" fn read(
     remote: *mut u64,
     channel: i32,
 ) -> bool {
+    API_CALLS[2].fetch_add(1, Ordering::Relaxed);
     if size.is_null() || remote.is_null() || (capacity > 0 && destination.is_null()) {
+        API_INVALID[2].fetch_add(1, Ordering::Relaxed);
         return false;
     }
     if let Some(shared) = BRIDGE.get() {
         let Ok(mut bridge) = shared.bridge.try_lock() else {
+            API_BUSY[2].fetch_add(1, Ordering::Relaxed);
             LOCK_BUSY.fetch_add(1, Ordering::Relaxed);
             return false;
         };
@@ -594,6 +710,9 @@ unsafe extern "thiscall" fn read(
             drop(bridge);
             // Steam's documented ABI consumes/truncates a packet when the caller's buffer is small.
             let count = packet.payload.len().min(capacity as usize);
+            if count < packet.payload.len() {
+                READ_TRUNCATED.fetch_add(1, Ordering::Relaxed);
+            }
             if count > 0 {
                 ptr::copy_nonoverlapping(packet.payload.as_ptr(), destination.cast::<u8>(), count);
             }
@@ -616,6 +735,7 @@ unsafe extern "thiscall" fn read(
     ) -> bool = transmute(address);
     // Discard a bounded number of stale native-path packets from already-owned peers.
     for _ in 0..16 {
+        API_NATIVE[2].fetch_add(1, Ordering::Relaxed);
         if !f(this, destination, capacity, size, remote, channel) {
             return false;
         }
@@ -628,12 +748,15 @@ unsafe extern "thiscall" fn read(
         if !ours {
             return true;
         }
+        NATIVE_DISCARDED.fetch_add(1, Ordering::Relaxed);
     }
     false
 }
 unsafe extern "thiscall" fn accept(this: *mut c_void, remote: u64) -> bool {
+    API_CALLS[3].fetch_add(1, Ordering::Relaxed);
     if let Some(shared) = BRIDGE.get() {
         let Ok(mut bridge) = shared.bridge.try_lock() else {
+            API_BUSY[3].fetch_add(1, Ordering::Relaxed);
             return false;
         };
         if let Some(result) = bridge.accept(remote) {
@@ -641,11 +764,14 @@ unsafe extern "thiscall" fn accept(this: *mut c_void, remote: u64) -> bool {
         }
     }
     let f: unsafe extern "thiscall" fn(*mut c_void, u64) -> bool = transmute(original(3));
+    API_NATIVE[3].fetch_add(1, Ordering::Relaxed);
     f(this, remote)
 }
 unsafe extern "thiscall" fn close(this: *mut c_void, remote: u64) -> bool {
+    API_CALLS[4].fetch_add(1, Ordering::Relaxed);
     if let Some(shared) = BRIDGE.get() {
         let Ok(mut bridge) = shared.bridge.try_lock() else {
+            API_BUSY[4].fetch_add(1, Ordering::Relaxed);
             return false;
         };
         if let Some(result) = bridge.close(remote, None) {
@@ -653,11 +779,14 @@ unsafe extern "thiscall" fn close(this: *mut c_void, remote: u64) -> bool {
         }
     }
     let f: unsafe extern "thiscall" fn(*mut c_void, u64) -> bool = transmute(original(4));
+    API_NATIVE[4].fetch_add(1, Ordering::Relaxed);
     f(this, remote)
 }
 unsafe extern "thiscall" fn close_channel(this: *mut c_void, remote: u64, channel: i32) -> bool {
+    API_CALLS[5].fetch_add(1, Ordering::Relaxed);
     if let Some(shared) = BRIDGE.get() {
         let Ok(mut bridge) = shared.bridge.try_lock() else {
+            API_BUSY[5].fetch_add(1, Ordering::Relaxed);
             return false;
         };
         if let Some(result) = bridge.close(remote, Some(channel)) {
@@ -665,6 +794,7 @@ unsafe extern "thiscall" fn close_channel(this: *mut c_void, remote: u64, channe
         }
     }
     let f: unsafe extern "thiscall" fn(*mut c_void, u64, i32) -> bool = transmute(original(5));
+    API_NATIVE[5].fetch_add(1, Ordering::Relaxed);
     f(this, remote, channel)
 }
 #[repr(C)]
@@ -683,20 +813,24 @@ unsafe extern "thiscall" fn session(
     remote: u64,
     result: *mut SessionState,
 ) -> bool {
+    API_CALLS[6].fetch_add(1, Ordering::Relaxed);
     if result.is_null() {
+        API_INVALID[6].fetch_add(1, Ordering::Relaxed);
         return false;
     }
     if let Some(shared) = BRIDGE.get() {
-        let bridge = shared.bridge.lock().unwrap_or_else(|p| p.into_inner());
+        let mut bridge = shared.bridge.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((active, bytes, packets)) = bridge.session(remote) {
+            let error = if bridge.stopped || bridge.peer_failed(remote) {
+                4
+            } else {
+                0
+            };
+            bridge.observe_session(remote, active, error);
             result.write(SessionState {
                 active: u8::from(active),
                 connecting: 0,
-                error: if bridge.stopped || bridge.peer_failed(remote) {
-                    4
-                } else {
-                    0
-                },
+                error,
                 relay: 1,
                 bytes: bytes as i32,
                 packets: packets as i32,
@@ -708,6 +842,7 @@ unsafe extern "thiscall" fn session(
     }
     let f: unsafe extern "thiscall" fn(*mut c_void, u64, *mut SessionState) -> bool =
         transmute(original(6));
+    API_NATIVE[6].fetch_add(1, Ordering::Relaxed);
     f(this, remote, result)
 }
 

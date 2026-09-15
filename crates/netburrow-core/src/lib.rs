@@ -1,4 +1,6 @@
 mod client;
+mod path_diagnostics;
+pub use path_diagnostics::{PathDiagnostics, PathPeer, SequenceReport};
 #[cfg(windows)]
 mod client_io;
 pub mod diagnostics;
@@ -9,7 +11,7 @@ mod preflight;
 mod quality;
 
 pub use client::{Client, PeerInfo, Phase, Snapshot};
-pub use diagnostics_report::export_report;
+pub use diagnostics_report::{export_freeze_report, export_report};
 pub use preflight::{preflight, Check, CheckLevel, PreflightReport};
 pub use quality::{connection_quality, Quality};
 pub use netburrow_protocol::MemberStatus;

@@ -10,6 +10,20 @@ use crate::{Settings, Snapshot};
 
 const LOG_TAIL: u64 = 128 * 1024;
 
+/// A user-observed stall, not an automatic assertion that the game is deadlocked.
+pub fn export_freeze_report(settings: &Settings, snapshot: &Snapshot) -> Result<PathBuf, String> {
+    crate::diagnostics::record(
+        "INFO",
+        "freeze marker",
+        "user reported gameplay not advancing; capturing diagnostics",
+    );
+    let mut snapshot = snapshot.clone();
+    snapshot
+        .logs
+        .push("现场标记：用户观察到对局画面不推进；此标记不代表已确认死锁或断网。".into());
+    export_report(settings, &snapshot)
+}
+
 pub fn export_report(settings: &Settings, snapshot: &Snapshot) -> Result<PathBuf, String> {
     let destination = crate::config_directory().join("diagnostics");
     export_to(
@@ -78,13 +92,27 @@ fn build_report(logs: &Path, settings: &Settings, snapshot: &Snapshot) -> String
         redact(&snapshot.detail, &secrets),
     );
     result.push_str(&format!(
+        "导出时间（Unix 毫秒）：{}\n",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    ));
+    result.push_str("诊断说明：连接在线及持续收发不代表对局正在推进。Hook 的 game diagnostics 每约 10 秒记录累计统计；member 是 Relay 临时编号，kind 0/1 为不可靠发送、2/3 为可靠发送，sent 表示 Hook 接受入队，不表示对端收到；received 包含被拒绝的入站包；consumed 表示从 Hook 队列取走，缓冲区截断另见 read_truncated。age_ms 表示距最近一次该事件的毫秒数，never 表示尚未发生。poll 只统计取得 Hook 锁后的查询；锁竞争、原生路径调用见 game api。省略计数非零时，细分统计不完整。\n");
+    result.push_str(&format!(
         "本地接入：ipc_slow={} process_unknown={} peer_faults={}\n",
         snapshot.ipc_slow, snapshot.process_unknown, snapshot.peer_faults
     ));
+    result.push_str(&format!("会话恢复：relay_recovering={} relay_recoveries={} ipc_recoveries={}\n",snapshot.relay_recovering,snapshot.relay_recoveries,snapshot.ipc_recoveries));
     if let Some(h) = &snapshot.hook_health {
         result.push_str(&format!("Hook：send_calls={} rejected={} read_calls={} consumed={} dropped={} lock_busy={} queue_packets={} queue_bytes={} oldest_ms={} interface_changed={}\n",h.send_calls,h.send_rejected,h.read_calls,h.consumed,h.dropped,h.lock_busy,h.queued_packets,h.queued_bytes,h.oldest_ms,h.interface_changed));
     }
     result.push_str("\n分成员通信（member 为本次 Relay 临时编号；Hook 接收不代表游戏已读取，discarded 为入站会话清理/失败包数）\n");
+    result.push_str("\n端到端诊断：TCP 探测经过本机客户端 → Relay → 队友客户端 → Relay → 本机，不经过游戏 Hook，也不代表 UDP 路径或游戏逻辑正常。未协商支持时不发送扩展数据。序号在本机客户端收到 Hook 数据后、网络发送入队前分配，接收统计位于对端客户端入站队列出队后、交给 Hook 前；assigned 不代表发送完成。每个目标的可靠/不可靠数据分别编号，可靠类型 2/3 共用序号。gaps_detected 为累计观察到的跳号，乱序补到后不回减；missing_window 仅统计最近 256 个序号仍缺失的数量，too_old 无法精确区分迟到与重复。没有后续数据时不能仅凭序号发现末尾缺包。stream_changes 表示当前会话中流编号变化；成员/游戏实例或 Relay 连接变化后重置统计。最多跟踪 32 位已绑定成员，超出部分见 omitted。\n");
+    for line in snapshot.path_diagnostics.lines() {
+        result.push_str(&line);
+        result.push('\n');
+    }
     for line in crate::client::peer_diagnostic_lines(snapshot) {
         result.push_str(&line);
         result.push('\n');
@@ -239,6 +267,14 @@ mod tests {
             }],
             ..Default::default()
         });
+        let mut tracker = crate::path_diagnostics::Tracker::default();
+        tracker.members(1, &[
+            netburrow_protocol::Peer { client_id:1,steam_id:11,epoch:111 },
+            netburrow_protocol::Peer { client_id:7,steam_id:76561198012345678,epoch:123456789123456789 },
+        ]);
+        tracker.capabilities(vec![1,7]);
+        tracker.tick(std::time::Instant::now());
+        snapshot.path_diagnostics = tracker.snapshot(std::time::Instant::now());
         let report = build_report(
             Path::new("missing-peer-test-logs"),
             &Settings::default(),
@@ -246,6 +282,8 @@ mod tests {
         );
         assert!(report.contains("member=7 hook_send_calls=9"));
         assert!(report.contains("hook_received=8 game_consumed=2"));
+        assert!(report.contains("path member=7 supported=true tcp_probe_sent=1"));
+        assert!(report.contains("sequence member=7 reliable=true"));
         assert!(!report.contains("76561198012345678"));
         assert!(!report.contains("123456789123456789"));
         snapshot.peers[0].game_epoch += 1;
@@ -266,6 +304,8 @@ mod tests {
                 settings.group, settings.display_name, settings.server
             ),
             logs: vec![
+                "现场标记：用户观察到对局画面不推进；此标记不代表已确认死锁或断网。".into(),
+                "flow member=7 channel=3 kind=2 sent=90 received=80 consumed=80 dropped=0 stale_received=0 cleared_in=0 cleared_out=0".into(),
                 "token=never-export-me".into(),
                 "old NB1-previous-secret".into(),
                 "id=76561198012345678".into(),
@@ -298,6 +338,9 @@ mod tests {
         }
         assert!(report.contains(env!("CARGO_PKG_VERSION")));
         assert!(report.contains("尚无此日志"));
+        assert!(report.contains("现场标记：用户观察到对局画面不推进"));
+        assert!(report.contains("flow member=7 channel=3 kind=2 sent=90 received=80 consumed=80"));
+        assert!(report.contains("导出时间（Unix 毫秒）"));
         fs::remove_file(file).unwrap();
         fs::remove_dir(dir).unwrap();
     }
