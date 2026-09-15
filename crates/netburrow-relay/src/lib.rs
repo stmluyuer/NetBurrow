@@ -223,6 +223,16 @@ async fn client_loop(
     mut stopping: watch::Receiver<bool>,
 ) {
     let stats = state.lock().await.stats.clone();
+    // Game traffic consists of latency-sensitive small frames in both directions.
+    if let Err(error) = stream.set_nodelay(true) {
+        increment(&stats.io_failed);
+        record(
+            "ERROR",
+            "tcp_nodelay_failed",
+            format_args!("kind={:?}", error.kind()),
+        );
+        return;
+    }
     let first = tokio::select! {
         result = tokio::time::timeout(config.handshake_timeout, read_tcp_message(&mut stream)) => result,
         _ = stopping.changed() => return,
