@@ -65,8 +65,6 @@ impl NetBurrowApp {
                     ui.label(
                         RichText::new(if checking {
                             "正在检查连接…"
-                        } else if active && self.current_phase() == Phase::WaitingForGame {
-                            "请从 Steam 启动游戏"
                         } else if active {
                             "停止后需重开游戏"
                         } else if self.settings.allow_late_hook {

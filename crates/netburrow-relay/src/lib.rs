@@ -1153,6 +1153,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn four_clients_interleaved_channels_and_rejoin_keep_routes_isolated() {
+        async fn exchange(clients: &mut [TcpStream], epochs: &[u64; 4]) {
+            for round in 0..4u8 {
+                for source in 0..4 {
+                    for target in 0..4 {
+                        if source == target {
+                            continue;
+                        }
+                        let mut p = packet(
+                            source as u64 + 1,
+                            target as u64 + 1,
+                            epochs[source],
+                            epochs[target],
+                            round,
+                            &[source as u8, target as u8, round],
+                        );
+                        p.channel = i32::from(round % 2);
+                        write_tcp_message(&mut clients[source], &Message::Data(p))
+                            .await
+                            .unwrap();
+                    }
+                }
+                for target in 0..4 {
+                    let mut sources = std::collections::HashSet::new();
+                    for _ in 0..3 {
+                        let m = recv_until(&mut clients[target], |m| {
+                            assert!(!matches!(m, Message::Error(_)));
+                            matches!(m, Message::Data(_))
+                        })
+                        .await;
+                        let Message::Data(p) = m else { unreachable!() };
+                        assert!(p.from >= 1 && p.from <= 4 && p.from != target as u64 + 1);
+                        assert!(sources.insert(p.from));
+                        assert_eq!(
+                            (
+                                p.to,
+                                p.source_epoch,
+                                p.target_epoch,
+                                p.channel,
+                                p.send_type,
+                                p.payload
+                            ),
+                            (
+                                target as u64 + 1,
+                                epochs[(p.from - 1) as usize],
+                                epochs[target],
+                                i32::from(round % 2),
+                                round,
+                                vec![(p.from - 1) as u8, target as u8, round]
+                            )
+                        );
+                    }
+                }
+            }
+        }
+        let relay = spawn(Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            ..Config::default()
+        })
+        .await
+        .unwrap();
+        let (a, b, c, d) = tokio::join!(
+            connect(relay.local_addr(), group(1)),
+            connect(relay.local_addr(), group(1)),
+            connect(relay.local_addr(), group(1)),
+            connect(relay.local_addr(), group(1))
+        );
+        let old_id = d.1;
+        let mut clients = vec![a.0, b.0, c.0, d.0];
+        let mut epochs = [10, 20, 30, 40];
+        for i in 0..4 {
+            bind(&mut clients[i], i as u64 + 1, epochs[i]).await;
+        }
+        for client in &mut clients {
+            assert_healthy(client).await;
+        }
+        exchange(&mut clients, &epochs).await;
+        write_tcp_message(&mut clients[3], &Message::Leave)
+            .await
+            .unwrap();
+        recv_until(
+            &mut clients[0],
+            |m| matches!(m,Message::Members(p) if p.iter().all(|p|p.client_id!=old_id)),
+        )
+        .await;
+        for i in 0..3 {
+            write_tcp_message(
+                &mut clients[i],
+                &Message::Data(packet(i as u64 + 1, 4, epochs[i], 40, 2, b"departed")),
+            )
+            .await
+            .unwrap();
+            assert_healthy(&mut clients[i]).await;
+        }
+        let (replacement, _, _) = connect(relay.local_addr(), group(1)).await;
+        clients[3] = replacement;
+        epochs[3] = 41;
+        bind(&mut clients[3], 4, 41).await;
+        for client in &mut clients {
+            assert_healthy(client).await;
+        }
+        write_tcp_message(
+            &mut clients[0],
+            &Message::Data(packet(1, 4, 10, 40, 2, b"old epoch")),
+        )
+        .await
+        .unwrap();
+        assert_healthy(&mut clients[0]).await;
+        assert_healthy(&mut clients[3]).await;
+        exchange(&mut clients, &epochs).await;
+        relay.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn peer_unbind_restart_and_disconnect_do_not_fail_remaining_clients() {
         let relay = spawn(Config {
             bind: "127.0.0.1:0".parse().unwrap(),

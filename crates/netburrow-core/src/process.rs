@@ -35,6 +35,13 @@ pub struct GameProcess {
     pub path: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessState {
+    Alive,
+    Exited,
+    Unknown(Option<i32>),
+}
+
 #[cfg(windows)]
 pub use windows::*;
 
@@ -47,6 +54,96 @@ mod windows {
         os::windows::ffi::OsStrExt,
         ptr,
     };
+
+    /// An owned handle pins the exact process object, including after PID reuse.
+    pub struct ProcessMonitor(std::os::windows::io::OwnedHandle);
+    impl ProcessMonitor {
+        pub fn open(expected: &GameProcess) -> io::Result<Self> {
+            use std::os::windows::io::FromRawHandle;
+            use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+            let raw = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                    0,
+                    expected.pid,
+                )
+            };
+            let handle = Handle::new(raw)?;
+            let mut created: FILETIME = unsafe { zeroed() };
+            let (mut exited, mut kernel, mut user) = (created, created, created);
+            if unsafe {
+                GetProcessTimes(handle.0, &mut created, &mut exited, &mut kernel, &mut user)
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if (((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
+                != expected.created
+            {
+                return Err(io::Error::other("process identity changed"));
+            }
+            std::mem::forget(handle);
+            Ok(Self(unsafe {
+                std::os::windows::io::OwnedHandle::from_raw_handle(raw)
+            }))
+        }
+        pub fn state(&self) -> ProcessState {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::{
+                Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+                System::Threading::WaitForSingleObject,
+            };
+            match unsafe { WaitForSingleObject(self.0.as_raw_handle(), 0) } {
+                WAIT_OBJECT_0 => ProcessState::Exited,
+                WAIT_TIMEOUT => ProcessState::Alive,
+                _ => ProcessState::Unknown(io::Error::last_os_error().raw_os_error()),
+            }
+        }
+    }
+    #[cfg(test)]
+    mod monitor_tests {
+        use super::*;
+        #[test]
+        fn child_fixture() {
+            if std::env::var_os("NETBURROW_MONITOR_FIXTURE").is_some() {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+        #[test]
+        fn pinned_process_handle_survives_path_changes_and_confirms_exit() {
+            use std::os::windows::process::CommandExt;
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "process::windows::monitor_tests::child_fixture"])
+                .env("NETBURROW_MONITOR_FIXTURE", "1")
+                .creation_flags(0x08000000)
+                .spawn()
+                .unwrap();
+            let raw = Handle::new(unsafe {
+                OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, child.id())
+            })
+            .unwrap();
+            let mut created: FILETIME = unsafe { zeroed() };
+            let (mut exited, mut kernel, mut user) = (created, created, created);
+            assert_ne!(
+                unsafe {
+                    GetProcessTimes(raw.0, &mut created, &mut exited, &mut kernel, &mut user)
+                },
+                0
+            );
+            let game = GameProcess {
+                pid: child.id(),
+                created: ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64,
+                path: PathBuf::from("path-no-longer-readable.exe"),
+            };
+            let monitor = ProcessMonitor::open(&game).unwrap();
+            assert_eq!(monitor.state(), ProcessState::Alive);
+            let mut wrong = game;
+            wrong.created += 1;
+            assert!(ProcessMonitor::open(&wrong).is_err());
+            assert!(child.wait().unwrap().success());
+            assert_eq!(monitor.state(), ProcessState::Exited);
+        }
+    }
     use windows_sys::Win32::{
         Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE},
         Security::{EqualSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser},

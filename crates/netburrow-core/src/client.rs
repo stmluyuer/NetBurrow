@@ -49,22 +49,43 @@ pub struct Snapshot {
     pub last_disconnect_at: Option<std::time::Instant>,
     pub disconnects: u64,
     pub heartbeat_timeouts: u64,
+    pub hook_health: Option<netburrow_protocol::HookHealth>,
+    pub ipc_slow: bool,
+    pub process_unknown: bool,
+    pub peer_faults: u64,
     pub logs: Vec<String>,
 }
 
 type Shared = Arc<Mutex<Snapshot>>;
 
+/// Local per-peer stages, mapped to the Relay's temporary member number, never Steam IDs.
+pub(crate) fn peer_diagnostic_lines(snapshot: &Snapshot) -> Vec<String> {
+    let Some(health) = &snapshot.hook_health else { return Vec::new(); };
+    health.peers.iter().filter_map(|h| {
+        let member = snapshot.peers.iter().find(|p| !p.is_self && p.steam_id == h.peer && p.game_epoch == h.epoch)?;
+        Some(format!("member={} hook_send_calls={} hook_send_rejected={} hook_received={} game_consumed={} dropped={} discarded={} queued_packets={} queued_bytes={} oldest_ms={} outgoing_packets={} failed={}",
+            member.client_id,h.send_calls,h.send_rejected,h.received,h.consumed,h.dropped,h.discarded,h.queued_packets,h.queued_bytes,h.oldest_ms,h.outgoing_packets,h.failed))
+    }).collect()
+}
+
 pub(crate) fn probe_relay(settings: &Settings) -> Result<(), String> {
     #[cfg(windows)]
     {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|error| format!("无法启动自检：{error}"))?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("无法启动自检：{error}"))?;
         runtime.block_on(async {
-            tokio::time::timeout(std::time::Duration::from_secs(8), runtime::probe(settings)).await
+            tokio::time::timeout(std::time::Duration::from_secs(8), runtime::probe(settings))
+                .await
                 .map_err(|_| "服务器自检超时，请检查网络、地址和端口后重试。".to_owned())?
         })
     }
     #[cfg(not(windows))]
-    { let _ = settings; Err("客户端自检需要 Windows".into()) }
+    {
+        let _ = settings;
+        Err("客户端自检需要 Windows".into())
+    }
 }
 fn change(shared: &Shared, update: impl FnOnce(&mut Snapshot)) {
     update(&mut shared.lock().unwrap_or_else(|p| p.into_inner()));
@@ -165,10 +186,11 @@ impl Drop for Client {
 #[cfg(windows)]
 mod runtime {
     use super::*;
+    use crate::client_io::{Budget, Mailbox, Writer as SocketWriter, reader as socket_reader};
     use crate::diagnostics::record as log;
     use crate::{
         Transport,
-        process::{GameProcess, find_games},
+        process::{GameProcess, ProcessMonitor, ProcessState, find_games},
         settings::parse_group,
     };
     use netburrow_protocol::{
@@ -185,16 +207,21 @@ mod runtime {
     };
     use tokio::{
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-        net::{TcpListener, TcpStream, UdpSocket, tcp::OwnedWriteHalf},
-        sync::{mpsc, watch},
+        net::{TcpListener, TcpStream, UdpSocket},
+        sync::watch,
         task::JoinHandle as Task,
         time::{Instant, interval, timeout},
     };
 
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
+    use netburrow_protocol::{
+        IPC_CAPABILITIES,
+        local::{IPC_TIMEOUT, IPC_WARNING},
+    };
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-    const GROUP_NOT_ALLOWED_HINT: &str = "该组码未获服务器授权，请联系管理员添加，或更换已授权组码后重新启用联机。";
+    const GROUP_NOT_ALLOWED_HINT: &str =
+        "该组码未获服务器授权，请联系管理员添加，或更换已授权组码后重新启用联机。";
 
     #[derive(Debug)]
     struct GroupNotAllowed;
@@ -208,25 +235,52 @@ mod runtime {
     impl std::error::Error for GroupNotAllowed {}
 
     fn group_not_allowed(error: &io::Error) -> bool {
-        error.get_ref().is_some_and(|cause| cause.is::<GroupNotAllowed>())
+        error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<GroupNotAllowed>())
     }
 
     pub(super) async fn probe(settings: &Settings) -> Result<(), String> {
         let group = parse_group(&settings.group)?;
-        let mut network = Network::connect(settings.server.trim(), group, Transport::Tcp).await
-            .map_err(|error| connection_hint(&error).split('；').next().unwrap_or("服务器连接失败").to_owned())?;
-        network.send(&Message::Status(MemberStatus { name: String::new(), phase: 0, ping_ms: None, transport: 0, sent: 0, received: 0 })).await
+        let mut network = Network::connect(settings.server.trim(), group, Transport::Tcp)
+            .await
+            .map_err(|error| {
+                connection_hint(&error)
+                    .split('；')
+                    .next()
+                    .unwrap_or("服务器连接失败")
+                    .to_owned()
+            })?;
+        network
+            .send(&Message::Status(MemberStatus {
+                name: String::new(),
+                phase: 0,
+                ping_ms: None,
+                transport: 0,
+                sent: 0,
+                received: 0,
+            }))
+            .await
             .map_err(|_| "服务器状态检查发送失败，请稍后重试。".to_owned())?;
         let result = loop {
             match network.events.recv().await {
                 Some(NetworkEvent::Tcp(Message::Statuses(_))) => break Ok(()),
-                Some(NetworkEvent::Tcp(Message::Members(_))) => {},
-                Some(NetworkEvent::Tcp(Message::Ping(value))) => { if network.send(&Message::Pong(value)).await.is_err() { break Err("服务器连接中断，请重试。".into()); } },
-                Some(NetworkEvent::Tcp(Message::Error(_))) => break Err("服务器拒绝状态检查，请确认连接的是支持成员状态的 NetBurrow Relay。".into()),
+                Some(NetworkEvent::Tcp(Message::Members(_))) => {}
+                Some(NetworkEvent::Tcp(Message::Ping(value))) => {
+                    if network.send(&Message::Pong(value)).await.is_err() {
+                        break Err("服务器连接中断，请重试。".into());
+                    }
+                }
+                Some(NetworkEvent::Tcp(Message::Error(_))) => {
+                    break Err(
+                        "服务器拒绝状态检查，请确认连接的是支持成员状态的 NetBurrow Relay。".into(),
+                    );
+                }
                 _ => break Err("服务器握手或协议检查失败，请检查地址和服务状态。".into()),
             }
         };
         let _ = network.send(&Message::Leave).await;
+        let _ = network.writer.drain().await;
         result
     }
 
@@ -236,9 +290,13 @@ mod runtime {
         }
         match error.kind() {
             io::ErrorKind::TimedOut => "连接服务器超时，请检查地址、网络和防火墙；3 秒后重试。",
-            io::ErrorKind::ConnectionRefused => "服务器拒绝连接，请检查服务是否启动、端口是否开放；3 秒后重试。",
+            io::ErrorKind::ConnectionRefused => {
+                "服务器拒绝连接，请检查服务是否启动、端口是否开放；3 秒后重试。"
+            }
             io::ErrorKind::WouldBlock => "服务器已满，请稍后再试；3 秒后重试。",
-            io::ErrorKind::PermissionDenied => "服务器拒绝加入，请核对服务器地址和版本；3 秒后重试。",
+            io::ErrorKind::PermissionDenied => {
+                "服务器拒绝加入，请核对服务器地址和版本；3 秒后重试。"
+            }
             io::ErrorKind::InvalidData => "服务器协议不匹配，请核对端口和版本；3 秒后重试。",
             _ => "无法连接服务器，请检查地址、网络和服务状态；3 秒后重试。",
         }
@@ -266,14 +324,29 @@ mod runtime {
         UdpBound,
         Closed,
     }
+    struct NetworkEvents {
+        tcp: Mailbox,
+        udp: Mailbox,
+    }
+    impl NetworkEvents {
+        async fn recv(&mut self) -> Option<NetworkEvent> {
+            tokio::select! {
+                value=self.tcp.recv()=>Some(match value {Some(Ok(m))=>NetworkEvent::Tcp(m),_=>NetworkEvent::Closed}),
+                value=self.udp.recv()=>Some(match value {Some(Ok(Message::Data(p)))=>NetworkEvent::Udp(p),Some(Ok(Message::IpcReady))=>NetworkEvent::UdpBound,Some(Ok(m))=>NetworkEvent::Tcp(m),_=>NetworkEvent::Closed}),
+            }
+        }
+    }
     struct Network {
-        writer: OwnedWriteHalf,
-        events: mpsc::Receiver<NetworkEvent>,
+        writer: SocketWriter,
+        events: NetworkEvents,
         tasks: Vec<Task<()>>,
         udp: Option<Arc<UdpSocket>>,
         client_id: u64,
         token: Token,
         udp_bound: bool,
+        udp_written: u64,
+        incoming_budget: Budget,
+        outgoing_budget: Budget,
     }
     impl Drop for Network {
         fn drop(&mut self) {
@@ -295,28 +368,39 @@ mod runtime {
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "join timeout"))??;
             let (client_id, token) = match hello {
-                Message::Welcome { client_id, udp_token } => (client_id, udp_token),
+                Message::Welcome {
+                    client_id,
+                    udp_token,
+                } => (client_id, udp_token),
                 Message::Error(reason) if reason == "relay is full" => {
                     return Err(io::Error::new(io::ErrorKind::WouldBlock, "Relay is full"));
                 }
                 Message::Error(reason) if reason == "group is not allowed" => {
-                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, GroupNotAllowed));
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        GroupNotAllowed,
+                    ));
                 }
                 Message::Error(_) => {
-                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Relay rejected join"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Relay rejected join",
+                    ));
                 }
-                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Unexpected Relay handshake")),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Unexpected Relay handshake",
+                    ));
+                }
             };
-            let (tx, events) = mpsc::channel(16);
-            let tcp_tx = tx.clone();
-            let reader = tokio::spawn(async move {
-                while let Ok(message) = read(&mut input).await {
-                    if tcp_tx.send(NetworkEvent::Tcp(message)).await.is_err() {
-                        return;
-                    }
-                }
-                let _ = tcp_tx.send(NetworkEvent::Closed).await;
-            });
+            let incoming_budget = Budget::default();
+            let outgoing_budget = Budget::default();
+            let events = NetworkEvents {
+                tcp: Mailbox::with_budget(true, incoming_budget.clone()),
+                udp: Mailbox::with_budget(true, incoming_budget.clone()),
+            };
+            let reader = socket_reader(input, events.tcp.clone(), false);
             let mut tasks = vec![reader];
             let udp = if transport == Transport::Udp {
                 let socket = Arc::new(
@@ -329,21 +413,22 @@ mod runtime {
                 );
                 socket.connect(address).await?;
                 let udp_input = socket.clone();
+                let udp_events = events.udp.clone();
                 tasks.push(tokio::spawn(async move {
                     let mut buffer = [0; netburrow_protocol::UDP_LIMIT + 1];
                     while let Ok(count) = udp_input.recv(&mut buffer).await {
                         let event = match decode_datagram(&buffer[..count]) {
                             Ok(Datagram::Bound { client_id: id }) if id == client_id => {
-                                NetworkEvent::UdpBound
+                                Message::IpcReady
                             }
                             Ok(Datagram::Data {
                                 client_id: id,
                                 token: key,
                                 packet,
-                            }) if id == client_id && key == token => NetworkEvent::Udp(packet),
+                            }) if id == client_id && key == token => Message::Data(packet),
                             _ => continue,
                         };
-                        if tx.send(event).await.is_err() {
+                        if udp_events.post(event).is_err() {
                             break;
                         }
                     }
@@ -353,29 +438,40 @@ mod runtime {
                 None
             };
             Ok(Self {
-                writer,
+                writer: SocketWriter::with_budget(
+                    writer,
+                    false,
+                    IO_TIMEOUT,
+                    outgoing_budget.clone(),
+                ),
                 events,
                 tasks,
                 udp,
                 client_id,
                 token,
                 udp_bound: false,
+                udp_written: 0,
+                incoming_budget,
+                outgoing_budget,
             })
         }
         async fn send(&mut self, message: &Message) -> io::Result<()> {
             if matches!(message, Message::Bind { .. }) {
                 self.udp_bound = false;
             }
-            write(&mut self.writer, message).await
+            self.writer.send(message.clone()).map(|_| ())
         }
         async fn bind_udp(&self) -> io::Result<()> {
             if let Some(socket) = &self.udp {
-                socket
-                    .send(&encode_datagram(&Datagram::Bind {
-                        client_id: self.client_id,
-                        token: self.token,
-                    })?)
-                    .await?;
+                let bytes = encode_datagram(&Datagram::Bind {
+                    client_id: self.client_id,
+                    token: self.token,
+                })?;
+                match socket.try_send(&bytes) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Err(e),
+                }
             }
             Ok(())
         }
@@ -387,7 +483,11 @@ mod runtime {
                         token: self.token,
                         packet: packet.clone(),
                     }) {
-                        socket.send(&bytes).await?;
+                        match socket.try_send(&bytes) {
+                            Ok(_) => self.udp_written += 1,
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                            Err(e) => return Err(e),
+                        }
                         return Ok(true);
                     }
                 }
@@ -403,9 +503,12 @@ mod runtime {
         nonce: Token,
         since: Instant,
         helper: Option<Child>,
+        monitor: watch::Receiver<ProcessState>,
+        monitor_task: Task<()>,
     }
     impl Drop for Launch {
         fn drop(&mut self) {
+            self.monitor_task.abort();
             if let Some(mut child) = self.helper.take() {
                 if child.try_wait().ok().flatten().is_none() {
                     let _ = child.kill();
@@ -415,14 +518,17 @@ mod runtime {
         }
     }
     struct Hook {
-        writer: OwnedWriteHalf,
-        input: mpsc::Receiver<io::Result<Message>>,
+        writer: SocketWriter,
+        input: Mailbox,
         reader: Task<()>,
         steam_id: u64,
         epoch: u64,
         ready: bool,
         bound: bool,
         acknowledged: bool,
+        received_base: u64,
+        udp_received_base: u64,
+        failed: HashSet<(u64, u64)>,
     }
     impl Drop for Hook {
         fn drop(&mut self) {
@@ -430,34 +536,44 @@ mod runtime {
         }
     }
     impl Hook {
-        async fn accept(mut socket: TcpStream, launch: &Launch) -> io::Result<Self> {
+        async fn accept(
+            mut socket: TcpStream,
+            expected_pid: u32,
+            expected_nonce: Token,
+            expected_epoch: u64,
+            incoming_budget: Budget,
+            outgoing_budget: Budget,
+        ) -> io::Result<Self> {
             socket.set_nodelay(true)?;
             let hello = timeout(IO_TIMEOUT, read(&mut socket))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "IPC hello timeout"))??;
-            if !matches!(hello, Message::IpcHello { nonce, pid, steam_id, epoch } if nonce == launch.nonce && pid == launch.game.pid && steam_id != 0 && epoch == launch.epoch)
-            {
-                return Err(io::Error::other("IPC identity mismatch"));
+            let old_known = matches!(&hello,Message::IpcHello {nonce,pid,steam_id,epoch} if *nonce==expected_nonce && *pid==expected_pid && *steam_id!=0 && *epoch==expected_epoch);
+            let unsupported_known = matches!(&hello,Message::IpcHelloV2 {nonce,pid,steam_id,epoch,capabilities} if *nonce==expected_nonce && *pid==expected_pid && *steam_id!=0 && *epoch==expected_epoch && *capabilities!=IPC_CAPABILITIES);
+            if old_known || unsupported_known {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Hook capabilities require a complete package update",
+                ));
             }
-            let Message::IpcHello {
+            if !matches!(hello, Message::IpcHelloV2 { nonce, pid, steam_id, epoch, capabilities } if nonce == expected_nonce && pid == expected_pid && steam_id != 0 && epoch == expected_epoch && capabilities==IPC_CAPABILITIES)
+            {
+                return Err(io::Error::other(
+                    "IPC identity/capability mismatch; update the complete client package and restart the game",
+                ));
+            }
+            let Message::IpcHelloV2 {
                 steam_id, epoch, ..
             } = hello
             else {
                 unreachable!()
             };
-            let (mut input, writer) = socket.into_split();
-            let (tx, rx) = mpsc::channel(16);
-            let reader = tokio::spawn(async move {
-                loop {
-                    let result = read(&mut input).await;
-                    let ended = result.is_err();
-                    if tx.send(result).await.is_err() || ended {
-                        break;
-                    }
-                }
-            });
+            write(&mut socket, &Message::IpcAccepted(IPC_CAPABILITIES)).await?;
+            let (input, writer) = socket.into_split();
+            let rx = Mailbox::with_budget(false, outgoing_budget);
+            let reader = socket_reader(input, rx.clone(), true);
             Ok(Self {
-                writer,
+                writer: SocketWriter::with_budget(writer, true, IPC_TIMEOUT, incoming_budget),
                 input: rx,
                 reader,
                 steam_id,
@@ -465,14 +581,31 @@ mod runtime {
                 ready: false,
                 bound: false,
                 acknowledged: false,
+                received_base: 0,
+                udp_received_base: 0,
+                failed: HashSet::new(),
             })
         }
         async fn send(&mut self, message: &Message) -> io::Result<()> {
-            write(&mut self.writer, message).await
+            if let Err(error) = self.writer.send(message.clone()) {
+                self.writer.report_failure(error);
+            }
+            Ok(()) // Tick handles an IPC failure without tearing down the Relay connection.
+        }
+        fn fail_peer(&mut self, peer: u64, epoch: u64) -> io::Result<()> {
+            if self.failed.insert((peer, epoch)) {
+                self.writer.queue.fail_peer(peer, epoch);
+                self.input.fail_peer(peer, epoch);
+                if let Err(error) = self.writer.send(Message::IpcPeerFault { peer, epoch }) {
+                    self.writer.report_failure(error);
+                }
+            }
+            Ok(())
         }
     }
 
     fn launch(game: GameProcess, directory: &Path, port: u16) -> io::Result<Launch> {
+        let process_monitor = ProcessMonitor::open(&game)?;
         log(
             "INFO",
             "inject",
@@ -511,12 +644,24 @@ mod runtime {
             let _ = child.wait();
             return Err(e);
         }
+        let (observed, monitor) = watch::channel(process_monitor.state());
+        let monitor_task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let state = process_monitor.state();
+                if observed.send(state).is_err() || state == ProcessState::Exited {
+                    break;
+                }
+            }
+        });
         Ok(Launch {
             game,
             epoch,
             nonce,
             since: Instant::now(),
             helper: Some(child),
+            monitor,
+            monitor_task,
         })
     }
 
@@ -604,11 +749,7 @@ mod runtime {
                         status(&state, Phase::Failed, detail);
                         return;
                     }
-                    status(
-                        &state,
-                        Phase::Connecting,
-                        connection_hint(&error),
-                    );
+                    status(&state, Phase::Connecting, connection_hint(&error));
                     tokio::select! { _ = stop.changed() => break, _ = tokio::time::sleep(Duration::from_secs(3)) => {} }
                     continue;
                 }
@@ -650,6 +791,7 @@ mod runtime {
             )
             .await;
             let _ = network.send(&Message::Leave).await;
+            let _ = network.writer.drain().await;
             if let Err(error) = &result {
                 log("ERROR", "connection ended", &error.to_string());
             }
@@ -662,18 +804,24 @@ mod runtime {
                     s.last_disconnect_at = Some(std::time::Instant::now());
                 });
             }
-            if result
-                .as_ref()
-                .is_err_and(|error| error.kind() == io::ErrorKind::Unsupported
+            if result.as_ref().is_err_and(|error| {
+                error.kind() == io::ErrorKind::Unsupported
                     || (error.kind() == io::ErrorKind::PermissionDenied
-                        && state.lock().unwrap_or_else(|p| p.into_inner()).phase == Phase::Failed))
-            {
+                        && state.lock().unwrap_or_else(|p| p.into_inner()).phase == Phase::Failed)
+            }) {
                 change(&state, |s| {
                     s.peers.clear();
                     s.ping_ms = None;
                 });
-                if result.as_ref().is_err_and(|error| error.kind() == io::ErrorKind::Unsupported) {
-                    status(&state, Phase::Failed, "服务器版本不兼容：Relay 尚不支持成员状态，请更新服务器后重新启用联机。");
+                if result
+                    .as_ref()
+                    .is_err_and(|error| error.kind() == io::ErrorKind::Unsupported)
+                {
+                    status(
+                        &state,
+                        Phase::Failed,
+                        "服务器版本不兼容：Relay 尚不支持成员状态，请更新服务器后重新启用联机。",
+                    );
                 }
                 return;
             }
@@ -716,14 +864,17 @@ mod runtime {
         clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let since = Instant::now();
         let mut last_ping = Instant::now() - Duration::from_secs(1);
-        let mut last_pong = Instant::now();
         let mut last_stats = Instant::now();
         let mut last_report = Instant::now() - Duration::from_secs(3);
         let mut status_supported = false;
+        let sent_base = state.lock().unwrap_or_else(|p| p.into_inner()).sent;
+        let udp_base = state.lock().unwrap_or_else(|p| p.into_inner()).udp_sent;
+        let mut candidate: Option<Task<io::Result<Hook>>> = None;
+        let mut discovery: Option<Task<io::Result<Vec<GameProcess>>>> = None;
+        let mut next_discovery = Instant::now();
         let result = async {
             loop {
                 tokio::select! {
-                    biased;
                     _ = stop.changed() => return Ok(()),
                     event = network.events.recv() => {
                         match event {
@@ -754,7 +905,6 @@ mod runtime {
                             Some(NetworkEvent::Tcp(Message::Data(packet))) => deliver(packet, false, &peers, &mut hook, state).await?,
                             Some(NetworkEvent::Udp(packet)) => deliver(packet, true, &peers, &mut hook, state).await?,
                             Some(NetworkEvent::Tcp(Message::Pong(sequence))) => {
-                                last_pong = Instant::now();
                                 change(state, |s| {
                                     let ping = (since.elapsed().as_millis() as u64).saturating_sub(sequence);
                                     s.ping_ms = Some(ping);
@@ -765,6 +915,11 @@ mod runtime {
                             }
                             Some(NetworkEvent::Tcp(Message::Ping(value))) => network.send(&Message::Pong(value)).await?,
                             Some(NetworkEvent::UdpBound) => { network.udp_bound = true; log("INFO", "udp", "endpoint bound; unreliable packets may use UDP"); }
+                            Some(NetworkEvent::Tcp(Message::IpcPeerFault {peer,epoch})) => {
+                                if peers.iter().any(|p|p.steam_id==peer && p.epoch==epoch) {
+                                    if let Some(h)=hook.as_mut() { h.fail_peer(peer,epoch)?; }
+                                }
+                            }
                             Some(NetworkEvent::Tcp(Message::Error(reason))) if matches!(reason.as_str(), "target connection is slow" | "target connection closed") => {
                                 log("WARN", "relay peer disconnected", relay_reason(&reason));
                                 // Members is authoritative for peer cleanup; these errors carry no target identity.
@@ -795,17 +950,30 @@ mod runtime {
                     }
                     incoming = listener.accept() => {
                         let (socket, address) = incoming?;
-                        if !address.ip().is_loopback() || hook.is_some() { continue; }
+                        if !address.ip().is_loopback() || hook.is_some() || candidate.is_some() { continue; }
                         if let Some(p) = pending.as_ref() {
-                            let accepted = tokio::select! { _ = stop.changed() => return Ok(()), value = Hook::accept(socket, p) => value };
-                            if let Ok(h) = accepted {
+                            let (pid,nonce,epoch)=(p.game.pid,p.nonce,p.epoch);
+                            candidate=Some(tokio::spawn(Hook::accept(socket,pid,nonce,epoch,network.incoming_budget.clone(),network.outgoing_budget.clone())));
+                        }
+                    }
+                    accepted = async { match candidate.as_mut() {Some(task)=>Some(task.await),None=>std::future::pending().await} } => {
+                            candidate=None;
+                            if let Some(Ok(Ok(mut h))) = accepted {
+                                if hook.is_some() || pending.as_ref().is_none_or(|p|p.epoch!=h.epoch) {continue;}
                                 log("INFO", "ipc", "Hook hello identity verified; requesting Relay game binding");
+                                h.received_base=state.lock().unwrap_or_else(|p|p.into_inner()).received;
+                                h.udp_received_base=state.lock().unwrap_or_else(|p|p.into_inner()).udp_received;
                                 network.send(&Message::Bind { steam_id: h.steam_id, epoch: h.epoch }).await?;
                                 hook = Some(h);
-                            } else if let Err(error) = accepted {
-                                log("WARN", "ipc hello rejected", &error.to_string());
+                            } else {
+                                log("WARN", "ipc hello rejected", "identity/capability verification failed; use the complete client package");
+                                if let Some(Ok(Err(error)))=accepted {
+                                    if error.kind()==io::ErrorKind::Unsupported {
+                                        pending=None;
+                                        status(state,Phase::RestartRequired,"客户端与 Hook 版本不匹配，请完整解压同一版本并重开游戏；Relay 保持连接");
+                                    }
+                                }
                             }
-                        }
                     }
                     message = async { match hook.as_mut() { Some(h) => h.input.recv().await, None => std::future::pending().await } } => {
                         match message {
@@ -818,10 +986,22 @@ mod runtime {
                             }
                             Some(Ok(Message::Data(packet))) => {
                                 if let Some(h) = hook.as_ref() {
-                                    if h.acknowledged && packet.from == h.steam_id && packet.source_epoch == h.epoch && peers.iter().any(|p| p.steam_id == packet.to && p.epoch == packet.target_epoch && p.steam_id != 0) {
-                                        let udp = network.packet(packet).await?;
-                                        change(state, |s| { s.sent += 1; s.udp_sent += u64::from(udp); });
+                                    if h.acknowledged && !h.failed.contains(&(packet.to,packet.target_epoch)) && packet.from == h.steam_id && packet.source_epoch == h.epoch && peers.iter().any(|p| p.steam_id == packet.to && p.epoch == packet.target_epoch && p.steam_id != 0) {
+                                        network.packet(packet).await?;
                                     }
+                                }
+                            }
+                            Some(Ok(Message::IpcHealth(mut health))) => {
+                                health.peers.retain(|h|peers.iter().any(|p|p.steam_id==h.peer && p.epoch==h.epoch));
+                                change(state,|s|s.hook_health=Some(health));
+                            }
+                            Some(Ok(Message::IpcPeerFault {peer,epoch})) => {
+                                if peers.iter().any(|p|p.steam_id==peer && p.epoch==epoch) {
+                                    if let Some(h)=hook.as_mut() {h.fail_peer(peer,epoch)?;}
+                                    network.writer.queue.fail_peer(peer,epoch);
+                                    network.events.tcp.fail_peer(peer,epoch);
+                                    network.events.udp.fail_peer(peer,epoch);
+                                    log("WARN","peer fault","one peer session failed; other peers and Relay remain active");
                                 }
                             }
                             Some(Ok(Message::Diagnostic(text))) => { log("INFO", "hook", &text); change(state, |s| { s.logs.push(text); if s.logs.len() > 64 { s.logs.remove(0); } }); },
@@ -836,6 +1016,23 @@ mod runtime {
                         }
                     }
                     _ = clock.tick() => {
+                        network.writer.check()?;
+                        while let Some((peer,epoch))=network.writer.queue.fault() { if let Some(h)=hook.as_mut() {h.fail_peer(peer,epoch)?;} }
+                        let ipc_error=hook.as_ref().and_then(|h|h.writer.check().err().map(|e|e.to_string()).or_else(||(h.input.age()>=IPC_TIMEOUT).then(||"IPC liveness deadline".into())));
+                        if let Some(error)=ipc_error {
+                            log("ERROR","ipc stopped",&error);
+                            disconnect_hook(&mut hook,&mut pending,network).await;
+                            change(state,|s|{s.ipc_slow=false;s.hook_health=None;s.process_unknown=false;s.peer_faults=0;});
+                            status(state,Phase::RestartRequired,"游戏接入已断开，请退出游戏后重开；Relay 保持连接");
+                            continue;
+                        }
+                        if let Some(h)=hook.as_mut() {
+                            while let Some((peer,epoch))=h.writer.queue.fault() {h.fail_peer(peer,epoch)?;}
+                            change(state,|s| {s.received=h.received_base+h.writer.count();s.udp_received=h.udp_received_base+h.writer.udp_count();s.ipc_slow=h.input.age()>=IPC_WARNING || h.writer.slow();s.peer_faults=h.failed.len() as u64;});
+                        } else {
+                            change(state,|s| {s.ipc_slow=false;s.hook_health=None;s.process_unknown=false;s.peer_faults=0;});
+                        }
+                        change(state,|s|{s.sent=sent_base+network.writer.count()+network.udp_written;s.udp_sent=udp_base+network.udp_written;});
                         if last_report.elapsed() >= Duration::from_secs(3) {
                             let report = {
                                 let s = state.lock().unwrap_or_else(|p| p.into_inner());
@@ -849,9 +1046,15 @@ mod runtime {
                         }
                         if last_stats.elapsed() >= Duration::from_secs(10) {
                             change(state, |s| log("INFO", "traffic", &format!("sent={} received={} udp_sent={} udp_received={} ping_ms={:?} udp_bound={}", s.sent, s.received, s.udp_sent, s.udp_received, s.ping_ms, network.udp_bound)));
+                            let health=state.lock().unwrap_or_else(|p|p.into_inner()).hook_health.clone();
+                            if let Some(h)=health {log("INFO","hook health",&format!("send_calls={} rejected={} read_calls={} consumed={} dropped={} lock_busy={} queued_packets={} queued_bytes={} oldest_ms={} interface_changed={}",h.send_calls,h.send_rejected,h.read_calls,h.consumed,h.dropped,h.lock_busy,h.queued_packets,h.queued_bytes,h.oldest_ms,h.interface_changed));}
+                            let peer_lines=super::peer_diagnostic_lines(&state.lock().unwrap_or_else(|p|p.into_inner()));
+                            for line in peer_lines {log("INFO","peer health",&line);}
+                            let drops=network.events.tcp.dropped()+network.events.udp.dropped()+network.writer.queue.dropped()+hook.as_ref().map_or(0,|h|h.input.dropped()+h.writer.queue.dropped());
+                            log("INFO","local handoff",&format!("unreliable_dropped={drops}"));
                             last_stats = Instant::now();
                         }
-                        if last_pong.elapsed() > Duration::from_secs(15) {
+                        if network.events.tcp.pong_age() > Duration::from_secs(15) {
                             change(state, |s| s.heartbeat_timeouts += 1);
                             return Err(io::Error::new(io::ErrorKind::TimedOut, "Relay heartbeat timeout"));
                         }
@@ -865,10 +1068,21 @@ mod runtime {
                             if since.elapsed() > Duration::from_secs(10) { return Err(io::Error::new(io::ErrorKind::Unsupported, "Relay member status handshake timed out")); }
                             continue;
                         }
-                        let games = find_games(game_path)?;
-                        seen.retain(|key| games.iter().any(|p| (p.pid,p.created) == *key));
+                        let mut games=Vec::new();
+                        if pending.is_none() {
+                            if discovery.as_ref().is_some_and(|task|task.is_finished()) {
+                                match discovery.take().unwrap().await {
+                                    Ok(Ok(found))=> {games=found;seen.retain(|key|games.iter().any(|p|(p.pid,p.created)==*key));},
+                                    _=>log("WARN","process discovery","process enumeration temporarily unavailable"),
+                                }
+                            }
+                            if discovery.is_none() && Instant::now()>=next_discovery {let path=game_path.to_owned();discovery=Some(tokio::task::spawn_blocking(move||find_games(&path)));next_discovery=Instant::now()+Duration::from_secs(1);}
+                        }
                         if let Some(p) = pending.as_mut() {
-                            if !games.iter().any(|g| g.pid == p.game.pid && g.created == p.game.created) {
+                            let process_state=*p.monitor.borrow();
+                            let unknown=matches!(process_state,ProcessState::Unknown(_));
+                            change(state,|s| {if s.process_unknown!=unknown {log("WARN","process monitor",&format!("state={process_state:?}"));}s.process_unknown=unknown;});
+                            if process_state==ProcessState::Exited {
                                 disconnect_hook(&mut hook, &mut pending, network).await;
                                 status(state, Phase::WaitingForGame, "游戏已退出，等待下次从 Steam 启动");
                                 continue;
@@ -910,6 +1124,12 @@ mod runtime {
                 }
             }
         }.await;
+        if let Some(task) = candidate {
+            task.abort();
+        }
+        if let Some(task) = discovery {
+            task.abort();
+        }
         disconnect_hook(&mut hook, &mut pending, network).await;
         result
     }
@@ -966,17 +1186,17 @@ mod runtime {
     ) -> io::Result<()> {
         if let Some(h) = hook.as_mut() {
             if h.acknowledged
+                && !h.failed.contains(&(packet.from, packet.source_epoch))
                 && packet.to == h.steam_id
                 && packet.target_epoch == h.epoch
                 && peers.iter().any(|p| {
                     p.steam_id == packet.from && p.epoch == packet.source_epoch && p.steam_id != 0
                 })
             {
-                h.send(&Message::Data(packet)).await?;
-                change(state, |s| {
-                    s.received += 1;
-                    s.udp_received += u64::from(udp);
-                });
+                if let Err(error) = h.writer.send_data(Message::Data(packet), udp) {
+                    h.writer.report_failure(error);
+                }
+                let _ = state; // Actual socket completion is counted by the writer task.
             }
         }
         Ok(())
@@ -989,22 +1209,114 @@ mod runtime {
         use tokio::time::{Duration, timeout};
 
         #[tokio::test]
+        async fn hook_capabilities_are_checked_before_binding() {
+            for supported in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let client = tokio::spawn(async move {
+                    let mut socket = TcpStream::connect(address).await.unwrap();
+                    let hello = if supported {
+                        Message::IpcHelloV2 {
+                            nonce: [7; 16],
+                            pid: 42,
+                            steam_id: 101,
+                            epoch: 11,
+                            capabilities: IPC_CAPABILITIES,
+                        }
+                    } else {
+                        Message::IpcHello {
+                            nonce: [7; 16],
+                            pid: 42,
+                            steam_id: 101,
+                            epoch: 11,
+                        }
+                    };
+                    write(&mut socket, &hello).await.unwrap();
+                    if supported {
+                        assert_eq!(
+                            read(&mut socket).await.unwrap(),
+                            Message::IpcAccepted(IPC_CAPABILITIES)
+                        );
+                    } else {
+                        assert!(read(&mut socket).await.is_err());
+                    }
+                });
+                let (socket, _) = listener.accept().await.unwrap();
+                let result = Hook::accept(
+                    socket,
+                    42,
+                    [7; 16],
+                    11,
+                    Budget::default(),
+                    Budget::default(),
+                )
+                .await;
+                assert_eq!(result.is_ok(), supported);
+                if let Ok(hook) = result {
+                    assert!(!hook.bound);
+                    assert!(!hook.acknowledged);
+                    client.await.unwrap();
+                    drop(hook);
+                } else {
+                    client.await.unwrap();
+                }
+            }
+        }
+
+        #[tokio::test]
         async fn preflight_probes_existing_protocol_and_rejects_unsupported_server() {
-            let relay = spawn(Config { bind: "127.0.0.1:0".parse().unwrap(), ..Config::default() }).await.unwrap();
-            let mut settings = Settings { server: relay.local_addr().to_string(), group: crate::new_group().unwrap(), ..Settings::default() };
-            timeout(Duration::from_secs(3), probe(&settings)).await.unwrap().unwrap();
+            let relay = spawn(Config {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                ..Config::default()
+            })
+            .await
+            .unwrap();
+            let mut settings = Settings {
+                server: relay.local_addr().to_string(),
+                group: crate::new_group().unwrap(),
+                ..Settings::default()
+            };
+            timeout(Duration::from_secs(3), probe(&settings))
+                .await
+                .unwrap()
+                .unwrap();
             relay.shutdown().await.unwrap();
             let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
             settings.server = server.local_addr().unwrap().to_string();
             let task = tokio::spawn(async move {
                 let (mut socket, _) = server.accept().await.unwrap();
-                assert!(matches!(read(&mut socket).await.unwrap(), Message::Join { .. }));
-                write(&mut socket, &Message::Welcome { client_id: 1, udp_token: [8; 16] }).await.unwrap();
-                assert!(matches!(read(&mut socket).await.unwrap(), Message::Status(_)));
-                write(&mut socket, &Message::Error("message is not accepted from a client".into())).await.unwrap();
+                assert!(matches!(
+                    read(&mut socket).await.unwrap(),
+                    Message::Join { .. }
+                ));
+                write(
+                    &mut socket,
+                    &Message::Welcome {
+                        client_id: 1,
+                        udp_token: [8; 16],
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    read(&mut socket).await.unwrap(),
+                    Message::Status(_)
+                ));
+                write(
+                    &mut socket,
+                    &Message::Error("message is not accepted from a client".into()),
+                )
+                .await
+                .unwrap();
                 assert!(matches!(read(&mut socket).await.unwrap(), Message::Leave));
             });
-            assert!(timeout(Duration::from_secs(3), probe(&settings)).await.unwrap().unwrap_err().contains("状态检查"));
+            assert!(
+                timeout(Duration::from_secs(3), probe(&settings))
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .contains("状态检查")
+            );
             task.await.unwrap();
         }
 
@@ -1020,28 +1332,68 @@ mod runtime {
             let task = tokio::spawn(async move {
                 for _ in 0..2 {
                     let (mut socket, _) = server.accept().await.unwrap();
-                    assert!(matches!(read(&mut socket).await.unwrap(), Message::Join { .. }));
-                    write(&mut socket, &Message::Error("group is not allowed".into())).await.unwrap();
+                    assert!(matches!(
+                        read(&mut socket).await.unwrap(),
+                        Message::Join { .. }
+                    ));
+                    write(&mut socket, &Message::Error("group is not allowed".into()))
+                        .await
+                        .unwrap();
                 }
                 // A fresh manual attempt can still use the same server after rejection.
                 let (mut socket, _) = server.accept().await.unwrap();
-                assert!(matches!(read(&mut socket).await.unwrap(), Message::Join { .. }));
-                write(&mut socket, &Message::Welcome { client_id: 1, udp_token: [8; 16] }).await.unwrap();
-                assert!(matches!(read(&mut socket).await.unwrap(), Message::Status(_)));
-                write(&mut socket, &Message::Statuses(vec![])).await.unwrap();
+                assert!(matches!(
+                    read(&mut socket).await.unwrap(),
+                    Message::Join { .. }
+                ));
+                write(
+                    &mut socket,
+                    &Message::Welcome {
+                        client_id: 1,
+                        udp_token: [8; 16],
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    read(&mut socket).await.unwrap(),
+                    Message::Status(_)
+                ));
+                write(&mut socket, &Message::Statuses(vec![]))
+                    .await
+                    .unwrap();
                 assert!(matches!(read(&mut socket).await.unwrap(), Message::Leave));
             });
-            assert_eq!(timeout(Duration::from_secs(2), probe(&settings)).await.unwrap().unwrap_err(), GROUP_NOT_ALLOWED_HINT);
+            assert_eq!(
+                timeout(Duration::from_secs(2), probe(&settings))
+                    .await
+                    .unwrap()
+                    .unwrap_err(),
+                GROUP_NOT_ALLOWED_HINT
+            );
             let state = Arc::new(Mutex::new(Snapshot {
                 ping_ms: Some(42),
                 last_pong_at: Some(std::time::Instant::now()),
                 rtt_samples: [42].into(),
-                peers: vec![PeerInfo { client_id: 2, game_epoch: 1, steam_id: 2, ready: true, is_self: false, status: None, status_updated: None }],
+                peers: vec![PeerInfo {
+                    client_id: 2,
+                    game_epoch: 1,
+                    steam_id: 2,
+                    ready: true,
+                    is_self: false,
+                    status: None,
+                    status_updated: None,
+                }],
                 ..Snapshot::default()
             }));
             let (_stop, stopped) = watch::channel(false);
             // Finishing before the existing three-second retry proves this is terminal.
-            timeout(Duration::from_secs(2), run(settings.clone(), PathBuf::new(), stopped, state.clone())).await.unwrap();
+            timeout(
+                Duration::from_secs(2),
+                run(settings.clone(), PathBuf::new(), stopped, state.clone()),
+            )
+            .await
+            .unwrap();
             {
                 let snapshot = state.lock().unwrap();
                 assert_eq!(snapshot.phase, Phase::Failed);
@@ -1052,17 +1404,36 @@ mod runtime {
                 assert!(snapshot.last_pong_at.is_none());
             }
             settings.group = crate::new_group().unwrap();
-            timeout(Duration::from_secs(2), probe(&settings)).await.unwrap().unwrap();
+            timeout(Duration::from_secs(2), probe(&settings))
+                .await
+                .unwrap()
+                .unwrap();
             task.await.unwrap();
         }
 
         #[tokio::test]
         async fn handshake_errors_have_distinct_safe_guidance() {
             for (reply, expected, hint) in [
-                (Message::Error("relay is full".into()), io::ErrorKind::WouldBlock, "服务器已满"),
-                (Message::Error("group is not allowed".into()), io::ErrorKind::PermissionDenied, GROUP_NOT_ALLOWED_HINT),
-                (Message::Error("untrusted secret text".into()), io::ErrorKind::PermissionDenied, "服务器拒绝加入"),
-                (Message::Pong(0), io::ErrorKind::InvalidData, "服务器协议不匹配"),
+                (
+                    Message::Error("relay is full".into()),
+                    io::ErrorKind::WouldBlock,
+                    "服务器已满",
+                ),
+                (
+                    Message::Error("group is not allowed".into()),
+                    io::ErrorKind::PermissionDenied,
+                    GROUP_NOT_ALLOWED_HINT,
+                ),
+                (
+                    Message::Error("untrusted secret text".into()),
+                    io::ErrorKind::PermissionDenied,
+                    "服务器拒绝加入",
+                ),
+                (
+                    Message::Pong(0),
+                    io::ErrorKind::InvalidData,
+                    "服务器协议不匹配",
+                ),
             ] {
                 let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let endpoint = server.local_addr().unwrap().to_string();
@@ -1071,7 +1442,10 @@ mod runtime {
                     let _ = read(&mut socket).await.unwrap();
                     write(&mut socket, &reply).await.unwrap();
                 });
-                let error = Network::connect(&endpoint, [5; 32], Transport::Tcp).await.err().unwrap();
+                let error = Network::connect(&endpoint, [5; 32], Transport::Tcp)
+                    .await
+                    .err()
+                    .unwrap();
                 assert_eq!(error.kind(), expected);
                 assert!(connection_hint(&error).contains(hint));
                 assert_eq!(group_not_allowed(&error), hint == GROUP_NOT_ALLOWED_HINT);
@@ -1081,7 +1455,10 @@ mod runtime {
             let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = server.local_addr().unwrap().to_string();
             drop(server);
-            let error = Network::connect(&endpoint, [5; 32], Transport::Tcp).await.err().unwrap();
+            let error = Network::connect(&endpoint, [5; 32], Transport::Tcp)
+                .await
+                .err()
+                .unwrap();
             assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
             assert!(connection_hint(&error).contains("服务器拒绝连接"));
         }
@@ -1189,7 +1566,7 @@ mod runtime {
         async fn nonfatal_errors_keep_relay_session_alive() {
             for (reason, hint) in [
                 ("target connection is slow", "对方连接拥堵"),
-                ("target connection closed", "对方连接已关闭"),
+                ("target connection closed", "对方已断开"),
                 ("status reports are limited to once per second", ""),
             ] {
                 let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1197,17 +1574,30 @@ mod runtime {
                 let (stop, mut stopped) = watch::channel(false);
                 let task = tokio::spawn(async move {
                     let (mut socket, _) = server.accept().await.unwrap();
-                    assert!(matches!(read(&mut socket).await.unwrap(), Message::Join { .. }));
-                    write(&mut socket, &Message::Welcome {
-                        client_id: 1, udp_token: [8; 16],
-                    }).await.unwrap();
-                    write(&mut socket, &Message::Error(reason.into())).await.unwrap();
+                    assert!(matches!(
+                        read(&mut socket).await.unwrap(),
+                        Message::Join { .. }
+                    ));
+                    write(
+                        &mut socket,
+                        &Message::Welcome {
+                            client_id: 1,
+                            udp_token: [8; 16],
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    write(&mut socket, &Message::Error(reason.into()))
+                        .await
+                        .unwrap();
                     write(&mut socket, &Message::Ping(12345)).await.unwrap();
                     loop {
                         match read(&mut socket).await.unwrap() {
                             Message::Pong(12345) => break,
-                            Message::Ping(n) => write(&mut socket, &Message::Pong(n)).await.unwrap(),
-                            Message::Status(_) | Message::Bind { .. } => {},
+                            Message::Ping(n) => {
+                                write(&mut socket, &Message::Pong(n)).await.unwrap()
+                            }
+                            Message::Status(_) | Message::Bind { .. } => {}
                             other => panic!("unexpected message after peer error: {other:?}"),
                         }
                     }
@@ -1215,18 +1605,34 @@ mod runtime {
                     // Keep the socket alive until the client's normal shutdown.
                     let _ = read(&mut socket).await;
                 });
-                let mut network = Network::connect(&endpoint, [5; 32], Transport::Tcp).await.unwrap();
+                let mut network = Network::connect(&endpoint, [5; 32], Transport::Tcp)
+                    .await
+                    .unwrap();
                 let ipc = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let state = Arc::new(Mutex::new(Snapshot {
                     phase: Phase::Ready,
                     ..Snapshot::default()
                 }));
-                let settings = Settings { allow_late_hook: true, ..Settings::default() };
-                let result = timeout(Duration::from_secs(2), connected(
-                    &settings, Path::new("missing-binaries"), Path::new("missing-game"),
-                    &ipc, ipc.local_addr().unwrap().port(), &mut HashSet::new(),
-                    &mut network, &mut stopped, &state,
-                )).await.expect("client stopped responding after peer error");
+                let settings = Settings {
+                    allow_late_hook: true,
+                    ..Settings::default()
+                };
+                let result = timeout(
+                    Duration::from_secs(2),
+                    connected(
+                        &settings,
+                        Path::new("missing-binaries"),
+                        Path::new("missing-game"),
+                        &ipc,
+                        ipc.local_addr().unwrap().port(),
+                        &mut HashSet::new(),
+                        &mut network,
+                        &mut stopped,
+                        &state,
+                    ),
+                )
+                .await
+                .expect("client stopped responding after peer error");
                 assert!(result.is_ok(), "peer error terminated session: {result:?}");
                 let snapshot = state.lock().unwrap().clone();
                 assert_eq!(snapshot.phase, Phase::Ready);

@@ -379,21 +379,27 @@ impl NetBurrowApp {
             });
         }
         let detail = self.last_snapshot.detail.trim();
-        // A warning may keep the current phase (e.g. a peer disconnects while we stay Ready).
-        // Hide only routine messages already covered by the status label and launch hint.
-        let routine = matches!(detail,
-            "正在连接 Relay…"
-                | "Relay 已连接，请从 Steam 正常启动游戏"
-                | "游戏已退出，等待下次从 Steam 启动"
-                | "已发现游戏进程，正在加载自己的 Hook…"
-                | "游戏已接入 NetBurrow，可在游戏中邀请同组朋友"
-        );
-        let show_detail = self.client.is_some() && !detail.is_empty() && !routine;
+        let show_detail = self.client.is_some() && !detail.is_empty();
         let finished = self.client.as_ref().is_some_and(Client::is_finished);
-        if show_detail || finished {
+        let show_group_hint = self.client.is_some() && !finished
+            && self.last_snapshot.peers.len() <= 1
+            && matches!(self.current_phase(), Phase::WaitingForGame | Phase::Ready);
+        if show_detail || finished || show_group_hint {
             ui.add_space(8.0);
             if show_detail {
-                ui.add(egui::Label::new(RichText::new(detail).size(12.0).color(TEXT)).wrap());
+                let text = match detail {
+                    "正在连接 Relay…" => "正在连接服务器…",
+                    "Relay 已连接，请从 Steam 正常启动游戏" => "已连接，请从 Steam 启动游戏",
+                    "游戏已退出，等待下次从 Steam 启动" => "游戏已退出，请从 Steam 重新启动",
+                    "已发现游戏进程，正在加载自己的 Hook…" => "正在接入游戏…",
+                    "游戏已接入 NetBurrow，可在游戏中邀请同组朋友" => "已接入游戏，可以邀请同组朋友",
+                    _ => detail,
+                };
+                ui.add(egui::Label::new(RichText::new(text).size(12.0).color(TEXT)).wrap());
+            }
+            if show_group_hint {
+                ui.add(egui::Label::new(RichText::new("未看到朋友？请核对双方服务器地址和完整组码。")
+                    .size(12.0).color(MUTED)).wrap());
             }
             if finished {
                 ui.label(RichText::new("请停止联机，处理问题后重新启用").size(12.0).color(Color32::from_rgb(151, 103, 37)));

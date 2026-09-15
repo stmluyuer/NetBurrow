@@ -180,13 +180,19 @@ unsafe fn run() {
         .unwrap();
     assert_eq!(
         read_message(&mut socket).unwrap(),
-        Message::IpcHello {
+        Message::IpcHelloV2 {
             nonce: [7; 16],
             pid: std::process::id(),
             steam_id: 101,
-            epoch: 11
+            epoch: 11,
+            capabilities: netburrow_protocol::IPC_CAPABILITIES,
         }
     );
+    write_message(
+        &mut socket,
+        &Message::IpcAccepted(netburrow_protocol::IPC_CAPABILITIES),
+    )
+    .unwrap();
     assert!(matches!(
         read_message(&mut socket).unwrap(),
         Message::Diagnostic(_)
@@ -274,6 +280,7 @@ unsafe fn run() {
     loop {
         match read_message(&mut socket).unwrap() {
             Message::Ping(n) => write_message(&mut socket, &Message::Pong(n)).unwrap(),
+            Message::IpcHealth(_) => {}
             Message::Data(packet) => {
                 assert_eq!(
                     (
@@ -294,10 +301,98 @@ unsafe fn run() {
     }
     assert!(send(object, 303, b"native".as_ptr().cast(), 6, 2, 0));
     assert_eq!(NATIVE_SENDS.load(Ordering::SeqCst), 1);
+    // Real-time consumption pause: Hook stays live while the game does not call ReadP2PPacket.
+    println!("Starting 20s no-read backlog test (three peers, 90% dominant traffic)");
+    write_message(
+        &mut socket,
+        &Message::Members(vec![
+            Peer {
+                client_id: 2,
+                steam_id: 202,
+                epoch: 22,
+            },
+            Peer {
+                client_id: 3,
+                steam_id: 302,
+                epoch: 32,
+            },
+            Peer {
+                client_id: 4,
+                steam_id: 303,
+                epoch: 33,
+            },
+        ]),
+    )
+    .unwrap();
+    let accept: unsafe extern "thiscall" fn(*mut c_void, u64) -> bool = transmute(*patched.add(3));
+    let session: unsafe extern "thiscall" fn(*mut c_void, u64, *mut c_void) -> bool =
+        transmute(*patched.add(6));
+    for peer in [202, 302, 303] {
+        let mut state = [0u64; 4];
+        eventually(|| session(object, peer, state.as_mut_ptr().cast()));
+        eventually(|| accept(object, peer));
+    }
+    let worker = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        for index in 0u32..3000 {
+            let (peer, epoch, channel) = match index % 30 {
+                0 => (303, 33, 5),
+                1 | 2 => (302, 32, 4),
+                _ => (202, 22, 3),
+            };
+            let mut payload = vec![0; 256];
+            payload[..4].copy_from_slice(&index.to_le_bytes());
+            write_message(
+                &mut socket,
+                &Message::Data(Packet {
+                    from: peer,
+                    to: 101,
+                    source_epoch: epoch,
+                    target_epoch: 11,
+                    channel,
+                    send_type: 2,
+                    payload,
+                }),
+            )
+            .unwrap();
+            if index % 150 == 0 {
+                write_message(&mut socket, &Message::Pong(0)).unwrap();
+            }
+            let due = Duration::from_micros((u64::from(index) + 1) * 1_000_000 / 150);
+            if let Some(wait) = due.checked_sub(started.elapsed()) {
+                std::thread::sleep(wait);
+            }
+        }
+        socket
+    });
+    let mut socket = worker.join().unwrap();
+    let mut buffer = [0u8; 256];
+    for channel in 3..=5 {
+        for index in (0u32..3000).filter(|index| match index % 30 {
+            0 => channel == 5,
+            1 | 2 => channel == 4,
+            _ => channel == 3,
+        }) {
+            eventually(|| {
+                read(
+                    object,
+                    buffer.as_mut_ptr().cast(),
+                    256,
+                    &mut count,
+                    &mut remote,
+                    channel,
+                )
+            });
+            assert_eq!(count, 256);
+            assert_eq!(&buffer[..4], &index.to_le_bytes());
+        }
+        assert!(!available(object, &mut count, channel));
+    }
+    println!("PASS: 20s real-time 3000-packet reliable backlog consumed without gaps/duplicates");
     write_message(&mut socket, &Message::Stop).unwrap();
     eventually(|| {
         SteamAPI_RunCallbacks();
-        FAILURES.load(Ordering::SeqCst) == 1
+        FAILURES.load(Ordering::SeqCst) >= 1
     });
     assert!(!send(object, 202, b"stopped".as_ptr().cast(), 7, 2, 0));
     assert_eq!(

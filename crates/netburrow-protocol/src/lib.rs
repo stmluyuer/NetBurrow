@@ -5,6 +5,44 @@
 
 use std::io::{self, ErrorKind, Read, Write};
 
+pub mod local;
+pub const IPC_CAPABILITIES: u32 = 3;
+pub const MAX_HEALTH_PEERS: usize = 1024;
+
+/// Loopback-only identity. Logs/exports map it to a temporary member slot.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HookPeerHealth {
+    pub peer: u64,
+    pub epoch: u64,
+    pub send_calls: u64,
+    pub send_rejected: u64,
+    pub received: u64,
+    pub consumed: u64,
+    pub dropped: u64,
+    pub discarded: u64,
+    pub queued_packets: u32,
+    pub queued_bytes: u32,
+    pub oldest_ms: u32,
+    pub outgoing_packets: u32,
+    pub failed: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HookHealth {
+    pub send_calls: u64,
+    pub send_rejected: u64,
+    pub read_calls: u64,
+    pub consumed: u64,
+    pub dropped: u64,
+    pub lock_busy: u64,
+    pub queued_packets: u32,
+    pub queued_bytes: u32,
+    pub oldest_ms: u32,
+    pub interface_changed: bool,
+    pub peers: Vec<HookPeerHealth>,
+    pub peers_omitted: u32,
+}
+
 pub const MAX_PAYLOAD: usize = 1024 * 1024;
 pub const MAX_FRAME: usize = MAX_PAYLOAD + 256;
 pub const UDP_LIMIT: usize = 1200;
@@ -110,6 +148,20 @@ pub enum Message {
     Diagnostic(String),
     Status(MemberStatus),
     Statuses(Vec<PeerStatus>),
+    // Loopback-only messages. Existing public NBP1 tags/layouts are unchanged.
+    IpcHelloV2 {
+        nonce: Token,
+        pid: u32,
+        steam_id: u64,
+        epoch: u64,
+        capabilities: u32,
+    },
+    IpcAccepted(u32),
+    IpcHealth(HookHealth),
+    IpcPeerFault {
+        peer: u64,
+        epoch: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -252,6 +304,74 @@ pub fn encode(message: &Message) -> io::Result<Vec<u8>> {
                 encode_status(&mut body, &peer.status)?;
             }
         }
+        Message::IpcHelloV2 {
+            nonce,
+            pid,
+            steam_id,
+            epoch,
+            capabilities,
+        } => {
+            put_type(&mut body, 16);
+            body.extend_from_slice(nonce);
+            put_u32(&mut body, *pid);
+            put_u64(&mut body, *steam_id);
+            put_u64(&mut body, *epoch);
+            put_u32(&mut body, *capabilities);
+        }
+        Message::IpcAccepted(capabilities) => {
+            put_type(&mut body, 17);
+            put_u32(&mut body, *capabilities);
+        }
+        Message::IpcHealth(h) => {
+            put_type(&mut body, 18);
+            for value in [
+                h.send_calls,
+                h.send_rejected,
+                h.read_calls,
+                h.consumed,
+                h.dropped,
+                h.lock_busy,
+            ] {
+                put_u64(&mut body, value);
+            }
+            for value in [h.queued_packets, h.queued_bytes, h.oldest_ms] {
+                put_u32(&mut body, value);
+            }
+            body.push(u8::from(h.interface_changed));
+            if h.peers.len() > MAX_HEALTH_PEERS {
+                return Err(invalid("too many peer health entries"));
+            }
+            put_u16(&mut body, h.peers.len() as u16);
+            put_u32(&mut body, h.peers_omitted);
+            for p in &h.peers {
+                for value in [
+                    p.peer,
+                    p.epoch,
+                    p.send_calls,
+                    p.send_rejected,
+                    p.received,
+                    p.consumed,
+                    p.dropped,
+                    p.discarded,
+                ] {
+                    put_u64(&mut body, value);
+                }
+                for value in [
+                    p.queued_packets,
+                    p.queued_bytes,
+                    p.oldest_ms,
+                    p.outgoing_packets,
+                ] {
+                    put_u32(&mut body, value);
+                }
+                body.push(u8::from(p.failed));
+            }
+        }
+        Message::IpcPeerFault { peer, epoch } => {
+            put_type(&mut body, 19);
+            put_u64(&mut body, *peer);
+            put_u64(&mut body, *epoch);
+        }
     }
     check_frame_body(&body)?;
     let body_len = u32::try_from(body.len()).map_err(|_| invalid("frame is too large"))?;
@@ -322,6 +442,70 @@ pub fn decode(body: &[u8]) -> io::Result<Message> {
             }
             Message::Statuses(peers)
         }
+        16 => Message::IpcHelloV2 {
+            nonce: reader.take_array()?,
+            pid: reader.u32()?,
+            steam_id: reader.u64()?,
+            epoch: reader.u64()?,
+            capabilities: reader.u32()?,
+        },
+        17 => Message::IpcAccepted(reader.u32()?),
+        18 => {
+            let mut health = HookHealth {
+                send_calls: reader.u64()?,
+                send_rejected: reader.u64()?,
+                read_calls: reader.u64()?,
+                consumed: reader.u64()?,
+                dropped: reader.u64()?,
+                lock_busy: reader.u64()?,
+                queued_packets: reader.u32()?,
+                queued_bytes: reader.u32()?,
+                oldest_ms: reader.u32()?,
+                interface_changed: match reader.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(invalid("invalid Hook health flag")),
+                },
+                peers: Vec::new(),
+                peers_omitted: 0,
+            };
+            let count = reader.u16()? as usize;
+            health.peers_omitted = reader.u32()?;
+            if count > MAX_HEALTH_PEERS || count > (reader.bytes.len() - reader.position) / 81 {
+                return Err(invalid("invalid peer health count"));
+            }
+            let mut identities = std::collections::HashSet::new();
+            for _ in 0..count {
+                let p = HookPeerHealth {
+                    peer: reader.u64()?,
+                    epoch: reader.u64()?,
+                    send_calls: reader.u64()?,
+                    send_rejected: reader.u64()?,
+                    received: reader.u64()?,
+                    consumed: reader.u64()?,
+                    dropped: reader.u64()?,
+                    discarded: reader.u64()?,
+                    queued_packets: reader.u32()?,
+                    queued_bytes: reader.u32()?,
+                    oldest_ms: reader.u32()?,
+                    outgoing_packets: reader.u32()?,
+                    failed: match reader.u8()? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(invalid("invalid peer health flag")),
+                    },
+                };
+                if p.peer == 0 || p.epoch == 0 || !identities.insert(p.peer) {
+                    return Err(invalid("invalid peer health identity"));
+                }
+                health.peers.push(p);
+            }
+            Message::IpcHealth(health)
+        }
+        19 => Message::IpcPeerFault {
+            peer: reader.u64()?,
+            epoch: reader.u64()?,
+        },
         _ => return Err(invalid("unknown message type")),
     };
     reader.finish()?;

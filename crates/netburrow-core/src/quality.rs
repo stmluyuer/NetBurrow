@@ -23,6 +23,30 @@ pub fn connection_quality(snapshot: &Snapshot, now: Instant) -> (Quality, &'stat
             (Quality::Pending, "等待建立连接")
         };
     }
+    if snapshot.peer_faults > 0 {
+        return (
+            Quality::Abnormal,
+            "部分成员会话失败；其他连接保持，本局可能需要重开",
+        );
+    }
+    if snapshot.ipc_slow {
+        return (Quality::Unstable, "游戏接入响应慢，正在等待恢复");
+    }
+    if snapshot.process_unknown {
+        return (Quality::Unstable, "游戏状态检查暂不可用，联机保持中");
+    }
+    if let Some(h) = &snapshot.hook_health {
+        if h.interface_changed {
+            return (Quality::Abnormal, "游戏接入入口发生变化，请查看诊断");
+        }
+        if h.queued_packets > 0
+            && (h.oldest_ms >= 2000
+                || h.queued_packets >= 3072
+                || h.queued_bytes >= 6 * 1024 * 1024)
+        {
+            return (Quality::Unstable, "游戏暂时未读取数据，正在缓冲");
+        }
+    }
     let Some(last_pong) = snapshot.last_pong_at else {
         return (Quality::Pending, "等待延迟样本");
     };
@@ -56,6 +80,22 @@ pub fn connection_quality(snapshot: &Snapshot, now: Instant) -> (Quality, &'stat
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn local_health_is_not_reported_as_a_relay_failure() {
+        let mut s = Snapshot {
+            phase: Phase::Ready,
+            ..Snapshot::default()
+        };
+        s.ipc_slow = true;
+        assert_eq!(connection_quality(&s, Instant::now()).0, Quality::Unstable);
+        s.ipc_slow = false;
+        s.process_unknown = true;
+        assert_eq!(connection_quality(&s, Instant::now()).0, Quality::Unstable);
+        s.process_unknown = false;
+        s.peer_faults = 1;
+        assert_eq!(connection_quality(&s, Instant::now()).0, Quality::Abnormal);
+        assert_eq!(s.phase, Phase::Ready);
+    }
     #[test]
     fn quality_distinguishes_stale_latency_jitter_and_recovery() {
         let now = Instant::now();

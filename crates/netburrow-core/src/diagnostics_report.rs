@@ -77,6 +77,23 @@ fn build_report(logs: &Path, settings: &Settings, snapshot: &Snapshot) -> String
         snapshot.ping_ms,
         redact(&snapshot.detail, &secrets),
     );
+    result.push_str(&format!(
+        "本地接入：ipc_slow={} process_unknown={} peer_faults={}\n",
+        snapshot.ipc_slow, snapshot.process_unknown, snapshot.peer_faults
+    ));
+    if let Some(h) = &snapshot.hook_health {
+        result.push_str(&format!("Hook：send_calls={} rejected={} read_calls={} consumed={} dropped={} lock_busy={} queue_packets={} queue_bytes={} oldest_ms={} interface_changed={}\n",h.send_calls,h.send_rejected,h.read_calls,h.consumed,h.dropped,h.lock_busy,h.queued_packets,h.queued_bytes,h.oldest_ms,h.interface_changed));
+    }
+    result.push_str("\n分成员通信（member 为本次 Relay 临时编号；Hook 接收不代表游戏已读取，discarded 为入站会话清理/失败包数）\n");
+    for line in crate::client::peer_diagnostic_lines(snapshot) {
+        result.push_str(&line);
+        result.push('\n');
+    }
+    if let Some(h) = &snapshot.hook_health {
+        if h.peers_omitted > 0 {
+            result.push_str(&format!("摘要容量限制，省略 {} 个成员\n", h.peers_omitted));
+        }
+    }
     for line in snapshot
         .logs
         .iter()
@@ -196,6 +213,44 @@ fn redact(text: &str, secrets: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_diagnostics_are_epoch_scoped_and_export_no_identity() {
+        use netburrow_protocol::{HookHealth, HookPeerHealth};
+        let mut snapshot = Snapshot::default();
+        snapshot.peers.push(crate::client::PeerInfo {
+            client_id: 7,
+            steam_id: 76561198012345678,
+            game_epoch: 123456789123456789,
+            ready: true,
+            is_self: false,
+            status: None,
+            status_updated: None,
+        });
+        snapshot.hook_health = Some(HookHealth {
+            peers: vec![HookPeerHealth {
+                peer: 76561198012345678,
+                epoch: 123456789123456789,
+                send_calls: 9,
+                received: 8,
+                consumed: 2,
+                queued_packets: 6,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let report = build_report(
+            Path::new("missing-peer-test-logs"),
+            &Settings::default(),
+            &snapshot,
+        );
+        assert!(report.contains("member=7 hook_send_calls=9"));
+        assert!(report.contains("hook_received=8 game_consumed=2"));
+        assert!(!report.contains("76561198012345678"));
+        assert!(!report.contains("123456789123456789"));
+        snapshot.peers[0].game_epoch += 1;
+        assert!(crate::client::peer_diagnostic_lines(&snapshot).is_empty());
+    }
 
     #[test]
     fn report_masks_secrets_and_exports_without_logs() {

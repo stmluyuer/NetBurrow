@@ -1,0 +1,501 @@
+//! Local bounded socket handoff. Never await a data-queue permit in a socket reader.
+use netburrow_protocol::{
+    MAX_FRAME, Message, decode, encode,
+    local::{Admission, Frames, IPC_TIMEOUT, Limits},
+};
+use std::{
+    io,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    net::tcp::OwnedWriteHalf,
+    sync::Notify,
+    task::JoinHandle,
+};
+
+struct State {
+    frames: Frames,
+    closed: bool,
+    error: Option<io::Error>,
+    active: Instant,
+    pong: Instant,
+    writing_since: Option<Instant>,
+}
+#[derive(Clone, Default)]
+pub(crate) struct Budget(Arc<Mutex<Vec<std::sync::Weak<Mutex<State>>>>>);
+#[derive(Clone)]
+pub(crate) struct Mailbox {
+    state: Arc<Mutex<State>>,
+    notify: Arc<Notify>,
+    budget: Budget,
+}
+impl Mailbox {
+    #[cfg(test)]
+    pub fn new(by_source: bool) -> Self {
+        Self::with_budget(by_source, Budget::default())
+    }
+    pub fn with_budget(by_source: bool, budget: Budget) -> Self {
+        let state = Arc::new(Mutex::new(State {
+            frames: Frames::new(by_source),
+            closed: false,
+            error: None,
+            active: Instant::now(),
+            pong: Instant::now(),
+            writing_since: None,
+        }));
+        {
+            let mut queues = budget.0.lock().unwrap_or_else(|p| p.into_inner());
+            queues.retain(|q| q.strong_count() > 0);
+            queues.push(Arc::downgrade(&state));
+        }
+        Self {
+            state,
+            notify: Arc::new(Notify::new()),
+            budget,
+        }
+    }
+    pub fn post(&self, message: Message) -> io::Result<Admission> {
+        self.post_tagged(message, false)
+    }
+    fn post_tagged(&self, message: Message, udp: bool) -> io::Result<Admission> {
+        let queues = self.budget.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "local queue closed",
+            ));
+        }
+        let mut limits = Limits::default();
+        if let Message::Data(p) = &message {
+            let key = state.frames.packet_key(p);
+            for queue in queues
+                .iter()
+                .filter_map(|q| q.upgrade())
+                .filter(|q| !Arc::ptr_eq(q, &self.state))
+            {
+                let other = queue.lock().unwrap_or_else(|p| p.into_inner());
+                let (count, bytes) = other.frames.usage(None);
+                let (peer_count, peer_bytes) = other.frames.usage(Some(key));
+                limits.packets = limits.packets.saturating_sub(count);
+                limits.bytes = limits.bytes.saturating_sub(bytes);
+                limits.peer_packets = limits.peer_packets.saturating_sub(peer_count);
+                limits.peer_bytes = limits.peer_bytes.saturating_sub(peer_bytes);
+            }
+        }
+        let result = state
+            .frames
+            .push_limited(message, udp, limits)
+            .map_err(io::Error::other);
+        drop(state);
+        self.notify.notify_one();
+        result
+    }
+    pub fn observed(&self, pong: bool) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.active = Instant::now();
+        if pong {
+            state.pong = state.active;
+        }
+    }
+    pub fn age(&self) -> Duration {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .active
+            .elapsed()
+    }
+    pub fn pong_age(&self) -> Duration {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pong
+            .elapsed()
+    }
+    pub fn fail_peer(&self, peer: u64, epoch: u64) {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .frames
+            .fail(peer, epoch);
+        self.notify.notify_one();
+    }
+    pub fn dropped(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .frames
+            .dropped
+    }
+    pub fn fault(&self) -> Option<(u64, u64)> {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .frames
+            .fault()
+    }
+    pub fn close(&self, error: Option<io::Error>) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.closed = true;
+        state.error = error;
+        drop(state);
+        self.notify.notify_one();
+    }
+    pub async fn recv(&self) -> Option<io::Result<Message>> {
+        self.next(true).await.map(|v| v.map(|(m, _)| m))
+    }
+    async fn next(&self, faults: bool) -> Option<io::Result<(Message, bool)>> {
+        loop {
+            let notified = self.notify.notified();
+            {
+                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(e) = state.error.take() {
+                    return Some(Err(e));
+                }
+                if faults {
+                    if let Some((peer, epoch)) = state.frames.fault() {
+                        return Some(Ok((Message::IpcPeerFault { peer, epoch }, false)));
+                    }
+                }
+                if let Some(message) = state.frames.pop_tagged() {
+                    if !faults {
+                        state.writing_since = Some(Instant::now());
+                    }
+                    return Some(Ok(message));
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+pub(crate) struct Writer {
+    pub queue: Mailbox,
+    pub completed: Arc<AtomicU64>,
+    pub udp_completed: Arc<AtomicU64>,
+    failure: Arc<Mutex<Option<String>>>,
+    task: JoinHandle<()>,
+}
+impl Writer {
+    pub fn with_budget(
+        mut socket: OwnedWriteHalf,
+        by_source: bool,
+        deadline: Duration,
+        budget: Budget,
+    ) -> Self {
+        let queue = Mailbox::with_budget(by_source, budget);
+        let input = queue.clone();
+        let completed = Arc::new(AtomicU64::new(0));
+        let done = completed.clone();
+        let failure = Arc::new(Mutex::new(None));
+        let error = failure.clone();
+        let udp_completed = Arc::new(AtomicU64::new(0));
+        let udp_done = udp_completed.clone();
+        let task = tokio::spawn(async move {
+            while let Some(message) = input.next(false).await {
+                let result = async {
+                    let (message, udp) = message?;
+                    let data = matches!(message, Message::Data(_));
+                    let bytes = encode(&message)?;
+                    drop(message);
+                    tokio::time::timeout(deadline, socket.write_all(&bytes))
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "socket frame write deadline")
+                        })??;
+                    if data {
+                        done.fetch_add(1, Ordering::Relaxed);
+                        if udp {
+                            udp_done.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Ok::<_, io::Error>(())
+                }
+                .await;
+                if let Err(e) = result {
+                    *error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e.to_string());
+                    input.close(None);
+                    return;
+                }
+                input
+                    .state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .writing_since = None;
+            }
+        });
+        Self {
+            queue,
+            completed,
+            udp_completed,
+            failure,
+            task,
+        }
+    }
+    pub fn send(&self, message: Message) -> io::Result<Admission> {
+        self.check()?;
+        self.queue.post(message)
+    }
+    pub fn check(&self) -> io::Result<()> {
+        match self
+            .failure
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            Some(e) => Err(io::Error::other(e.clone())),
+            None => Ok(()),
+        }
+    }
+    pub fn report_failure(&self, error: io::Error) {
+        *self.failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.to_string());
+        self.task.abort();
+        self.queue.close(None);
+    }
+    pub fn count(&self) -> u64 {
+        self.completed.load(Ordering::Relaxed)
+    }
+    pub fn slow(&self) -> bool {
+        self.queue
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .writing_since
+            .is_some_and(|t| t.elapsed() >= netburrow_protocol::local::IPC_WARNING)
+    }
+    pub fn udp_count(&self) -> u64 {
+        self.udp_completed.load(Ordering::Relaxed)
+    }
+    pub fn send_data(&self, message: Message, udp: bool) -> io::Result<Admission> {
+        self.check()?;
+        self.queue.post_tagged(message, udp)
+    }
+    pub async fn drain(&self) -> io::Result<()> {
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                self.check()?;
+                let idle = {
+                    let state = self.queue.state.lock().unwrap_or_else(|p| p.into_inner());
+                    state.writing_since.is_none() && state.frames.is_empty()
+                };
+                if idle {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control drain deadline"))?
+    }
+}
+impl Drop for Writer {
+    fn drop(&mut self) {
+        self.task.abort();
+        self.queue.close(None);
+    }
+}
+
+pub(crate) fn reader(
+    mut socket: impl AsyncRead + Unpin + Send + 'static,
+    queue: Mailbox,
+    ipc: bool,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let result = read_frame(&mut socket, ipc).await;
+            match result {
+                Ok(message) => {
+                    if !ipc
+                        && matches!(
+                            message,
+                            Message::IpcHelloV2 { .. }
+                                | Message::IpcAccepted(_)
+                                | Message::IpcHealth(_)
+                                | Message::IpcPeerFault { .. }
+                        )
+                    {
+                        queue.close(Some(io::Error::other("local message received from Relay")));
+                        return;
+                    }
+                    queue.observed(matches!(message, Message::Pong(_)));
+                    if let Err(e) = queue.post(message) {
+                        queue.close(Some(e));
+                        return;
+                    }
+                }
+                Err(e) => {
+                    queue.close(Some(e));
+                    return;
+                }
+            }
+        }
+    })
+}
+async fn read_frame(input: &mut (impl AsyncRead + Unpin), ipc: bool) -> io::Result<Message> {
+    let mut length = [0; 4];
+    // Idle and in-progress framing have separate deadlines; no cancellation loses a prefix.
+    if ipc {
+        tokio::time::timeout(IPC_TIMEOUT, input.read_exact(&mut length[..1]))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "IPC liveness deadline"))??;
+    } else {
+        input.read_exact(&mut length[..1]).await?;
+    }
+    let body = async {
+        input.read_exact(&mut length[1..]).await?;
+        let size = u32::from_be_bytes(length) as usize;
+        if !(5..=MAX_FRAME - 4).contains(&size) {
+            return Err(io::Error::other("invalid frame length"));
+        }
+        let mut body = vec![0; size];
+        input.read_exact(&mut body).await?;
+        decode(&body)
+    };
+    if ipc {
+        tokio::time::timeout(IPC_TIMEOUT, body)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "IPC partial frame deadline"))?
+    } else {
+        body.await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn ipc_writer_waits_twenty_seconds_without_losing_or_repeating_frames() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let (_read, write) = client.into_split();
+        let writer = Writer::with_budget(write, false, IPC_TIMEOUT, Budget::default());
+        for n in 0u8..8 {
+            let m = Message::Data(netburrow_protocol::Packet {
+                from: 10,
+                to: 20 + u64::from(n % 3),
+                source_epoch: 100,
+                target_epoch: 200 + u64::from(n % 3),
+                channel: 0,
+                send_type: 2,
+                payload: vec![n; 1024 * 1024],
+            });
+            assert_eq!(writer.send(m).unwrap(), Admission::Queued);
+        }
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        writer.check().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for n in 0u8..8 {
+                let Message::Data(p) = read_frame(&mut server, true).await.unwrap() else {
+                    panic!("expected data")
+                };
+                assert_eq!(p.payload.len(), 1024 * 1024);
+                assert!(p.payload.iter().all(|b| *b == n));
+            }
+        })
+        .await
+        .unwrap();
+        writer.drain().await.unwrap();
+        assert_eq!(writer.count(), 8);
+    }
+    #[tokio::test]
+    async fn all_handoff_stages_share_one_direction_budget() {
+        let budget = Budget::default();
+        let first = Mailbox::with_budget(true, budget.clone());
+        let second = Mailbox::with_budget(true, budget);
+        let packet = || {
+            Message::Data(netburrow_protocol::Packet {
+                from: 20,
+                to: 10,
+                source_epoch: 200,
+                target_epoch: 100,
+                channel: 0,
+                send_type: 2,
+                payload: vec![1; 256],
+            })
+        };
+        for _ in 0..2000 {
+            first.post(packet()).unwrap();
+        }
+        for _ in 0..1072 {
+            assert_eq!(second.post(packet()).unwrap(), Admission::Queued);
+        }
+        assert_eq!(
+            second.post(packet()).unwrap(),
+            Admission::PeerFailed(20, 200)
+        );
+        first.fail_peer(20, 200);
+        assert_eq!(
+            first.recv().await.unwrap().unwrap(),
+            Message::IpcPeerFault {
+                peer: 20,
+                epoch: 200
+            }
+        );
+    }
+    #[tokio::test]
+    async fn ipc_partial_read_keeps_progress_during_twenty_second_pause() {
+        let (mut tx, rx) = tokio::io::duplex(64);
+        let queue = Mailbox::new(false);
+        let task = reader(rx, queue.clone(), true);
+        let expected = Message::Ping(123);
+        let bytes = encode(&expected).unwrap();
+        tx.write_all(&bytes[..6]).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        tx.write_all(&bytes[6..]).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), queue.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            expected
+        );
+        task.abort();
+    }
+    #[tokio::test]
+    async fn relay_cannot_send_local_fault_commands() {
+        let (mut tx, rx) = tokio::io::duplex(64);
+        let queue = Mailbox::new(true);
+        let task = reader(rx, queue.clone(), false);
+        tx.write_all(
+            &encode(&Message::IpcPeerFault {
+                peer: 10,
+                epoch: 100,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(queue.recv().await.unwrap().is_err());
+        task.await.unwrap();
+    }
+    #[tokio::test]
+    async fn control_is_processed_with_full_data_queue() {
+        let q = Mailbox::new(true);
+        for n in 0..4096 {
+            q.post(Message::Data(netburrow_protocol::Packet {
+                from: 20 + n % 3,
+                to: 10,
+                source_epoch: 200 + n % 3,
+                target_epoch: 100,
+                channel: 0,
+                send_type: 2,
+                payload: vec![0],
+            }))
+            .unwrap();
+        }
+        q.post(Message::Ping(99)).unwrap();
+        assert_eq!(q.recv().await.unwrap().unwrap(), Message::Ping(99));
+    }
+}

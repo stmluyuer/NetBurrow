@@ -1,4 +1,6 @@
 mod client;
+#[cfg(windows)]
+mod client_io;
 pub mod diagnostics;
 mod diagnostics_report;
 pub mod process;

@@ -5,7 +5,9 @@
 
 use crate::queue::{Bridge, Event};
 use netburrow_protocol::{
-    HOOK_INIT_VERSION, HookInit, MAX_PAYLOAD, Message, read_message, write_message,
+    HOOK_INIT_VERSION, HookInit, IPC_CAPABILITIES, MAX_PAYLOAD, Message,
+    local::{Admission, PendingWrite, Reader},
+    read_message, write_message,
 };
 use std::{
     ffi::c_void,
@@ -35,13 +37,20 @@ use windows_sys::core::BOOL;
 
 struct Shared {
     bridge: Mutex<Bridge>,
-    wake: Condvar,
+    wake: std::thread::Thread,
+    stopped: AtomicBool,
+    faults: AtomicBool,
 }
 static BRIDGE: OnceLock<Arc<Shared>> = OnceLock::new();
 static STARTED: AtomicBool = AtomicBool::new(false);
 static STEAM: OnceLock<Steam> = OnceLock::new();
+static LOCK_BUSY: AtomicUsize = AtomicUsize::new(0);
+static INTERFACE_CHANGED: AtomicBool = AtomicBool::new(false);
+static CALLBACK_TICKS: AtomicUsize = AtomicUsize::new(0);
 struct Steam {
     original: [usize; 22],
+    object: usize,
+    table: usize,
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -96,7 +105,8 @@ pub unsafe extern "system" fn NetBurrowInit(argument: *const HookInit) -> u32 {
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .stop();
-                    shared.wake.notify_all();
+                    shared.stopped.store(true, Ordering::Release);
+                    shared.wake.unpark();
                 }
             }
         })
@@ -144,7 +154,9 @@ fn initialize(init: HookInit) -> io::Result<()> {
     };
     let shared = Arc::new(Shared {
         bridge: Mutex::new(Bridge::new(steam_id, init.epoch)),
-        wake: Condvar::new(),
+        wake: std::thread::current(),
+        stopped: AtomicBool::new(false),
+        faults: AtomicBool::new(false),
     });
     BRIDGE
         .set(shared.clone())
@@ -160,22 +172,31 @@ fn initialize(init: HookInit) -> io::Result<()> {
     let endpoint = SocketAddr::from(([127, 0, 0, 1], init.port as u16));
     let mut socket = TcpStream::connect_timeout(&endpoint, Duration::from_secs(3))?;
     socket.set_nodelay(true)?;
-    socket.set_read_timeout(Some(Duration::from_secs(8)))?;
+    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
     socket.set_write_timeout(Some(Duration::from_secs(5)))?;
     write_message(
         &mut socket,
-        &Message::IpcHello {
+        &Message::IpcHelloV2 {
             nonce: init.nonce,
             pid: init.pid,
             steam_id,
             epoch: init.epoch,
+            capabilities: IPC_CAPABILITIES,
         },
     )?;
+    if read_message(&mut socket)? != Message::IpcAccepted(IPC_CAPABILITIES) {
+        return Err(io::Error::other(
+            "IPC capability mismatch; update the complete client package",
+        ));
+    }
     write_message(
         &mut socket,
         &Message::Diagnostic("自己的 SteamNetworking006 接口与回调入口已接入".into()),
     )?;
     write_message(&mut socket, &Message::IpcReady)?;
+    socket.set_read_timeout(None)?;
+    socket.set_write_timeout(None)?;
+    socket.set_nonblocking(true)?;
     crate::diagnostics::record(
         "INFO",
         "ipc",
@@ -186,9 +207,14 @@ fn initialize(init: HookInit) -> io::Result<()> {
     let reader = std::thread::Builder::new()
         .name("netburrow-ipc-read".into())
         .spawn(move || {
+            let mut decoder = Reader::default();
             loop {
-                let message = match read_message(&mut input) {
-                    Ok(message) => message,
+                let message = match decoder.poll(&mut input) {
+                    Ok(Some(message)) => message,
+                    Ok(None) => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
                     Err(error) => {
                         crate::diagnostics::record("ERROR", "ipc read", &error.to_string());
                         break;
@@ -214,7 +240,17 @@ fn initialize(init: HookInit) -> io::Result<()> {
                         }
                         true
                     }
-                    Message::Data(packet) => bridge.receive(packet),
+                    Message::Data(packet) => {
+                        if matches!(bridge.receive(packet), Admission::PeerFailed(..)) {
+                            receive_shared.faults.store(true, Ordering::Release);
+                        }
+                        true
+                    }
+                    Message::IpcPeerFault { peer, epoch } => {
+                        bridge.fail_peer(peer, epoch);
+                        receive_shared.faults.store(true, Ordering::Release);
+                        true
+                    }
                     Message::Pong(_) => true,
                     Message::Stop => {
                         crate::diagnostics::record("INFO", "ipc", "client requested stop");
@@ -229,7 +265,7 @@ fn initialize(init: HookInit) -> io::Result<()> {
                     crate::diagnostics::record(
                         "INFO",
                         "ipc",
-                        "receiver stopped; invalid/overflow data or Stop command",
+                        "receiver stopped; protocol error or explicit Stop",
                     );
                     break;
                 }
@@ -239,11 +275,33 @@ fn initialize(init: HookInit) -> io::Result<()> {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .stop();
-            receive_shared.wake.notify_all();
+            receive_shared.stopped.store(true, Ordering::Release);
+            receive_shared.wake.unpark();
         })?;
     let mut ping = Instant::now() - Duration::from_secs(2);
     let mut callback_report = Instant::now() - Duration::from_secs(10);
+    let mut health_report = Instant::now();
+    let mut pending: Option<PendingWrite> = None;
+    let outbound = shared
+        .bridge
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .outbound
+        .clone();
     let result = loop {
+        if shared.stopped.load(Ordering::Acquire) {
+            break Ok(());
+        }
+        if let Some(frame) = pending.as_mut() {
+            match frame.poll(&mut socket) {
+                Ok(true) => pending = None,
+                Ok(false) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(e) => break Err(e),
+            }
+        }
         if callback_report.elapsed() >= Duration::from_secs(10) {
             let (requests, failures) = {
                 let subscriptions = SUBSCRIPTIONS.lock().unwrap_or_else(|p| p.into_inner());
@@ -261,26 +319,40 @@ fn initialize(init: HookInit) -> io::Result<()> {
             );
             callback_report = Instant::now();
         }
-        let mut bridge = shared.bridge.lock().unwrap_or_else(|p| p.into_inner());
-        if bridge.stopped {
-            break Ok(());
-        }
-        if let Some(packet) = bridge.pop_outgoing() {
-            drop(bridge);
-            if let Err(error) = write_message(&mut socket, &Message::Data(packet)) {
-                break Err(error);
-            }
-        } else if ping.elapsed() >= Duration::from_secs(2) {
-            drop(bridge);
-            if let Err(error) = write_message(&mut socket, &Message::Ping(0)) {
-                break Err(error);
-            }
+        let message = if ping.elapsed() >= Duration::from_secs(2) {
             ping = Instant::now();
+            Some(Message::Ping(0))
+        } else if shared.faults.load(Ordering::Acquire) {
+            let mut bridge = shared.bridge.lock().unwrap_or_else(|p| p.into_inner());
+            match bridge.pop_fault() {
+                Some((peer, epoch)) => Some(Message::IpcPeerFault { peer, epoch }),
+                None => {
+                    shared.faults.store(false, Ordering::Release);
+                    None
+                }
+            }
+        } else if health_report.elapsed() >= Duration::from_secs(1) {
+            health_report = Instant::now();
+            let mut health = shared
+                .bridge
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .health();
+            health.lock_busy += LOCK_BUSY.load(Ordering::Relaxed) as u64;
+            health.interface_changed = INTERFACE_CHANGED.load(Ordering::Relaxed);
+            Some(Message::IpcHealth(health))
+        } else if let Some(packet) = outbound.lock().unwrap_or_else(|p| p.into_inner()).pop() {
+            Some(Message::Data(packet))
         } else {
-            let _guard = shared
-                .wake
-                .wait_timeout(bridge, Duration::from_millis(10))
-                .unwrap_or_else(|p| p.into_inner());
+            None
+        };
+        if let Some(message) = message {
+            match PendingWrite::new(&message) {
+                Ok(frame) => pending = Some(frame),
+                Err(e) => break Err(e),
+            }
+        } else {
+            std::thread::park_timeout(Duration::from_millis(10));
         }
     };
     shared
@@ -347,7 +419,11 @@ unsafe fn install_interface(object: usize) -> io::Result<()> {
     ]);
     let address = Box::into_raw(replacement) as usize;
     STEAM
-        .set(Steam { original })
+        .set(Steam {
+            original,
+            object,
+            table: address,
+        })
         .map_err(|_| io::Error::other("networking already patched"))?;
     swap_pointer(object, address)?;
     Ok(())
@@ -444,6 +520,7 @@ unsafe extern "thiscall" fn send(
     }
     if let Some(shared) = BRIDGE.get() {
         let Ok(mut bridge) = shared.bridge.try_lock() else {
+            LOCK_BUSY.fetch_add(1, Ordering::Relaxed);
             return false;
         };
         let bytes = if length == 0 {
@@ -453,7 +530,7 @@ unsafe extern "thiscall" fn send(
         };
         if let Some(result) = bridge.send(remote, bytes, kind as u8, channel) {
             drop(bridge);
-            shared.wake.notify_one();
+            shared.wake.unpark();
             return result;
         }
     }
@@ -471,6 +548,7 @@ unsafe extern "thiscall" fn available(this: *mut c_void, size: *mut u32, channel
     }
     if let Some(shared) = BRIDGE.get() {
         let Ok(bridge) = shared.bridge.try_lock() else {
+            LOCK_BUSY.fetch_add(1, Ordering::Relaxed);
             return false;
         };
         if let Some(length) = bridge.available(channel) {
@@ -498,9 +576,11 @@ unsafe extern "thiscall" fn read(
     }
     if let Some(shared) = BRIDGE.get() {
         let Ok(mut bridge) = shared.bridge.try_lock() else {
+            LOCK_BUSY.fetch_add(1, Ordering::Relaxed);
             return false;
         };
         if let Some(packet) = bridge.read(channel) {
+            drop(bridge);
             // Steam's documented ABI consumes/truncates a packet when the caller's buffer is small.
             let count = packet.payload.len().min(capacity as usize);
             if count > 0 {
@@ -603,14 +683,23 @@ unsafe extern "thiscall" fn session(
             result.write(SessionState {
                 active: u8::from(active),
                 connecting: 0,
-                error: if bridge.stopped { 4 } else { 0 },
+                error: if bridge.stopped || bridge.peer_failed(remote) {
+                    4
+                } else {
+                    0
+                },
                 relay: 1,
                 bytes: bytes as i32,
                 packets: packets as i32,
                 ip: 0,
                 port: 0,
             });
-            return active;
+            return true;
+        }
+        if bridge.known(remote) {
+            // A busy local outbox is not an unknown Steam peer; never switch routes.
+            LOCK_BUSY.fetch_add(1, Ordering::Relaxed);
+            return false;
         }
     }
     let f: unsafe extern "thiscall" fn(*mut c_void, u64, *mut SessionState) -> bool =
@@ -769,6 +858,17 @@ unsafe extern "C" fn unregister_callback(object: *mut c_void) {
 unsafe extern "C" fn run_callbacks() {
     let f: unsafe extern "C" fn() = transmute(RUN_CALLBACKS.load(Ordering::Acquire));
     f();
+    if CALLBACK_TICKS.fetch_add(1, Ordering::Relaxed) % 60 == 0 {
+        // Query a current interface on the game callback thread, never write a stale saved object.
+        let module = GetModuleHandleW(wide("steam_api.dll").as_ptr());
+        if let (Some(saved), Some((object, _))) = (STEAM.get(), steam_interface(module)) {
+            if object != saved.object
+                || (readable(object, 4) && (object as *const usize).read() != saved.table)
+            {
+                INTERFACE_CHANGED.store(true, Ordering::Relaxed);
+            }
+        }
+    }
     let Some(shared) = BRIDGE.get() else {
         return;
     };
