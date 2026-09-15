@@ -3,7 +3,7 @@
 // The interface/ABI definitions are used here; the adapter and lifecycle are our own.
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::queue::{Bridge, Event};
+use crate::queue::Bridge;
 use netburrow_protocol::{
     HOOK_INIT_VERSION, HookInit, IPC_CAPABILITIES, MAX_PAYLOAD, Message,
     local::{Admission, PendingWrite, Reader},
@@ -16,7 +16,7 @@ use std::{
     net::{Shutdown, SocketAddr, TcpStream},
     ptr,
     sync::{
-        Arc, Condvar, Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -45,6 +45,8 @@ static BRIDGE: OnceLock<Arc<Shared>> = OnceLock::new();
 static STARTED: AtomicBool = AtomicBool::new(false);
 static STEAM: OnceLock<Steam> = OnceLock::new();
 static LOCK_BUSY: AtomicUsize = AtomicUsize::new(0);
+static SEND_LOCK_BUSY: AtomicUsize = AtomicUsize::new(0);
+static SEND_INVALID: AtomicUsize = AtomicUsize::new(0);
 static INTERFACE_CHANGED: AtomicBool = AtomicBool::new(false);
 static CALLBACK_TICKS: AtomicUsize = AtomicUsize::new(0);
 struct Steam {
@@ -220,6 +222,22 @@ fn initialize(init: HookInit) -> io::Result<()> {
                         break;
                     }
                 };
+                // Logging can touch disk; keep it outside the game send lock.
+                match &message {
+                    Message::IpcReady => crate::diagnostics::record(
+                        "INFO",
+                        "ipc",
+                        "client acknowledged Relay binding; forwarding active",
+                    ),
+                    Message::Stop => {
+                        crate::diagnostics::record("INFO", "ipc", "client requested stop")
+                    }
+                    Message::Members(_)
+                    | Message::Data(_)
+                    | Message::IpcPeerFault { .. }
+                    | Message::Pong(_) => {}
+                    _ => crate::diagnostics::record("ERROR", "ipc", "unexpected message type"),
+                }
                 let mut bridge = receive_shared
                     .bridge
                     .lock()
@@ -230,11 +248,6 @@ fn initialize(init: HookInit) -> io::Result<()> {
                         true
                     }
                     Message::IpcReady => {
-                        crate::diagnostics::record(
-                            "INFO",
-                            "ipc",
-                            "client acknowledged Relay binding; forwarding active",
-                        );
                         if !bridge.stopped {
                             bridge.active = true;
                         }
@@ -252,15 +265,10 @@ fn initialize(init: HookInit) -> io::Result<()> {
                         true
                     }
                     Message::Pong(_) => true,
-                    Message::Stop => {
-                        crate::diagnostics::record("INFO", "ipc", "client requested stop");
-                        false
-                    }
-                    _ => {
-                        crate::diagnostics::record("ERROR", "ipc", "unexpected message type");
-                        false
-                    }
+                    Message::Stop => false,
+                    _ => false,
                 };
+                drop(bridge);
                 if !valid {
                     crate::diagnostics::record(
                         "INFO",
@@ -303,18 +311,22 @@ fn initialize(init: HookInit) -> io::Result<()> {
             }
         }
         if callback_report.elapsed() >= Duration::from_secs(10) {
-            let (requests, failures) = {
-                let subscriptions = SUBSCRIPTIONS.lock().unwrap_or_else(|p| p.into_inner());
-                (
-                    subscriptions.iter().filter(|s| s.id == 1202).count(),
-                    subscriptions.iter().filter(|s| s.id == 1203).count(),
-                )
-            };
+            let rejected = shared
+                .bridge
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .send_rejections;
             crate::diagnostics::record(
                 "INFO",
-                "callbacks",
+                "send rejections",
                 &format!(
-                    "tracked_request_callbacks={requests} tracked_failure_callbacks={failures}; zero may mean registered before injection"
+                    "bridge_busy={} queue_busy={} unavailable={} invalid={} global_full={} peer_full={}",
+                    SEND_LOCK_BUSY.load(Ordering::Relaxed),
+                    rejected.queue_busy,
+                    rejected.unavailable,
+                    rejected.invalid + SEND_INVALID.load(Ordering::Relaxed) as u64,
+                    rejected.global_full,
+                    rejected.peer_full,
                 ),
             );
             callback_report = Instant::now();
@@ -341,7 +353,7 @@ fn initialize(init: HookInit) -> io::Result<()> {
             health.lock_busy += LOCK_BUSY.load(Ordering::Relaxed) as u64;
             health.interface_changed = INTERFACE_CHANGED.load(Ordering::Relaxed);
             Some(Message::IpcHealth(health))
-        } else if let Some(packet) = outbound.lock().unwrap_or_else(|p| p.into_inner()).pop() {
+        } else if let Some(packet) = outbound.pop() {
             Some(Message::Data(packet))
         } else {
             None
@@ -516,13 +528,12 @@ unsafe extern "thiscall" fn send(
     channel: i32,
 ) -> bool {
     if length as usize > MAX_PAYLOAD || !(0..=3).contains(&kind) || (length > 0 && data.is_null()) {
+        SEND_INVALID.fetch_add(1, Ordering::Relaxed);
         return false;
     }
     if let Some(shared) = BRIDGE.get() {
-        let Ok(mut bridge) = shared.bridge.try_lock() else {
-            LOCK_BUSY.fetch_add(1, Ordering::Relaxed);
-            return false;
-        };
+        // Lock order is Bridge -> Outbox. No network I/O or Steam calls under either lock.
+        let mut bridge = shared.bridge.lock().unwrap_or_else(|p| p.into_inner());
         let bytes = if length == 0 {
             &[]
         } else {
@@ -676,9 +687,7 @@ unsafe extern "thiscall" fn session(
         return false;
     }
     if let Some(shared) = BRIDGE.get() {
-        let Ok(bridge) = shared.bridge.try_lock() else {
-            return false;
-        };
+        let bridge = shared.bridge.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((active, bytes, packets)) = bridge.session(remote) {
             result.write(SessionState {
                 active: u8::from(active),
@@ -696,28 +705,13 @@ unsafe extern "thiscall" fn session(
             });
             return true;
         }
-        if bridge.known(remote) {
-            // A busy local outbox is not an unknown Steam peer; never switch routes.
-            LOCK_BUSY.fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
     }
     let f: unsafe extern "thiscall" fn(*mut c_void, u64, *mut SessionState) -> bool =
         transmute(original(6));
     f(this, remote, result)
 }
 
-static REGISTER: AtomicUsize = AtomicUsize::new(0);
-static UNREGISTER: AtomicUsize = AtomicUsize::new(0);
 static RUN_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
-static SUBSCRIPTIONS: Mutex<Vec<Arc<Subscription>>> = Mutex::new(Vec::new());
-struct Subscription {
-    address: usize,
-    id: i32,
-    state: Mutex<(bool, usize)>,
-    idle: Condvar,
-}
-thread_local! {static DISPATCHING:std::cell::Cell<usize>=const {std::cell::Cell::new(0)};}
 
 unsafe fn install_callback_imports() -> io::Result<()> {
     let image = GetModuleHandleW(ptr::null()) as usize;
@@ -772,12 +766,6 @@ unsafe fn install_callback_imports() -> io::Result<()> {
                     continue;
                 };
                 let (replacement, original) = match name {
-                    b"SteamAPI_RegisterCallback" => {
-                        (register_callback as *const () as usize, &REGISTER)
-                    }
-                    b"SteamAPI_UnregisterCallback" => {
-                        (unregister_callback as *const () as usize, &UNREGISTER)
-                    }
                     b"SteamAPI_RunCallbacks" => {
                         (run_callbacks as *const () as usize, &RUN_CALLBACKS)
                     }
@@ -795,7 +783,7 @@ unsafe fn install_callback_imports() -> io::Result<()> {
         }
         descriptor += 20;
     }
-    if patched != 3 {
+    if patched != 1 {
         return Err(io::Error::other("required Steam callback imports missing"));
     }
     Ok(())
@@ -814,47 +802,6 @@ unsafe fn bounded_name<'a>(address: usize, max: usize) -> Option<&'a [u8]> {
     None
 }
 
-unsafe extern "C" fn register_callback(object: *mut c_void, id: i32) {
-    let f: unsafe extern "C" fn(*mut c_void, i32) = transmute(REGISTER.load(Ordering::Acquire));
-    f(object, id);
-    if !matches!(id, 1202 | 1203) || !readable(object as usize, 12) {
-        return;
-    }
-    if *((object as *const u8).add(4)) & 2 != 0 {
-        return;
-    } // Don't deliver client events to server callbacks.
-    let mut list = SUBSCRIPTIONS.lock().unwrap_or_else(|p| p.into_inner());
-    if !list.iter().any(|s| s.address == object as usize) {
-        list.push(Arc::new(Subscription {
-            address: object as usize,
-            id,
-            state: Mutex::new((true, 0)),
-            idle: Condvar::new(),
-        }));
-    }
-}
-unsafe extern "C" fn unregister_callback(object: *mut c_void) {
-    let subscription = {
-        let mut list = SUBSCRIPTIONS.lock().unwrap_or_else(|p| p.into_inner());
-        list.iter()
-            .position(|s| s.address == object as usize)
-            .map(|i| list.remove(i))
-    };
-    if let Some(subscription) = subscription {
-        let mut state = subscription.state.lock().unwrap_or_else(|p| p.into_inner());
-        state.0 = false;
-        if !DISPATCHING.with(|current| current.get() == object as usize) {
-            while state.1 > 0 {
-                state = subscription
-                    .idle
-                    .wait(state)
-                    .unwrap_or_else(|p| p.into_inner());
-            }
-        }
-    }
-    let f: unsafe extern "C" fn(*mut c_void) = transmute(UNREGISTER.load(Ordering::Acquire));
-    f(object);
-}
 unsafe extern "C" fn run_callbacks() {
     let f: unsafe extern "C" fn() = transmute(RUN_CALLBACKS.load(Ordering::Acquire));
     f();
@@ -869,95 +816,5 @@ unsafe extern "C" fn run_callbacks() {
             }
         }
     }
-    let Some(shared) = BRIDGE.get() else {
-        return;
-    };
-    let events = {
-        let Ok(mut bridge) = shared.bridge.try_lock() else {
-            return;
-        };
-        (0..64)
-            .filter_map(|_| bridge.pop_event())
-            .collect::<Vec<_>>()
-    };
-    for event in events {
-        if let Event::Request(id) = event {
-            if !shared
-                .bridge
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .needs_request(id)
-            {
-                continue;
-            }
-        }
-        if !dispatch(event) {
-            shared
-                .bridge
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .defer_event(event);
-        }
-    }
-}
-struct Flight(Arc<Subscription>);
-impl Drop for Flight {
-    fn drop(&mut self) {
-        let mut s = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-        s.1 -= 1;
-        self.0.idle.notify_all();
-    }
-}
-unsafe fn dispatch(event: Event) -> bool {
-    let (id, remote) = match event {
-        Event::Request(remote) => (1202, remote),
-        Event::Failed(remote) => (1203, remote),
-    };
-    let subscriptions: Vec<_> = SUBSCRIPTIONS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .iter()
-        .filter(|s| s.id == id)
-        .cloned()
-        .collect();
-    let mut delivered = false;
-    for subscription in subscriptions {
-        {
-            let mut state = subscription.state.lock().unwrap_or_else(|p| p.into_inner());
-            if !state.0 {
-                continue;
-            }
-            state.1 += 1;
-        }
-        let _flight = Flight(subscription.clone());
-        let object = subscription.address;
-        if !readable(object, 4) {
-            continue;
-        }
-        let table = (object as *const usize).read();
-        if !readable(table, 12) {
-            continue;
-        }
-        let run = (table as *const usize).read();
-        let size = ((table + 8) as *const usize).read();
-        if !executable(run) || !executable(size) {
-            continue;
-        }
-        let size: unsafe extern "thiscall" fn(*mut c_void) -> i32 = transmute(size);
-        let count = size(object as *mut c_void);
-        if (id == 1202 && count != 8) || (id == 1203 && count != 12 && count != 16) {
-            continue;
-        }
-        #[repr(C, align(8))]
-        struct Parameters([u8; 16]);
-        let mut parameters = Parameters([0; 16]);
-        parameters.0[..8].copy_from_slice(&remote.to_ne_bytes());
-        parameters.0[8] = 4;
-        let run: unsafe extern "thiscall" fn(*mut c_void, *mut c_void) = transmute(run);
-        let previous = DISPATCHING.with(|current| current.replace(object));
-        run(object as *mut c_void, parameters.0.as_mut_ptr().cast());
-        DISPATCHING.with(|current| current.set(previous));
-        delivered = true;
-    }
-    delivered
+    // Steam owns callback registration, object lifetimes, and dispatch.
 }

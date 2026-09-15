@@ -198,7 +198,7 @@ unsafe fn run() {
         Message::Diagnostic(_)
     ));
     assert_eq!(read_message(&mut socket).unwrap(), Message::IpcReady);
-    println!("IPC ready; waiting for request callback");
+    println!("IPC ready; verifying receive without synthetic callbacks");
     let callback_table = [
         callback_run as *const () as usize,
         unused as *const () as usize,
@@ -238,11 +238,6 @@ unsafe fn run() {
         payload: b"abcdef".to_vec(),
     };
     write_message(&mut socket, &Message::Data(incoming.clone())).unwrap();
-    eventually(|| {
-        SteamAPI_RunCallbacks();
-        REQUESTS.load(Ordering::SeqCst) == 1
-    });
-    println!("request callback passed");
     let patched = *object as *const usize;
     let send: unsafe extern "thiscall" fn(*mut c_void, u64, *const c_void, u32, i32, i32) -> bool =
         transmute(*patched);
@@ -262,6 +257,12 @@ unsafe fn run() {
     assert!(!available(object, &mut count, 4));
     eventually(|| available(object, &mut count, 3));
     assert_eq!(count, 6);
+    SteamAPI_RunCallbacks();
+    assert_eq!(
+        REQUESTS.load(Ordering::SeqCst),
+        0,
+        "Hook must not invoke game callback objects"
+    );
     let mut small = [0u8; 2];
     let mut remote = 0;
     assert!(read(
@@ -274,7 +275,7 @@ unsafe fn run() {
     ));
     assert_eq!((small, count, remote), (*b"ab", 2, 202));
     assert!(!available(object, &mut count, 3));
-    // Clear callback acceptance, then start solely with Isaac's no-delay send mode.
+    // Close the local session, then start solely with Isaac's no-delay send mode.
     eventually(|| close(object, 202));
     eventually(|| send(object, 202, b"out".as_ptr().cast(), 3, 1, 9));
     loop {
@@ -390,10 +391,19 @@ unsafe fn run() {
     }
     println!("PASS: 20s real-time 3000-packet reliable backlog consumed without gaps/duplicates");
     write_message(&mut socket, &Message::Stop).unwrap();
+    let session: unsafe extern "thiscall" fn(*mut c_void, u64, *mut u8) -> bool =
+        transmute(*patched.add(6));
+    let mut state = [0u32; 5];
     eventually(|| {
         SteamAPI_RunCallbacks();
-        FAILURES.load(Ordering::SeqCst) >= 1
+        session(object, 202, state.as_mut_ptr().cast()) && state[0].to_le_bytes()[2] == 4
     });
+    assert_eq!(state[0].to_le_bytes()[0], 0);
+    assert_eq!(
+        FAILURES.load(Ordering::SeqCst),
+        0,
+        "Hook must not synthesize failure callbacks"
+    );
     assert!(!send(object, 202, b"stopped".as_ptr().cast(), 7, 2, 0));
     assert_eq!(
         NATIVE_SENDS.load(Ordering::SeqCst),
@@ -403,6 +413,6 @@ unsafe fn run() {
     SteamAPI_UnregisterCallback((&mut request as *mut Callback).cast());
     SteamAPI_UnregisterCallback((&mut failure as *mut Callback).cast());
     println!(
-        "PASS: x86 helper identity rejection, DLL load, IPC identity, callback acceptance, channel/truncated read, no-delay first-packet routing and stop without fallback"
+        "PASS: x86 helper identity rejection, DLL load, IPC identity, receive-first acceptance without synthetic callbacks, channel/truncated read, no-delay first-packet routing and stop without fallback"
     );
 }
