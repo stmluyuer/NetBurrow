@@ -4,10 +4,7 @@ use netburrow_protocol::{
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -39,66 +36,36 @@ struct Outgoing {
 #[derive(Default)]
 pub struct Outbox {
     queue: Mutex<OutgoingQueue>,
-    pending: AtomicBool,
 }
 impl Outbox {
     pub fn pop(&self) -> Option<Packet> {
-        // Idle IPC polls must not compete with game sends for the queue lock.
-        // The sender publishes pending before waking the worker.
-        if !self.pending.load(Ordering::Acquire) {
-            return None;
-        }
         let mut queue = self.queue.lock().unwrap_or_else(|p| p.into_inner());
         let packet = queue.pop();
-        self.pending
-            .store(!queue.packets.is_empty(), Ordering::Release);
         packet
     }
     fn retain(&self, keep: impl FnMut(&Outgoing) -> bool) {
         let mut queue = self.queue.lock().unwrap_or_else(|p| p.into_inner());
         queue.packets.retain(keep);
         queue.recount();
-        self.pending
-            .store(!queue.packets.is_empty(), Ordering::Release);
     }
     fn clear(&self) {
         let mut queue = self.queue.lock().unwrap_or_else(|p| p.into_inner());
         *queue = OutgoingQueue::default();
-        self.pending.store(false, Ordering::Release);
     }
-}
-#[derive(Default)]
-struct PeerUsage {
-    packets: usize,
-    bytes: usize,
-    immediate: usize,
 }
 #[derive(Default)]
 struct OutgoingQueue {
     packets: VecDeque<Outgoing>,
     bytes: usize,
-    peers: BTreeMap<u64, PeerUsage>,
     last_peer: Option<(u64, u64)>,
 }
 impl OutgoingQueue {
     fn push(&mut self, item: Outgoing) {
         self.bytes += item.packet.payload.len();
-        let usage = self.peers.entry(item.packet.to).or_default();
-        usage.packets += 1;
-        usage.bytes += item.packet.payload.len();
-        usage.immediate += usize::from(item.packet.send_type == 2);
         self.packets.push_back(item);
     }
     fn recount(&mut self) {
-        self.bytes = 0;
-        self.peers.clear();
-        for item in &self.packets {
-            self.bytes += item.packet.payload.len();
-            let usage = self.peers.entry(item.packet.to).or_default();
-            usage.packets += 1;
-            usage.bytes += item.packet.payload.len();
-            usage.immediate += usize::from(item.packet.send_type == 2);
-        }
+        self.bytes = self.packets.iter().map(|p| p.packet.payload.len()).sum();
     }
     fn pop(&mut self) -> Option<Packet> {
         let mut seen = HashSet::new();
@@ -108,21 +75,23 @@ impl OutgoingQueue {
             }
             let eligible = item.packet.send_type != 3
                 || item.queued.elapsed() >= Duration::from_millis(200)
-                || self.peers[&item.packet.to].immediate > 0
-                || self.peers[&item.packet.to].bytes >= 1200;
+                || self
+                    .packets
+                    .iter()
+                    .any(|p| p.packet.to == item.packet.to && p.packet.send_type == 2)
+                || self
+                    .packets
+                    .iter()
+                    .filter(|p| p.packet.to == item.packet.to)
+                    .map(|p| p.packet.payload.len())
+                    .sum::<usize>()
+                    >= 1200;
             eligible.then_some((i, (item.packet.to, item.packet.target_epoch)))
         });
         let index = fair_index(candidates, self.last_peer)?;
         let item = self.packets.remove(index)?;
         self.last_peer = Some((item.packet.to, item.packet.target_epoch));
         self.bytes -= item.packet.payload.len();
-        let usage = self.peers.get_mut(&item.packet.to).unwrap();
-        usage.packets -= 1;
-        usage.bytes -= item.packet.payload.len();
-        usage.immediate -= usize::from(item.packet.send_type == 2);
-        if usage.packets == 0 {
-            self.peers.remove(&item.packet.to);
-        }
         Some(item.packet)
     }
 }
@@ -278,9 +247,12 @@ impl Bridge {
             return Some(false);
         }
         let (count, size) = outbound
-            .peers
-            .get(&to)
-            .map_or((0, 0), |p| (p.packets, p.bytes));
+            .packets
+            .iter()
+            .filter(|p| p.packet.to == to)
+            .fold((0, 0), |(n, bytes), p| {
+                (n + 1, bytes + p.packet.payload.len())
+            });
         if count >= 512 || size + bytes.len() > 2 * 1024 * 1024 {
             self.send_rejections.peer_full += 1;
             return Some(false);
@@ -300,7 +272,6 @@ impl Bridge {
             },
             queued: Instant::now(),
         });
-        self.outbound.pending.store(true, Ordering::Release);
         drop(outbound);
         peer.accepted = true;
         peer.channels.insert(channel);
@@ -472,9 +443,12 @@ impl Bridge {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let (packets, bytes) = outbound
-            .peers
-            .get(&id)
-            .map_or((0, 0), |p| (p.packets, p.bytes));
+            .packets
+            .iter()
+            .filter(|p| p.packet.to == id)
+            .fold((0, 0), |(n, bytes), p| {
+                (n + 1, bytes + p.packet.payload.len())
+            });
         Some((
             self.active && peer.online && peer.accepted && !peer.failed,
             bytes,
@@ -506,14 +480,14 @@ impl Bridge {
         health.oldest_ms = self.inbound.front().map_or(0, |p| {
             p.queued.elapsed().as_millis().min(u32::MAX as u128) as u32
         });
-        let outgoing: BTreeMap<_, _> = self
+        let outgoing: Vec<_> = self
             .outbound
             .queue
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .peers
+            .packets
             .iter()
-            .map(|(&id, p)| (id, p.packets as u32))
+            .map(|p| p.packet.to)
             .collect();
         let online = self.remotes.values().filter(|r| r.online).count();
         health.peers_omitted = online.saturating_sub(MAX_HEALTH_PEERS) as u32;
@@ -533,7 +507,7 @@ impl Bridge {
                 p.oldest_ms = incoming.first().map_or(0, |p| {
                     p.queued.elapsed().as_millis().min(u32::MAX as u128) as u32
                 });
-                p.outgoing_packets = outgoing.get(&id).copied().unwrap_or(0);
+                p.outgoing_packets = outgoing.iter().filter(|&&peer| peer == id).count() as u32;
                 p
             })
             .collect();
@@ -564,34 +538,24 @@ impl Bridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     #[test]
-    fn idle_outbox_does_not_lock_and_buffered_packets_stay_pending() {
+    fn idle_poll_and_buffered_flush_work_without_pending_flag() {
         let mut b = bridge();
         let outbox = b.outbound.clone();
-        let guard = outbox.queue.lock().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let worker_outbox = outbox.clone();
-        let worker = std::thread::spawn(move || tx.send(worker_outbox.pop()).unwrap());
-        let result = rx.recv_timeout(Duration::from_secs(2));
-        drop(guard);
-        worker.join().unwrap();
-        assert_eq!(
-            result.unwrap(),
-            None,
-            "idle poll must bypass the queue lock"
-        );
+        assert!(outbox.pop().is_none());
 
         assert_eq!(b.send(20, b"buffered", 3, 0), Some(true));
-        assert!(outbox.pending.load(Ordering::Acquire));
+        assert_eq!(outbox.queue.lock().unwrap().packets.len(), 1);
         // Expire explicitly rather than sleeping or depending on test scheduling.
         outbox.queue.lock().unwrap().packets[0].queued =
             Instant::now() - Duration::from_millis(201);
         assert_eq!(outbox.pop().unwrap().payload, b"buffered");
-        assert!(!outbox.pending.load(Ordering::Acquire));
+        assert!(outbox.queue.lock().unwrap().packets.is_empty());
         assert_eq!(b.send(20, b"wake again", 2, 0), Some(true));
         assert!(outbox.pop().is_some());
         b.stop();
-        assert!(!outbox.pending.load(Ordering::Acquire));
+        assert!(outbox.queue.lock().unwrap().packets.is_empty());
     }
 
     #[test]
@@ -631,14 +595,18 @@ mod tests {
         let queue = b.outbound.queue.lock().unwrap();
         assert_eq!((queue.packets.len(), queue.bytes), (300, 1200));
         assert_eq!(
-            queue.peers.values().map(|p| p.immediate).sum::<usize>(),
+            queue
+                .packets
+                .iter()
+                .filter(|p| p.packet.send_type == 2)
+                .count(),
             300
         );
         drop(queue);
         while b.pop_outgoing().is_some() {}
         let queue = b.outbound.queue.lock().unwrap();
         assert_eq!(queue.bytes, 0);
-        assert!(queue.peers.is_empty());
+        assert!(queue.packets.is_empty());
     }
 
     #[test]
@@ -728,7 +696,7 @@ mod tests {
                 if let Some(packet) = outbox.pop() {
                     received.push(packet);
                 } else if worker_done.load(Ordering::Acquire)
-                    && !outbox.pending.load(Ordering::Acquire)
+                    && outbox.queue.lock().unwrap().packets.is_empty()
                 {
                     break;
                 } else {
@@ -757,8 +725,7 @@ mod tests {
                 .collect();
             assert_eq!(actual, expected);
         }
-        assert!(!b.outbound.pending.load(Ordering::Acquire));
-        assert!(b.outbound.queue.lock().unwrap().peers.is_empty());
+        assert!(b.outbound.queue.lock().unwrap().packets.is_empty());
     }
 
     #[test]
