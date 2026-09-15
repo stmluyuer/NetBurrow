@@ -263,12 +263,30 @@ impl NetBurrowApp {
     }
 
     fn export_diagnostics(&mut self) {
-        let mut snapshot = self.last_snapshot.clone();
-        snapshot.phase = self.current_phase();
-        if self.client.is_none() { snapshot.detail = "联机当前未启用；下方可能包含上次运行记录。".into(); }
-        match netburrow_core::export_report(&self.settings, &snapshot) {
+        self.export_diagnostics_at(false);
+    }
+
+    fn export_diagnostics_at(&mut self, freeze: bool) {
+        let mut snapshot = self.client.as_ref().map_or_else(
+            || self.last_snapshot.clone(),
+            |client| client.snapshot(),
+        );
+        if self.client.is_none() {
+            snapshot.phase = Phase::Stopped;
+            snapshot.detail = "联机当前未启用；下方可能包含上次运行记录。".into();
+        }
+        let report = if freeze {
+            netburrow_core::export_freeze_report(&self.settings, &snapshot)
+        } else {
+            netburrow_core::export_report(&self.settings, &snapshot)
+        };
+        match report {
             Ok(path) => {
-                self.notice = Some("诊断已导出".into());
+                self.notice = Some(if freeze {
+                    "卡住现场已记录，可将诊断文件交给排查人员"
+                } else {
+                    "诊断已导出"
+                }.into());
                 self.diagnostic_export = Some(path);
             }
             Err(error) => self.notice = Some(error),

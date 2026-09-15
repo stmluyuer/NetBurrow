@@ -40,7 +40,7 @@ impl Notifications {
         {
             Notification {
                 title: "NetBurrow 连接中断",
-                body: "正在尝试重连；已接入的游戏需要重开。请打开工具查看状态。",
+                body: "正在尝试恢复连接。请打开工具查看恢复结果，暂时保留游戏。",
                 warning: true,
             }
         } else if phase == Phase::RestartRequired

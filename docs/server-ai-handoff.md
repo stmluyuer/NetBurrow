@@ -4,6 +4,8 @@
 
 ## 固定来源和更新原则
 
+2026-09-16 的序号诊断和队友探测需要新版 Relay 配合。扩展通过保留 Ping 值协商；旧客户端仍走原协议，新客户端连接旧 Relay 时继续通信但不启用两项诊断。部署无需新增端口、配置项或数据迁移。完整诊断需要双方客户端均更新；TCP 探测成功不代表游戏正在推进。此说明不代表当前服务器已更新，部署仍须使用用户指定的固定来源。
+
 GitHub 仓库是 `https://github.com/stmluyuer/NetBurrow.git`，当前发布分支是 `codex/independent-plan`，不是 `main`。服务器端不得用浮动的 `HEAD`、默认分支或未确认的本地改动构建。
 
 先以普通部署用户取得指定分支，并把远端引用解析为固定 commit。Git 的显式 refspec 会把远端分支写到指定远端跟踪引用，`git fetch` 的行为见 [Git 官方文档](https://git-scm.com/docs/git-fetch)。
@@ -97,6 +99,12 @@ Relay 默认使用 `0.0.0.0:24872`，同一端口需要 TCP 与 UDP。仅在既�
 
 ## Relay 日志和 journal
 
+### 原会话恢复兼容性
+
+客户端通过保留的 `Ping(0x4e425253554d0001)` 协商恢复能力。新版 Relay 对意外断开的已协商会话保留原成员与游戏绑定约 120 秒，恢复握手核对原连接编号、随机恢复凭据和可靠接收水位。可靠消息保留至确认，重发记录仍计入单连接和全局队列字节预算；过期、明确退出或协议错误会清理。旧客户端保持原断线行为，旧 Relay 不提供此功能。
+
+状态仅存内存，服务重启不能恢复旧局，因此仍应在对局结束后更新服务器。客户端需成套更新 helper/Hook。恢复后该客户端本次启用固定走 TCP。无需新增端口、依赖、配置或磁盘状态。本地回环和 x86 宿主测试不能代替公网四人续局验证。
+
 Relay 把 stderr 交给 systemd journal。在前述停服切换之前核查 `StandardOutput`、`StandardError` 和 `SyslogIdentifier`；只有 stderr 尚未交给 journal 时，才创建本服务的 drop-in，随该次服务重启生效：
 
 ```bash
@@ -110,7 +118,7 @@ sudo systemctl daemon-reload
 
 不改 unit 的其他既有字段，也不改全局 journald 配置。每条日志带 `unix_ms` 时间，字段和语义如下：
 
-- `event` 仅为 `started`、`summary`、`joined`、`game_binding`、`read_closed`、`disconnected`、`tcp_write_failed`、`udp_receive_failed`、`udp_loop_stopped`、`accept_failed`、`client_task_failed` 或 `stopped`。
+- 生命周期事件包括 `started`、`summary`、`joined`、`game_binding`、`read_closed`、`disconnected`、`session_detached`、`session_resumed`、`stopped`，以及对应的收发错误事件。`session_detached` 表示仍在保留窗口，`session_resumed` 表示恢复了原 Relay 会话，不代表游戏同步已恢复。
 - `event=summary` 每 10 秒一次。`online`、`game_bound`、`udp_bound`、`queued_bytes` 是当时快照；`accepted`、`joined`、`disconnected`、`handshake_rejected`、`capacity_rejected`、`tcp_data_received`、`tcp_data_written`、`udp_data_received`、`udp_data_sent`、`udp_invalid`、`udp_bind_rejected`、`protocol_rejected`、`queue_failed`、`io_failed` 是进程启动后的累计值。
 - `event=stopped` 记录停服时快照。`tcp_data_written` 只表示 `write_all` 成功，不表示对端游戏已收到；`udp_data_sent` 只表示系统 `send_to` 成功，不表示 UDP 已送达。`protocol_rejected` 表示因协议或慢队列等问题尝试向客户端返回错误的次数；错误回复也可能因连接关闭或队列满而未发出。
 - 不逐包刷日志；不得写入组码、token、显示名、SteamID、IP 地址或 payload。

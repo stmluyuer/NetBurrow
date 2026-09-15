@@ -263,6 +263,12 @@ impl NetBurrowApp {
                         if ui.button("导出诊断").clicked() {
                             self.export_diagnostics();
                         }
+                        if ui.button("记录卡住现场")
+                            .on_hover_text("对局画面不推进时点击，标记时间并导出当前状态和近期日志")
+                            .clicked()
+                        {
+                            self.export_diagnostics_at(true);
+                        }
                         if icons::button(ui, icons::Action::Folder, "打开日志文件夹").clicked()
                         {
                             self.open_log_folder();
@@ -376,7 +382,29 @@ impl NetBurrowApp {
             "断线 {} 次 · 心跳超时 {} 次",
             self.last_snapshot.disconnects, self.last_snapshot.heartbeat_timeouts
         ));
+        ui.label(format!("原 Relay 会话恢复 {} 次 · 本地游戏连接恢复 {} 次",self.last_snapshot.relay_recoveries,self.last_snapshot.ipc_recoveries));
         if !self.last_snapshot.peers.is_empty() {
+            ui.collapsing("队友路径与数据序号", |ui| {
+                let diagnostics = &self.last_snapshot.path_diagnostics;
+                if !diagnostics.relay_supported {
+                    ui.small("尚未收到 Relay 的诊断能力确认；旧版 Relay 不支持这两项诊断。");
+                }
+                ui.small("往返探测经过队友客户端，走 TCP；探测正常不代表游戏画面正在更新。");
+                for p in &diagnostics.peers {
+                    let peer = self.last_snapshot.peers.iter().find(|peer| peer.client_id == p.member);
+                    let name = peer.and_then(|peer| peer.status.as_ref()).filter(|s| !s.name.is_empty()).map(|s| s.name.clone()).unwrap_or_else(|| format!("成员 {}", p.member));
+                    let path = if !p.supported { "未支持诊断".to_owned() }
+                        else if p.probe_timed_out { "最近探测超时".to_owned() }
+                        else if let Some(rtt) = p.rtt_ms { format!("往返 {rtt} ms · {} ms 前成功", p.success_age_ms.unwrap_or_default()) }
+                        else { "等待探测回复".to_owned() };
+                    ui.label(format!("{name} · {path} · 超时 {} 次", p.probe_timeouts));
+                    for (i, f) in p.flows.iter().enumerate() {
+                        ui.small(format!("{}：已编号 {} · 收到 {} · 窗口缺号 {} · 乱序 {} · 重复 {}",
+                            if i == 1 { "可靠数据" } else { "不可靠数据" }, f.assigned, f.received, f.missing_window, f.reordered, f.duplicates));
+                    }
+                }
+                if diagnostics.omitted > 0 { ui.small(format!("容量限制，省略 {} 位成员", diagnostics.omitted)); }
+            });
             ui.collapsing("成员累计统计", |ui| {
                 for peer in &self.last_snapshot.peers {
                     if let Some(status) = &peer.status {
