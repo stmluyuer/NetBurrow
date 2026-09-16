@@ -10,6 +10,8 @@ use std::{
 
 const BYTE_LIMIT: usize = 4 * 1024 * 1024;
 const PACKET_LIMIT: usize = 1024;
+// Channels stay open after packets are read; bound that metadata separately.
+const PEER_CHANNEL_LIMIT: usize = DATA_PACKETS;
 
 struct Remote {
     member: u64,
@@ -264,6 +266,10 @@ impl Bridge {
             self.send_rejections.invalid += 1;
             return Some(false);
         }
+        if !peer.channels.contains(&channel) && peer.channels.len() >= PEER_CHANNEL_LIMIT {
+            self.send_rejections.peer_full += 1;
+            return Some(false);
+        }
         // Copy caller-owned bytes before taking the shared writer queue lock.
         let payload = bytes.to_vec();
         let mut outbound = self
@@ -355,6 +361,10 @@ impl Bridge {
         }
         let peer_id = packet.from;
         let peer_epoch = packet.source_epoch;
+        if !peer.channels.contains(&packet.channel) && peer.channels.len() >= PEER_CHANNEL_LIMIT {
+            self.fail_peer(peer_id, peer_epoch);
+            return Admission::PeerFailed(peer_id, peer_epoch);
+        }
         let full = |queue: &VecDeque<Incoming>, bytes: usize| {
             queue.len() >= DATA_PACKETS
                 || bytes + packet.payload.len() > DATA_BYTES
@@ -554,6 +564,7 @@ impl Bridge {
         }
         peer.failed = true;
         peer.accepted = false;
+        peer.channels.clear();
         self.drop_peer_packets(id, None, "peer_failed");
         self.faults.push_back((id, epoch));
     }
@@ -661,6 +672,93 @@ impl Bridge {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn channel_metadata_is_bounded_when_unread_lossy_packets_are_evicted() {
+        let mut b = bridge();
+        let mut peers = vec![
+            Peer { client_id: 2, steam_id: 20, epoch: 200 },
+            Peer { client_id: 3, steam_id: 30, epoch: 300 },
+        ];
+        b.members(&peers);
+        let mut healthy = incoming(77);
+        healthy.from = 30;
+        healthy.source_epoch = 300;
+        assert_eq!(b.receive(healthy.clone()), Admission::Queued);
+        assert_eq!(b.send(30, b"keep", 2, 77), Some(true));
+        assert_eq!(b.send(20, b"clear on failure", 2, 0), Some(true));
+        let lossy = |channel| {
+            let mut packet = incoming(channel);
+            packet.send_type = 0;
+            packet
+        };
+        for channel in 1..=2048 {
+            assert_eq!(b.receive(lossy(channel)), Admission::Queued);
+        }
+        for _ in 0..1024 {
+            assert_eq!(b.receive(incoming(0)), Admission::Queued);
+        }
+        for channel in 2049..PEER_CHANNEL_LIMIT as i32 {
+            assert_eq!(b.receive(incoming(0)), Admission::Queued);
+            assert!(b.read(0).is_some());
+            assert_eq!(b.receive(lossy(channel)), Admission::Queued);
+            assert_eq!(b.inbound.iter().filter(|p| p.from == 20).count(), PEER_PACKETS);
+        }
+        assert_eq!(b.remotes[&20].channels.len(), PEER_CHANNEL_LIMIT);
+        assert!(!b.peer_failed(20));
+        assert_eq!(b.receive(incoming(0)), Admission::Queued);
+        assert!(b.read(0).is_some());
+        assert_eq!(b.receive(lossy(PEER_CHANNEL_LIMIT as i32)), Admission::PeerFailed(20, 200));
+        assert!(b.remotes[&20].channels.is_empty());
+        assert_eq!(b.pop_fault(), Some((20, 200)));
+        assert_eq!(b.receive(incoming(0)), Admission::Dropped);
+        assert_eq!(b.pop_fault(), None);
+        assert!(b.known(20));
+        assert_eq!(b.accept(20), Some(false));
+        assert_eq!(b.send(20, b"failed", 2, 0), Some(false));
+        assert_eq!(b.session(20), Some((false, 0, 0)));
+        assert_eq!(b.read(77), Some(healthy));
+        assert_eq!(b.pop_outgoing().unwrap().to, 30);
+        assert!(b.pop_outgoing().is_none());
+        assert!(!b.peer_failed(30) && !b.stopped);
+
+        peers[0].epoch = 201;
+        b.members(&peers);
+        let mut renewed = incoming(1);
+        renewed.source_epoch = 201;
+        assert_eq!(b.receive(renewed), Admission::Queued);
+        assert!(!b.peer_failed(20));
+    }
+
+    #[test]
+    fn channel_limit_keeps_existing_channels_and_close_releases_a_slot() {
+        let mut b = bridge();
+        for channel in 0..PEER_CHANNEL_LIMIT as i32 {
+            assert_eq!(b.send(20, b"open", 2, channel), Some(true));
+            assert_eq!(b.pop_outgoing().unwrap().channel, channel);
+        }
+        assert_eq!(b.remotes[&20].channels.len(), PEER_CHANNEL_LIMIT);
+        assert_eq!(b.send(20, b"existing", 2, 0), Some(true));
+        assert!(b.pop_outgoing().is_some());
+        assert_eq!(b.receive(incoming(0)), Admission::Queued);
+        assert!(b.read(0).is_some());
+        assert_eq!(b.remotes[&20].channels.len(), PEER_CHANNEL_LIMIT);
+        assert_eq!(b.send(20, b"too many", 2, PEER_CHANNEL_LIMIT as i32), Some(false));
+        assert!(b.pop_outgoing().is_none());
+        assert!(!b.peer_failed(20));
+        assert_eq!(b.close(20, Some(1)), Some(true));
+        assert_eq!(b.session(20), Some((true, 0, 0)));
+        assert_eq!(b.send(20, b"reused", 2, PEER_CHANNEL_LIMIT as i32), Some(true));
+        assert_eq!(b.remotes[&20].channels.len(), PEER_CHANNEL_LIMIT);
+        assert_eq!(b.close(20, None), Some(true));
+        assert_eq!(b.session(20), Some((false, 0, 0)));
+        assert!(b.remotes[&20].channels.is_empty());
+        assert_eq!(b.receive(incoming(2)), Admission::Queued);
+        assert_eq!(b.remotes[&20].channels.len(), 1);
+        b.stop();
+        assert!(b.remotes[&20].channels.is_empty());
+    }
+
     #[test]
     fn diagnostics_distinguish_polling_consumption_stale_data_and_session_cleanup() {
         let mut b = bridge();
