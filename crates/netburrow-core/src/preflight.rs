@@ -4,6 +4,7 @@ use std::path::Path;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CheckLevel {
     Passed,
+    Info,
     Warning,
     Failed,
 }
@@ -80,29 +81,54 @@ fn local_checks(settings: &Settings, directory: Option<&Path>) -> PreflightRepor
             Err(error) => report.add(name, CheckLevel::Failed, error),
         }
     }
-    let version = file_version(Path::new(settings.game_path.trim()));
-    report.add("游戏版本", CheckLevel::Warning, match version {
-        Some(version) => format!("检测到文件版本 {version}。当前没有版本白名单；请确认使用忏悔+，实际兼容性由接入检查确认。"),
-        None => "未读取到游戏文件版本。请确认使用忏悔+；此项不代表已验证游戏兼容性。".into(),
-    });
+    let (level, detail) = match file_version(Path::new(settings.game_path.trim())) {
+        Ok(Some(version)) => (CheckLevel::Info, format!("EXE 文件版本：{version}。")),
+        Ok(None) => (
+            CheckLevel::Info,
+            "EXE 未提供可读取的文件版本信息，不表示游戏版本有误，不影响启用。".into(),
+        ),
+        Err(error) => (
+            CheckLevel::Warning,
+            format!("读取文件版本信息失败：{error}。此项不影响启用。"),
+        ),
+    };
+    report.add(
+        "文件版本信息",
+        level,
+        format!("{detail}本工具适用于忏悔+；文件版本信息不用于判断游戏兼容性。"),
+    );
     report
 }
 
 #[cfg(windows)]
-fn file_version(path: &Path) -> Option<String> {
+fn file_version(path: &Path) -> Result<Option<String>, String> {
     use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{
+        ERROR_RESOURCE_DATA_NOT_FOUND, ERROR_RESOURCE_LANG_NOT_FOUND,
+        ERROR_RESOURCE_NAME_NOT_FOUND, ERROR_RESOURCE_TYPE_NOT_FOUND, GetLastError,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileVersionInfoSizeW, GetFileVersionInfoW, VS_FIXEDFILEINFO, VerQueryValueW,
     };
     let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     unsafe {
         let size = GetFileVersionInfoSizeW(path.as_ptr(), std::ptr::null_mut());
-        if size == 0 || size > 1024 * 1024 {
-            return None;
+        if size == 0 {
+            let error = GetLastError();
+            return match error {
+                ERROR_RESOURCE_DATA_NOT_FOUND
+                | ERROR_RESOURCE_TYPE_NOT_FOUND
+                | ERROR_RESOURCE_NAME_NOT_FOUND
+                | ERROR_RESOURCE_LANG_NOT_FOUND => Ok(None),
+                _ => Err(format!("查询失败（Windows 错误码 {error}）")),
+            };
+        }
+        if size > 1024 * 1024 {
+            return Err("版本信息大小超过读取上限".into());
         }
         let mut bytes = vec![0u8; size as usize];
         if GetFileVersionInfoW(path.as_ptr(), 0, size, bytes.as_mut_ptr().cast()) == 0 {
-            return None;
+            return Err(format!("读取失败（Windows 错误码 {}）", GetLastError()));
         }
         let mut value = std::ptr::null_mut();
         let mut length = 0;
@@ -112,27 +138,28 @@ fn file_version(path: &Path) -> Option<String> {
             &mut value,
             &mut length,
         ) == 0
-            || value.is_null()
-            || length < std::mem::size_of::<VS_FIXEDFILEINFO>() as u32
         {
-            return None;
+            return Err("版本资源中缺少固定版本信息".into());
+        }
+        if value.is_null() || length < std::mem::size_of::<VS_FIXEDFILEINFO>() as u32 {
+            return Err("固定版本信息不完整".into());
         }
         let info = value.cast::<VS_FIXEDFILEINFO>().read_unaligned();
         if info.dwSignature != 0xfeef04bd {
-            return None;
+            return Err("固定版本信息签名无效".into());
         }
-        Some(format!(
+        Ok(Some(format!(
             "{}.{}.{}.{}",
             info.dwFileVersionMS >> 16,
             info.dwFileVersionMS & 0xffff,
             info.dwFileVersionLS >> 16,
             info.dwFileVersionLS & 0xffff
-        ))
+        )))
     }
 }
 #[cfg(not(windows))]
-fn file_version(_: &Path) -> Option<String> {
-    None
+fn file_version(_: &Path) -> Result<Option<String>, String> {
+    Err("当前平台不支持读取 Windows 文件版本信息".into())
 }
 
 #[cfg(test)]
@@ -154,11 +181,44 @@ mod tests {
             report
                 .checks
                 .iter()
-                .any(|check| check.name == "游戏版本" && check.level == CheckLevel::Warning)
+                .any(|check| check.name == "文件版本信息"
+                    && matches!(check.level, CheckLevel::Info | CheckLevel::Warning))
         );
         let mut report = PreflightReport::default();
         assert!(!report.can_start());
         report.add("version", CheckLevel::Warning, "unverified");
         assert!(report.can_start());
+        report.add("version", CheckLevel::Info, "unverified");
+        assert!(report.can_start());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_file_is_an_error_not_missing_version_metadata() {
+        let missing = std::env::current_exe().unwrap().join("missing.exe");
+        assert!(file_version(&missing).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn executable_without_version_resource_is_informational() {
+        // This crate has no build script embedding a VERSIONINFO resource.
+        let executable = std::env::current_exe().unwrap();
+        assert_eq!(file_version(&executable), Ok(None));
+        let settings = Settings {
+            game_path: executable.to_string_lossy().into_owned(),
+            ..Settings::default()
+        };
+        let report = local_checks(&settings, None);
+        let check = report
+            .checks
+            .into_iter()
+            .find(|check| check.name == "文件版本信息")
+            .unwrap();
+        assert_eq!(check.level, CheckLevel::Info);
+        let version_only = PreflightReport {
+            checks: vec![check],
+        };
+        assert!(version_only.can_start());
     }
 }

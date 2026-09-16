@@ -139,6 +139,7 @@ impl NetBurrowApp {
                 for check in &report.checks {
                     let (label, color) = match check.level {
                         CheckLevel::Passed => ("通过", ACCENT),
+                        CheckLevel::Info => ("说明", MUTED),
                         CheckLevel::Warning => ("提示", Color32::from_rgb(151, 103, 37)),
                         CheckLevel::Failed => ("未通过", Color32::from_rgb(174, 65, 60)),
                     };
