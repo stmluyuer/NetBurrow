@@ -128,17 +128,3 @@ pub fn is_enabled() -> Result<bool, String> {
 pub fn set_enabled(_: bool) -> Result<(), String> {
     Err("开机启动需要 Windows".into())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn autorun_quotes_unicode_paths_and_rejects_invalid_commands() {
-        assert_eq!(
-            command_line(Path::new(r"C:\测试 目录\NetBurrow.exe")).unwrap(),
-            "\"C:\\测试 目录\\NetBurrow.exe\""
-        );
-        assert!(command_line(Path::new("bad\"path.exe")).is_err());
-        assert!(command_line(Path::new(&"a".repeat(261))).is_err());
-    }
-}

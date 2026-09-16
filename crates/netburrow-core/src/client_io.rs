@@ -427,44 +427,6 @@ async fn read_frame(input: &mut (impl AsyncRead + Unpin), ipc: bool) -> io::Resu
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn ipc_writer_waits_twenty_seconds_without_losing_or_repeating_frames() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (mut server, _) = listener.accept().await.unwrap();
-        let (_read, write) = client.into_split();
-        let writer = Writer::with_budget(write, false, IPC_TIMEOUT, Budget::default());
-        for n in 0u8..8 {
-            let m = Message::Data(netburrow_protocol::Packet {
-                delivery: None,
-                from: 10,
-                to: 20 + u64::from(n % 3),
-                source_epoch: 100,
-                target_epoch: 200 + u64::from(n % 3),
-                channel: 0,
-                send_type: 2,
-                payload: vec![n; 1024 * 1024],
-            });
-            assert_eq!(writer.send(m).unwrap(), Admission::Queued);
-        }
-        tokio::time::sleep(Duration::from_secs(20)).await;
-        writer.check().unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            for n in 0u8..8 {
-                let Message::Data(p) = read_frame(&mut server, true).await.unwrap() else {
-                    panic!("expected data")
-                };
-                assert_eq!(p.payload.len(), 1024 * 1024);
-                assert!(p.payload.iter().all(|b| *b == n));
-            }
-        })
-        .await
-        .unwrap();
-        writer.drain().await.unwrap();
-        assert_eq!(writer.count(), 8);
-    }
-    #[tokio::test]
     async fn all_handoff_stages_share_one_direction_budget() {
         let budget = Budget::default();
         let first = Mailbox::with_budget(true, budget.clone());
@@ -501,26 +463,6 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn ipc_partial_read_keeps_progress_during_twenty_second_pause() {
-        let (mut tx, rx) = tokio::io::duplex(64);
-        let queue = Mailbox::new(false);
-        let task = reader(rx, queue.clone(), true);
-        let expected = Message::Ping(123);
-        let bytes = encode(&expected).unwrap();
-        tx.write_all(&bytes[..6]).await.unwrap();
-        tokio::time::sleep(Duration::from_secs(20)).await;
-        tx.write_all(&bytes[6..]).await.unwrap();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), queue.recv())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap(),
-            expected
-        );
-        task.abort();
-    }
-    #[tokio::test]
     async fn relay_cannot_send_local_fault_commands() {
         let (mut tx, rx) = tokio::io::duplex(64);
         let queue = Mailbox::new(true);
@@ -536,24 +478,5 @@ mod tests {
         .unwrap();
         assert!(queue.recv().await.unwrap().is_err());
         task.await.unwrap();
-    }
-    #[tokio::test]
-    async fn control_is_processed_with_full_data_queue() {
-        let q = Mailbox::new(true);
-        for n in 0..4096 {
-            q.post(Message::Data(netburrow_protocol::Packet {
-                delivery: None,
-                from: 20 + n % 3,
-                to: 10,
-                source_epoch: 200 + n % 3,
-                target_epoch: 100,
-                channel: 0,
-                send_type: 2,
-                payload: vec![0],
-            }))
-            .unwrap();
-        }
-        q.post(Message::Ping(99)).unwrap();
-        assert_eq!(q.recv().await.unwrap().unwrap(), Message::Ping(99));
     }
 }

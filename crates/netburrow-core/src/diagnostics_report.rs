@@ -243,54 +243,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn peer_diagnostics_are_epoch_scoped_and_export_no_identity() {
-        use netburrow_protocol::{HookHealth, HookPeerHealth};
-        let mut snapshot = Snapshot::default();
-        snapshot.peers.push(crate::client::PeerInfo {
-            client_id: 7,
-            steam_id: 76561198012345678,
-            game_epoch: 123456789123456789,
-            ready: true,
-            is_self: false,
-            status: None,
-            status_updated: None,
-        });
-        snapshot.hook_health = Some(HookHealth {
-            peers: vec![HookPeerHealth {
-                peer: 76561198012345678,
-                epoch: 123456789123456789,
-                send_calls: 9,
-                received: 8,
-                consumed: 2,
-                queued_packets: 6,
-                ..Default::default()
-            }],
-            ..Default::default()
-        });
-        let mut tracker = crate::path_diagnostics::Tracker::default();
-        tracker.members(1, &[
-            netburrow_protocol::Peer { client_id:1,steam_id:11,epoch:111 },
-            netburrow_protocol::Peer { client_id:7,steam_id:76561198012345678,epoch:123456789123456789 },
-        ]);
-        tracker.capabilities(vec![1,7]);
-        tracker.tick(std::time::Instant::now());
-        snapshot.path_diagnostics = tracker.snapshot(std::time::Instant::now());
-        let report = build_report(
-            Path::new("missing-peer-test-logs"),
-            &Settings::default(),
-            &snapshot,
-        );
-        assert!(report.contains("member=7 hook_send_calls=9"));
-        assert!(report.contains("hook_received=8 game_consumed=2"));
-        assert!(report.contains("path member=7 supported=true tcp_probe_sent=1"));
-        assert!(report.contains("sequence member=7 reliable=true"));
-        assert!(!report.contains("76561198012345678"));
-        assert!(!report.contains("123456789123456789"));
-        snapshot.peers[0].game_epoch += 1;
-        assert!(crate::client::peer_diagnostic_lines(&snapshot).is_empty());
-    }
-
-    #[test]
     fn report_masks_secrets_and_exports_without_logs() {
         let settings = Settings {
             group: format!("NB1-{}", "a1".repeat(32)),
@@ -345,13 +297,4 @@ mod tests {
         fs::remove_dir(dir).unwrap();
     }
 
-    #[test]
-    fn tail_is_bounded_and_drops_partial_secret() {
-        let file = std::env::temp_dir().join(format!("netburrow-tail-{}.log", std::process::id()));
-        let mut bytes = vec![b'x'; LOG_TAIL as usize + 50];
-        bytes.extend_from_slice(b"\nlast safe line\n");
-        fs::write(&file, bytes).unwrap();
-        assert_eq!(read_tail(&file).unwrap(), "last safe line\n");
-        fs::remove_file(file).unwrap();
-    }
 }

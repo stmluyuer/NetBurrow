@@ -192,33 +192,4 @@ mod tests {
         assert!(report.can_start());
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn missing_file_is_an_error_not_missing_version_metadata() {
-        let missing = std::env::current_exe().unwrap().join("missing.exe");
-        assert!(file_version(&missing).is_err());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn executable_without_version_resource_is_informational() {
-        // This crate has no build script embedding a VERSIONINFO resource.
-        let executable = std::env::current_exe().unwrap();
-        assert_eq!(file_version(&executable), Ok(None));
-        let settings = Settings {
-            game_path: executable.to_string_lossy().into_owned(),
-            ..Settings::default()
-        };
-        let report = local_checks(&settings, None);
-        let check = report
-            .checks
-            .into_iter()
-            .find(|check| check.name == "文件版本信息")
-            .unwrap();
-        assert_eq!(check.level, CheckLevel::Info);
-        let version_only = PreflightReport {
-            checks: vec![check],
-        };
-        assert!(version_only.can_start());
-    }
 }

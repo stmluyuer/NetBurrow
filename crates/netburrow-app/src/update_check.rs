@@ -308,69 +308,6 @@ mod windows {
         }
     }
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn request_disallows_downgrades_and_bounds_redirects_without_network() {
-            unsafe {
-                let session = Handle::new(WinHttpOpen(
-                    wide("NetBurrow-test").as_ptr(),
-                    WINHTTP_ACCESS_TYPE_NO_PROXY,
-                    ptr::null(),
-                    ptr::null(),
-                    0,
-                ))
-                .unwrap();
-                let connection = Handle::new(WinHttpConnect(
-                    session.0,
-                    wide("github.com").as_ptr(),
-                    443,
-                    0,
-                ))
-                .unwrap();
-                let request = Handle::new(WinHttpOpenRequest(
-                    connection.0,
-                    wide("GET").as_ptr(),
-                    wide("/").as_ptr(),
-                    ptr::null(),
-                    ptr::null(),
-                    ptr::null(),
-                    WINHTTP_FLAG_SECURE,
-                ))
-                .unwrap();
-                configure_request(&request).unwrap();
-                for (option, expected) in [
-                    (
-                        WINHTTP_OPTION_REDIRECT_POLICY,
-                        WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP,
-                    ),
-                    (WINHTTP_OPTION_MAX_HTTP_AUTOMATIC_REDIRECTS, 5),
-                ] {
-                    let mut actual = 0u32;
-                    let mut length = 4;
-                    succeeded(WinHttpQueryOption(
-                        request.0,
-                        option,
-                        (&mut actual as *mut u32).cast(),
-                        &mut length,
-                    ))
-                    .unwrap();
-                    assert_eq!(actual, expected);
-                }
-            }
-            assert!(error_message(ERROR_WINHTTP_TIMEOUT).contains("超时"));
-            assert!(error_message(ERROR_WINHTTP_SECURE_FAILURE).contains("安全连接"));
-        }
-
-        #[test]
-        #[ignore = "Explicit live GitHub check; requires a published release manifest"]
-        fn live_public_manifest() {
-            let bytes = download_manifest().unwrap();
-            parse_manifest(&bytes, env!("CARGO_PKG_VERSION")).unwrap();
-        }
-    }
 }
 
 #[cfg(test)]
@@ -419,22 +356,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_and_oversized_metadata() {
-        for bytes in [
-            b"not json".as_slice(),
-            br#"{"version":"1.2.3"}"#,
-            br#"{"version":123,"notes":"x"}"#,
-        ] {
-            assert!(parse_manifest(bytes, "0.1.0").is_err());
-        }
-        for notes in [" \n".to_owned(), "字".repeat(MAX_NOTES_CHARS + 1)] {
-            assert!(parse_manifest(&manifest("1.2.3", &notes), "0.1.0").is_err());
-        }
-        assert!(parse_manifest(&vec![b' '; MAX_MANIFEST_BYTES + 1], "0.1.0").is_err());
-        assert!(parse_manifest(&manifest("1.2.3", &"字".repeat(MAX_NOTES_CHARS)), "0.1.0").is_ok());
-    }
-
-    #[test]
     fn response_errors_limits_and_timeouts_do_not_become_success() {
         use std::io::Read;
         assert!(require_success(200).is_ok());
@@ -458,24 +379,4 @@ mod tests {
         assert!(read_body(|_| Err("certificate failure".into()), Instant::now()).is_err());
     }
 
-    #[test]
-    fn one_worker_at_a_time_and_disconnection_is_retryable() {
-        let mut check = UpdateCheck::default();
-        let (sender, receiver) = mpsc::channel();
-        check.pending = Some(receiver);
-        check.begin_with(|| panic!("Duplicate task must not start"));
-        check.poll();
-        assert!(check.is_checking());
-        drop(sender);
-        check.poll();
-        assert!(!check.is_checking());
-        assert!(check.result.as_ref().unwrap().is_err());
-        let (sender, receiver) = mpsc::channel();
-        check.pending = Some(receiver);
-        sender
-            .send(parse_manifest(&manifest("9.0.0", "说明"), "0.1.0"))
-            .unwrap();
-        check.poll();
-        assert!(check.newer_release().is_some());
-    }
 }

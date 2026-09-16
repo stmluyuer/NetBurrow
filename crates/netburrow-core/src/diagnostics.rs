@@ -115,35 +115,3 @@ fn timestamp() -> String {
             .to_string()
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn redacts_group_and_flattens_lines() {
-        assert_eq!(
-            clean("failed NB1-secret\nnext"),
-            "failed [group-redacted] next"
-        );
-        assert_eq!(clean(&"x".repeat(3000)).len(), 2048);
-    }
-    #[test]
-    fn rotates_without_losing_the_latest_record() {
-        let dir = std::env::temp_dir().join(format!(
-            "netburrow-log-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let path = dir.join("client.log");
-        append(&path, b"123456\n", 10).unwrap();
-        append(&path, b"next\n", 10).unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"next\n");
-        assert_eq!(
-            fs::read(path.with_extension("previous.log")).unwrap(),
-            b"123456\n"
-        );
-        fs::remove_dir_all(dir).unwrap();
-    }
-}

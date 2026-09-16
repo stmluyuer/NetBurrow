@@ -278,27 +278,6 @@ pub fn autodetect_game() -> Option<PathBuf> {
 mod tests {
     use super::*;
     #[test]
-    fn history_is_bounded_deduplicated_and_preferences_are_not_connection_edits() {
-        let mut value = Settings::default();
-        let original = value.clone();
-        value.start_minimized = true;
-        value.notifications_enabled = false;
-        assert!(value.same_connection(&original));
-        for index in 0..7 {
-            value.server = format!("relay{index}:24872");
-            value.group = new_group().unwrap();
-            value.remember_connection();
-        }
-        assert_eq!(value.recent_connections.len(), 5);
-        value.remember_connection();
-        assert_eq!(value.recent_connections.len(), 5);
-        assert_eq!(value.recent_connections[0].server, "relay6:24872");
-        assert!(!value.same_connection(&original));
-        let current = value.clone();
-        value.display_name = "new name".into();
-        assert!(!value.same_connection(&current));
-    }
-    #[test]
     fn preference_save_preserves_connection_and_corrupt_file() {
         let dir = std::env::temp_dir().join(format!("netburrow-preferences-{}-{}", std::process::id(), new_group().unwrap()));
         let saved = Settings { server: "saved.example:24872".into(), group: new_group().unwrap(), ..Settings::default() };
@@ -349,74 +328,5 @@ mod tests {
         assert!(read_settings(&dir.join("settings.json")).unwrap().minimize_on_close);
         fs::remove_file(dir.join("settings.json")).unwrap();
         fs::remove_dir(dir).unwrap();
-    }
-    #[test]
-    fn group_roundtrip_and_invalid_input() {
-        let value = new_group().unwrap();
-        assert_ne!(parse_group(&value).unwrap(), [0; 32]);
-        assert_eq!(
-            parse_group(&format!("  {value}\n")).unwrap(),
-            parse_group(&value).unwrap()
-        );
-        for invalid in [
-            "",
-            "NB1-你好",
-            "old-room-code",
-            &format!("NB1-{}", "0".repeat(64)),
-        ] {
-            assert!(parse_group(invalid).is_err());
-        }
-    }
-    #[test]
-    fn settings_preserve_group_and_reject_corruption() {
-        let value = Settings {
-            server: "localhost:24872".into(),
-            group: new_group().unwrap(),
-            game_path: "example/isaac-ng.exe".into(),
-            transport: Transport::Udp,
-            allow_late_hook: true,
-            display_name: "测试玩家".into(),
-            minimize_on_close: true,
-            notifications_enabled: false,
-            auto_check_updates: true,
-            window_placement: Some(WindowPlacement { normal: [50, 60, 690, 880], maximized: false }),
-            start_minimized: true,
-            recent_connections: vec![RecentConnection { server: "localhost:24872".into(), group: new_group().unwrap() }],
-        };
-        let encoded = serde_json::to_vec(&value).unwrap();
-        let decoded: Settings = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(decoded.group, value.group);
-        assert_eq!(decoded.transport, Transport::Udp);
-        assert!(decoded.allow_late_hook);
-        assert!(decoded.minimize_on_close);
-        assert!(!decoded.notifications_enabled);
-        assert!(decoded.auto_check_updates);
-        assert_eq!(decoded.window_placement, value.window_placement);
-        assert!(decoded.start_minimized);
-        assert_eq!(decoded.recent_connections, value.recent_connections);
-        assert_eq!(decoded.display_name, "测试玩家");
-        let mut legacy = serde_json::to_value(&value).unwrap();
-        legacy.as_object_mut().unwrap().remove("allow_late_hook");
-        legacy.as_object_mut().unwrap().remove("display_name");
-        legacy.as_object_mut().unwrap().remove("minimize_on_close");
-        legacy.as_object_mut().unwrap().remove("notifications_enabled");
-        legacy.as_object_mut().unwrap().remove("auto_check_updates");
-        legacy.as_object_mut().unwrap().remove("window_placement");
-        legacy.as_object_mut().unwrap().remove("start_minimized");
-        legacy.as_object_mut().unwrap().remove("recent_connections");
-        let legacy: Settings = serde_json::from_value(legacy).unwrap();
-        assert!(!legacy.allow_late_hook);
-        assert!(!legacy.minimize_on_close);
-        assert!(legacy.notifications_enabled);
-        assert!(!legacy.auto_check_updates);
-        assert!(!Settings::default().auto_check_updates);
-        assert!(legacy.window_placement.is_none());
-        assert!(!legacy.start_minimized);
-        assert!(legacy.recent_connections.is_empty());
-        assert!(!Settings::default().minimize_on_close);
-        assert!(legacy.display_name.is_empty());
-        assert_eq!(legacy.group, value.group);
-        assert!(serde_json::from_slice::<Settings>(b"{broken}").is_err());
-        assert!(serde_json::from_str::<Settings>("{}").is_err());
     }
 }

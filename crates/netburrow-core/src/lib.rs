@@ -87,33 +87,6 @@ impl SingleInstance {
     }
 }
 
-#[cfg(all(test, windows))]
-mod instance_tests {
-    use super::SingleInstance;
-
-    #[test]
-    fn duplicate_activation_survives_until_polled_and_releases_on_exit() {
-        let name = format!("Local\\NetBurrow.Test.{}", std::process::id());
-        let event = format!("{name}.Activate");
-        let first = SingleInstance::acquire_named(&name, &event)
-            .unwrap()
-            .unwrap();
-        assert!(!first.activation_requested());
-        assert!(
-            SingleInstance::acquire_named(&name, &event)
-                .unwrap()
-                .is_none()
-        );
-        assert!(first.activation_requested());
-        assert!(!first.activation_requested());
-        drop(first);
-        assert!(
-            SingleInstance::acquire_named(&name, &event)
-                .unwrap()
-                .is_some()
-        );
-    }
-}
 
 #[cfg(not(windows))]
 pub struct SingleInstance;

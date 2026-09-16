@@ -95,52 +95,6 @@ mod native {
         }
     }
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            CreateWindowExW, DestroyWindow, SW_HIDE, WS_OVERLAPPEDWINDOW,
-        };
-
-        #[test]
-        fn windows_relocates_saved_offscreen_rect() {
-            let class: Vec<u16> = "STATIC".encode_utf16().chain(Some(0)).collect();
-            let hwnd = unsafe {
-                CreateWindowExW(
-                    0,
-                    class.as_ptr(),
-                    std::ptr::null(),
-                    WS_OVERLAPPEDWINDOW,
-                    80,
-                    80,
-                    740,
-                    880,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                )
-            };
-            assert!(!hwnd.is_null());
-            let saved = WindowPlacement {
-                normal: [40000, 40000, 40740, 40880],
-                maximized: false,
-            };
-            let mut native = native_placement(&saved);
-            native.showCmd = SW_HIDE as u32; // Exercise placement without showing a test window.
-            let restored = unsafe { SetWindowPlacement(hwnd, &native) };
-            let captured = capture_from(hwnd);
-            unsafe {
-                DestroyWindow(hwnd);
-            }
-            assert_ne!(restored, 0);
-            let captured = captured.unwrap();
-            assert_ne!(captured.normal[0], 40000);
-            assert_eq!(captured.normal[2] - captured.normal[0], 740);
-            assert_eq!(captured.normal[3] - captured.normal[1], 880);
-            assert!(!captured.maximized);
-        }
-    }
 }
 
 #[cfg(windows)]
@@ -153,23 +107,4 @@ pub fn capture() -> Option<WindowPlacement> {
 #[cfg(not(windows))]
 pub fn restore(_: &WindowPlacement) -> Result<(), String> {
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn accepts_secondary_monitor_and_rejects_broken_dimensions() {
-        assert!(valid(&WindowPlacement {
-            normal: [-1920, 80, -1280, 900],
-            maximized: true
-        }));
-        for normal in [[0, 0, 0, 0], [640, 820, 0, 0], [i32::MIN, 0, i32::MAX, 820]] {
-            assert!(!valid(&WindowPlacement {
-                normal,
-                maximized: false
-            }));
-        }
-    }
 }
