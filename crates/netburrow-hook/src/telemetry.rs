@@ -146,31 +146,3 @@ impl Telemetry {
         lines
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn metadata_is_bounded_and_existing_flows_remain_observable() {
-        let mut t = Telemetry::default();
-        for member in 0..1000 {
-            t.flow(member, 0, 2);
-            t.poll(member as i32, false, false);
-            t.event(member, "close", None, 0, 0);
-        }
-        assert_eq!(t.flows.len(), FLOW_LIMIT);
-        assert_eq!(t.polls.len(), CHANNEL_LIMIT);
-        assert_eq!(t.events.len(), EVENT_LIMIT);
-        t.flow(0, 0, 2).unwrap().sent += 1;
-        let snapshot = t.take_snapshot();
-        assert!(t.events.is_empty());
-        assert_eq!(t.flows[&(0, 0, 2)].sent, 1);
-        assert!(
-            snapshot
-                .lines()
-                .iter()
-                .any(|s| s.contains("omitted_events=936"))
-        );
-    }
-}

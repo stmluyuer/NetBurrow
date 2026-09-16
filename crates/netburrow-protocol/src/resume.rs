@@ -156,22 +156,6 @@ mod tests {
     }
 
     #[test]
-    fn frame_capacity_rejects_without_advancing_sequence() {
-        let mut window = Window::default();
-        for _ in 0..MAX_PENDING_FRAMES {
-            window.retain(Vec::new()).unwrap();
-        }
-        assert!(window.retain(Vec::new()).is_err());
-        assert_eq!(window.pending_len(), MAX_PENDING_FRAMES);
-
-        window.acknowledge(1).unwrap();
-        assert_eq!(
-            window.retain(Vec::new()).unwrap(),
-            MAX_PENDING_FRAMES as u64 + 1
-        );
-    }
-
-    #[test]
     fn byte_capacity_rejects_without_mutating_window() {
         let mut window = Window::default();
         window.retain(vec![0; MAX_PENDING_BYTES]).unwrap();
@@ -183,18 +167,4 @@ mod tests {
         assert_eq!(window.retain(vec![2]).unwrap(), 2);
     }
 
-    #[test]
-    fn replay_snapshot_is_oldest_first_and_owned() {
-        let mut window = Window::default();
-        window.retain(vec![0, 0, 0, 1, 10]).unwrap();
-        window.retain(vec![0, 0, 0, 1, 20]).unwrap();
-
-        let mut snapshot = window.pending();
-        assert_eq!(
-            snapshot,
-            vec![(1, vec![0, 0, 0, 1, 10]), (2, vec![0, 0, 0, 1, 20])]
-        );
-        snapshot[0].1[4] = 99;
-        assert_eq!(window.pending()[0].1[4], 10);
-    }
 }

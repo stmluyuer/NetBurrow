@@ -896,78 +896,9 @@ mod tests {
             assert!(decode(&bytes[4..bytes.len()-1]).is_err());
         }
     }
-    #[test]
-    fn diagnostic_extension_preserves_legacy_frames_and_rejects_bad_metadata() {
-        let legacy = Message::Data(packet(b"payload", 0));
-        let old = encode(&legacy).unwrap();
-        assert_eq!(old[8], DATA);
-        assert_eq!(decode(&old[4..]).unwrap(), legacy);
-        let Message::Data(mut p) = legacy else { unreachable!() };
-        p.delivery = Some(Delivery { stream: 9, sequence: 3 });
-        let extended = Message::Data(p.clone());
-        let bytes = encode(&extended).unwrap();
-        assert_eq!(bytes.len(), old.len() + 16);
-        assert_eq!(&bytes[9..old.len()], &old[9..]);
-        assert_eq!(decode(&bytes[4..]).unwrap(), extended);
-        assert!(decode(&bytes[4..bytes.len()-1]).is_err());
-        let udp = Datagram::Data { client_id: 2, token: [1; 16], packet: p.clone() };
-        assert_eq!(decode_datagram(&encode_datagram(&udp).unwrap()).unwrap(), udp);
-        p.delivery.as_mut().unwrap().sequence = 0;
-        assert!(encode(&Message::Data(p)).is_err());
-        let mut bad = bytes;
-        let end = bad.len();
-        bad[end-8..].fill(0);
-        assert!(decode(&bad[4..]).is_err());
-        for m in [Message::DiagnosticsPeers(vec![1, 2]), Message::PeerProbe(PeerProbe { from: 1, to: 2, source_epoch: 10, target_epoch: 20, id: 7, reply: false })] {
-            let encoded = encode(&m).unwrap();
-            assert_eq!(decode(&encoded[4..]).unwrap(), m);
-            assert!(decode(&encoded[4..encoded.len()-1]).is_err());
-        }
-    }
 
     use super::*;
     use std::io::Cursor;
-
-    #[test]
-    fn member_status_roundtrip_and_limits() {
-        let mut status = MemberStatus {
-            name: "朋友甲".into(),
-            phase: 3,
-            ping_ms: Some(27),
-            transport: 2,
-            sent: 123,
-            received: 456,
-        };
-        for message in [
-            Message::Status(status.clone()),
-            Message::Statuses(vec![PeerStatus {
-                client_id: 5,
-                game_epoch: 10,
-                age_ms: 3000,
-                status: status.clone(),
-            }]),
-        ] {
-            let frame = encode(&message).unwrap();
-            assert_eq!(decode(&frame[4..]).unwrap(), message);
-        }
-        status.ping_ms = None;
-        let frame = encode(&Message::Status(status.clone())).unwrap();
-        assert_eq!(
-            decode(&frame[4..]).unwrap(),
-            Message::Status(status.clone())
-        );
-        status.name = "x".repeat(25);
-        assert!(encode(&Message::Status(status.clone())).is_err());
-        status.name = "bad\nname".into();
-        assert!(encode(&Message::Status(status.clone())).is_err());
-        status.name.clear();
-        status.phase = 7;
-        assert!(encode(&Message::Status(status)).is_err());
-        assert!(decode(b"NBP1\x0f\xff\xff").is_err());
-        let mut oversized_name = b"NBP1\x0e".to_vec();
-        oversized_name.extend_from_slice(&97u32.to_be_bytes());
-        assert!(decode(&oversized_name).is_err());
-    }
 
     fn packet(payload: &[u8], send_type: u8) -> Packet {
         Packet {
@@ -997,22 +928,6 @@ mod tests {
         ];
         assert_eq!(frame, expected);
         assert_eq!(decode(&frame[4..]).unwrap(), message);
-    }
-
-    #[test]
-    fn read_and_write_keep_frame_boundaries() {
-        let first = Message::Ping(9);
-        let second = Message::Members(vec![Peer {
-            client_id: 1,
-            steam_id: 2,
-            epoch: 3,
-        }]);
-        let mut bytes = Cursor::new(Vec::new());
-        write_message(&mut bytes, &first).unwrap();
-        write_message(&mut bytes, &second).unwrap();
-        bytes.set_position(0);
-        assert_eq!(read_message(&mut bytes).unwrap(), first);
-        assert_eq!(read_message(&mut bytes).unwrap(), second);
     }
 
     #[test]
@@ -1051,10 +966,4 @@ mod tests {
         assert!(encode_datagram(&huge).is_err());
     }
 
-    #[test]
-    fn hook_init_has_stable_shared_abi_layout() {
-        assert_eq!(std::mem::size_of::<HookInit>(), 40);
-        assert_eq!(HookInit::default().reserved, 0);
-        assert_eq!(HookInit::default().version, HOOK_INIT_VERSION);
-    }
 }

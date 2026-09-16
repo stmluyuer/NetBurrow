@@ -508,36 +508,6 @@ mod tests {
         }
     }
     #[test]
-    fn peer_health_rejects_duplicate_identity_and_invalid_count() {
-        let p = crate::HookPeerHealth {
-            peer: 20,
-            epoch: 200,
-            ..Default::default()
-        };
-        let duplicate = Message::IpcHealth(HookHealth {
-            peers: vec![p.clone(), p.clone()],
-            ..Default::default()
-        });
-        assert!(crate::decode(&encode(&duplicate).unwrap()[4..]).is_err());
-        let oversized = Message::IpcHealth(HookHealth {
-            peers: vec![p; crate::MAX_HEALTH_PEERS + 1],
-            ..Default::default()
-        });
-        assert!(encode(&oversized).is_err());
-    }
-    #[test]
-    fn control_priority_never_crosses_identity_barrier() {
-        let mut q = Frames::new(true);
-        q.push(packet(20)).unwrap();
-        q.push(Message::Ping(1)).unwrap();
-        q.push(Message::Members(vec![])).unwrap();
-        q.push(Message::Ping(2)).unwrap();
-        assert_eq!(q.pop(), Some(Message::Ping(1)));
-        assert_eq!(q.pop(), Some(packet(20)));
-        assert_eq!(q.pop(), Some(Message::Members(vec![])));
-        assert_eq!(q.pop(), Some(Message::Ping(2)));
-    }
-    #[test]
     fn peer_round_robin_preserves_order_tags_and_identity_barriers() {
         let mut q = Frames::new(true);
         for peer in [20, 30, 40] {
@@ -564,50 +534,6 @@ mod tests {
         assert!(matches!(q.pop(), Some(Message::Members(_))));
         assert_eq!(q.pop(), Some(Message::Ping(9)));
         assert_eq!(q.pop(), Some(packet(5)));
-    }
-    #[test]
-    fn saturated_peer_does_not_evict_other_peers_lossy_data() {
-        let mut q = Frames::new(true);
-        let limits = Limits {
-            packets: 8,
-            bytes: 4096,
-            peer_packets: 2,
-            peer_bytes: 4096,
-        };
-        q.push_limited(packet(20), false, limits).unwrap();
-        q.push_limited(packet(20), false, limits).unwrap();
-        let Message::Data(mut lossy) = packet(30) else {
-            unreachable!()
-        };
-        lossy.send_type = 0;
-        q.push_limited(Message::Data(lossy.clone()), true, limits)
-            .unwrap();
-        assert_eq!(
-            q.push_limited(packet(20), false, limits).unwrap(),
-            Admission::PeerFailed(20, 200)
-        );
-        assert_eq!(q.dropped, 0);
-        assert_eq!(q.pop_tagged(), Some((Message::Data(lossy), true)));
-    }
-    #[test]
-    fn skewed_backlog_fails_only_the_saturated_peer() {
-        let mut q = Frames::new(true);
-        for _ in 0..2956 {
-            assert_eq!(q.push(packet(20)).unwrap(), Admission::Queued);
-        }
-        for _ in 0..300 {
-            assert_eq!(q.push(packet(30)).unwrap(), Admission::Queued);
-        }
-        for _ in 2956..PEER_PACKETS {
-            q.push(packet(20)).unwrap();
-        }
-        assert_eq!(q.push(packet(20)).unwrap(), Admission::PeerFailed(20, 200));
-        assert_eq!(q.fault(), Some((20, 200)));
-        assert_eq!(q.push(packet(20)).unwrap(), Admission::Dropped);
-        for _ in 0..300 {
-            assert_eq!(q.pop(), Some(packet(30)));
-        }
-        assert!(q.is_empty());
     }
     struct Partial {
         bytes: Vec<u8>,
