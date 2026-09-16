@@ -1251,16 +1251,18 @@ dependencies = [
 
 [[package]]
 name = "netburrow-app"
-version = "0.1.17"
+version = "0.1.19"
 dependencies = [
  "eframe",
+ "flate2",
  "netburrow-core",
  "windows-sys 0.61.2",
+ "zip",
 ]
 
 [[package]]
 name = "netburrow-core"
-version = "0.1.17"
+version = "0.1.19"
 dependencies = [
  "getrandom",
  "netburrow-protocol",
@@ -1273,7 +1275,7 @@ dependencies = [
 
 [[package]]
 name = "netburrow-hook"
-version = "0.1.17"
+version = "0.1.19"
 dependencies = [
  "netburrow-protocol",
  "windows-sys 0.61.2",
@@ -1281,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "netburrow-injector"
-version = "0.1.17"
+version = "0.1.19"
 dependencies = [
  "netburrow-protocol",
  "windows-sys 0.61.2",
@@ -1289,14 +1291,14 @@ dependencies = [
 
 [[package]]
 name = "netburrow-protocol"
-version = "0.1.17"
+version = "0.1.19"
 dependencies = [
  "getrandom",
 ]
 
 [[package]]
 name = "netburrow-relay"
-version = "0.1.17"
+version = "0.1.19"
 dependencies = [
  "netburrow-protocol",
  "tokio",
@@ -2283,6 +2285,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 
 [[package]]
+name = "typed-path"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
+
+[[package]]
 name = "unicode-general-category"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2986,6 +2994,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "zip"
+version = "8.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b680f2a0cd479b4cff6e1233c483fdead418106eae419dc60200ae9850f6d004"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "indexmap",
+ "memchr",
+ "typed-path",
 ]
 
 [[package]]

@@ -95,7 +95,8 @@ function Write-PortableZip {
 function Write-ThirdPartyNotices {
     param(
         [Parameter(Mandatory = $true)][string]$ManifestPath,
-        [Parameter(Mandatory = $true)][string]$Destination
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [string[]]$PackageNames
     )
 
     New-Item -ItemType Directory -Force -Path $Destination | Out-Null
@@ -110,7 +111,7 @@ function Write-ThirdPartyNotices {
     $lines.Add('This package was assembled from Cargo metadata. Each dependency has its own directory below, containing license, licence, copying, and notice material found in its locally resolved crate root or legal-material subdirectories.')
     $lines.Add('')
 
-    foreach ($package in @($metadata.packages | Where-Object { $_.source } | Sort-Object name, version)) {
+    foreach ($package in @($metadata.packages | Where-Object { $_.source -and (-not $PackageNames -or $_.name -in $PackageNames) } | Sort-Object name, version)) {
         $license = if ($package.license) { $package.license } else { 'Not declared in Cargo metadata' }
         $lines.Add("- $($package.name) $($package.version): $license")
         $safePackage = ("{0}-{1}" -f $package.name, $package.version) -replace '[^A-Za-z0-9._-]', '_'
@@ -180,6 +181,7 @@ Copy-Item -LiteralPath $appBinary -Destination (Join-Path $appStage 'NetBurrow.e
 Copy-Item -LiteralPath $injectorBinary -Destination (Join-Path $appStage 'netburrow-injector.exe') -Force
 Copy-Item -LiteralPath $hookDll -Destination (Join-Path $appStage 'netburrow_hook.dll') -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot 'README.md') -Destination (Join-Path $appStage 'README.md') -Force
+Write-ThirdPartyNotices -ManifestPath (Join-Path $repoRoot 'crates\netburrow-app\Cargo.toml') -Destination (Join-Path $appStage 'LICENSES') -PackageNames @('zip', 'typed-path')
 Get-ChildItem -LiteralPath $appStage -File -Recurse | Where-Object { $_.LastWriteTime.Year -lt 1980 -or $_.LastWriteTime.Year -gt 2107 } | ForEach-Object { $_.LastWriteTime = Get-Date }
 Write-PortableZip -Source $appStage -Destination $appZip
 Write-Output "已生成：$appZip"

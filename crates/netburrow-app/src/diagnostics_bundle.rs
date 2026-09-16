@@ -85,66 +85,31 @@ fn bundle_to(destination: &Path, logs: &Path, report: &Path) -> io::Result<Bundl
     result
 }
 
-#[cfg(windows)]
 fn compress(source: &Path, destination: &Path) -> io::Result<()> {
-    use std::os::windows::process::CommandExt;
-
-    // Paths are data in environment variables, never interpolated into PowerShell code.
-    // ASCII source also works with Windows PowerShell 5.1 irrespective of script encoding.
-    let script = r#"
-$ErrorActionPreference = 'Stop'
-$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
-$PSDefaultParameterValues['*:Encoding'] = 'utf8'
-Add-Type -AssemblyName System.IO.Compression
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-$stream = [System.IO.File]::Open($env:NETBURROW_ZIP_DESTINATION, 'Open', 'Write', 'None')
-try {
-    $zip = [System.IO.Compression.ZipArchive]::new($stream, [System.IO.Compression.ZipArchiveMode]::Create)
-    try {
-        foreach ($file in [System.IO.Directory]::GetFiles($env:NETBURROW_ZIP_SOURCE)) {
-            [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $file, [System.IO.Path]::GetFileName($file), [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
-        }
-    } finally { if ($null -ne $zip) { $zip.Dispose() } }
-} finally { $stream.Dispose() }
-"#;
-    let powershell = std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::other("未找到 Windows 系统目录"))?
-        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
-    let output = std::process::Command::new(powershell)
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-Command",
-            script,
-        ])
-        .env("NETBURROW_ZIP_SOURCE", source)
-        .env("NETBURROW_ZIP_DESTINATION", destination)
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "压缩失败：{}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )))
+    let output = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(destination)?;
+    let mut archive = zip::ZipWriter::new(output);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .ok_or_else(|| io::Error::other("无法读取日志文件名"))?;
+        archive.start_file(name, options)?;
+        io::copy(&mut File::open(entry.path())?, &mut archive)?;
     }
-}
-
-#[cfg(not(windows))]
-fn compress(_source: &Path, _destination: &Path) -> io::Result<()> {
-    Err(io::Error::other("日志打包需要 Windows"))
+    // Finalization writes the ZIP directory and must succeed before revealing the file.
+    archive.finish()?.sync_all()?;
+    Ok(())
 }
 
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
-    use std::os::windows::process::CommandExt;
 
     fn fixture() -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -161,18 +126,14 @@ mod tests {
     }
 
     fn extract(archive: &Path, destination: &Path) {
-        let output = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command",
-                "$ErrorActionPreference = 'Stop'; $OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); $PSDefaultParameterValues['*:Encoding'] = 'utf8'; Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory($env:NETBURROW_TEST_ZIP, $env:NETBURROW_TEST_EXTRACT)"])
-            .env("NETBURROW_TEST_ZIP", archive)
-            .env("NETBURROW_TEST_EXTRACT", destination)
-            .creation_flags(0x0800_0000)
-            .output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let mut archive = zip::ZipArchive::new(File::open(archive).unwrap()).unwrap();
+        for index in 0..archive.len() {
+            assert_eq!(
+                archive.by_index(index).unwrap().compression(),
+                zip::CompressionMethod::Deflated
+            );
+        }
+        archive.extract(destination).unwrap();
     }
 
     #[test]
