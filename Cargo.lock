@@ -1251,7 +1251,7 @@ dependencies = [
 
 [[package]]
 name = "netburrow-app"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "eframe",
  "netburrow-core",
@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "netburrow-core"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "getrandom",
  "netburrow-protocol",
@@ -1273,7 +1273,7 @@ dependencies = [
 
 [[package]]
 name = "netburrow-hook"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "netburrow-protocol",
  "windows-sys 0.61.2",
@@ -1281,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "netburrow-injector"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "netburrow-protocol",
  "windows-sys 0.61.2",
@@ -1289,14 +1289,14 @@ dependencies = [
 
 [[package]]
 name = "netburrow-protocol"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "getrandom",
 ]
 
 [[package]]
 name = "netburrow-relay"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "netburrow-protocol",
  "tokio",
