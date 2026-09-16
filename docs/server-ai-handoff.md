@@ -32,7 +32,7 @@ STAGE="/opt/netburrow/stage-$COMMIT"
 git -C "$SOURCE" worktree add --detach "$STAGE" "$COMMIT"
 ```
 
-`NetBurrow-<版本>-relay-source.zip` 仍可用于离线交付；源码 ZIP 中已经裁剪为 Relay 和协议 workspace。GitHub 更新优先使用完整 workspace，因为下方检查需要在完整 workspace 中运行。使用 ZIP 时把解压根目录设为 `$STAGE`，仍显式使用 `TARGET_DIR="$STAGE/.local/target"` 和相同的 `cargo +1.97.0 ... --target-dir "$TARGET_DIR"` 命令。
+`NetBurrow-<版本>-relay-source.zip` 仍可用于离线交付；源码 ZIP 中已经裁剪为 Relay 和协议 workspace。GitHub 更新优先使用完整 workspace，因为下方检查需要在完整 workspace 中运行。使用 ZIP 时把解压根目录设为 `$STAGE`，仍显式使用 `TARGET_DIR="$STAGE/.local/target"` 和相同的 `cargo ... --target-dir "$TARGET_DIR"` 命令。
 
 ## 先核查现有服务，再构建验证
 
@@ -47,21 +47,20 @@ sudo systemctl status netburrow-relay.service --no-pager
 sudo ss -ltnup | grep ':24872' || true
 ```
 
-在未停止服务前，以该 unit 的普通 `User`/`Group` 在 `$STAGE` 内构建和测试。根目录的 `rust-toolchain.toml` 包含 Windows target；Linux Relay 不安装这些 target，使用显式 `+1.97.0` 覆盖目录工具链选择。若该普通用户未安装该工具链，先安装最小 profile：
+在未停止服务前，以该 unit 的普通 `User`/`Group` 在 `$STAGE` 内构建和测试。项目不固定 Rust 版本，使用该用户已配置的工具链；需支持 Rust 2024 edition 并满足锁定依赖的最低版本要求。Linux Relay 无需安装 Windows target。先确认工具链可用，再执行构建：
 
 ```bash
 set -euo pipefail
-if ! rustup toolchain list | awk '{print $1}' | grep -qx '1.97.0-x86_64-unknown-linux-gnu'; then
-  rustup toolchain install 1.97.0 --profile minimal
-fi
+rustc --version
+cargo --version
 
 cd "$STAGE"
 TARGET_DIR="$STAGE/.local/target"
 RELAY_BIND=0.0.0.0:24872       # 以现有 ExecStart 的 --bind 为准
 RELAY_MAX_CLIENTS=1024         # 以现有 ExecStart 的 --max-clients 为准
 RELAY_ALLOWED_GROUPS=/etc/netburrow/allowed-groups.txt  # 以现有 --allowed-groups-file 为准
-cargo +1.97.0 test -p netburrow-protocol -p netburrow-relay --locked --target-dir "$TARGET_DIR"
-cargo +1.97.0 build --release -p netburrow-relay --locked --target-dir "$TARGET_DIR"
+cargo test -p netburrow-protocol -p netburrow-relay --locked --target-dir "$TARGET_DIR"
+cargo build --release -p netburrow-relay --locked --target-dir "$TARGET_DIR"
 "$TARGET_DIR/release/netburrow-relay" --check-config --bind "$RELAY_BIND" --max-clients "$RELAY_MAX_CLIENTS" --allowed-groups-file "$RELAY_ALLOWED_GROUPS"
 ```
 

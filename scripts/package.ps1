@@ -23,8 +23,10 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $repoRoot
 $cargoHome = Join-Path $repoRoot '.local\cargo'
 $rustupHome = Join-Path $repoRoot '.local\rustup'
-$toolBin = Join-Path $rustupHome 'toolchains\1.97.0-x86_64-pc-windows-msvc\bin'
-$cargo = Join-Path $toolBin 'cargo.exe'
+$env:RUSTUP_HOME = $rustupHome
+$cargo = & rustup which cargo
+if ($LASTEXITCODE -ne 0) { throw '无法找到仓库本地默认 Rust 工具链。' }
+$toolBin = Split-Path -Parent $cargo
 $distRoot = Join-Path $repoRoot '.local\dist'
 $targetRoot = Join-Path $repoRoot '.local\target'
 
@@ -204,7 +206,6 @@ default-members = ["crates/netburrow-relay"]
 [workspace.package]
 version = "__PACKAGE_VERSION__"
 edition = "2024"
-rust-version = "1.97"
 publish = false
 
 [workspace.dependencies]
@@ -219,12 +220,6 @@ strip = "debuginfo"
 '@
 $relayManifest = $relayManifest.Replace('__PACKAGE_VERSION__', $Version)
 Set-Content -LiteralPath (Join-Path $relayStage 'Cargo.toml') -Value $relayManifest -Encoding UTF8
-$relayToolchain = @'
-[toolchain]
-channel = "1.97.0"
-profile = "minimal"
-'@
-Set-Content -LiteralPath (Join-Path $relayStage 'rust-toolchain.toml') -Value $relayToolchain -Encoding UTF8
 New-Item -ItemType Directory -Force -Path (Join-Path $relayStage 'crates') | Out-Null
 Copy-Item -LiteralPath (Join-Path $repoRoot 'crates\netburrow-protocol') -Destination (Join-Path $relayStage 'crates\netburrow-protocol') -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot 'crates\netburrow-relay') -Destination (Join-Path $relayStage 'crates\netburrow-relay') -Recurse -Force

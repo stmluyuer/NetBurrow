@@ -4,10 +4,12 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
 $PSDefaultParameterValues['*:Encoding'] = 'utf8'
 Set-Location (Split-Path $PSScriptRoot -Parent)
-$taskBin = Join-Path $PWD '.local/rustup/toolchains/1.97.0-x86_64-pc-windows-msvc/bin'
-if (Test-Path $taskBin) {
+if (Test-Path (Join-Path $PWD '.local/rustup/settings.toml')) {
     $env:CARGO_HOME = Join-Path $PWD '.local/cargo'
     $env:RUSTUP_HOME = Join-Path $PWD '.local/rustup'
+    $taskCargo = & rustup which cargo
+    if ($LASTEXITCODE -ne 0) { throw 'Local Rust toolchain not found' }
+    $taskBin = Split-Path -Parent $taskCargo
     $env:RUSTC = Join-Path $taskBin 'rustc.exe'
     $env:RUSTDOC = Join-Path $taskBin 'rustdoc.exe'
     $env:PATH = "$taskBin;" + $env:PATH

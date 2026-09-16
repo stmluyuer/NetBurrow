@@ -148,7 +148,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\打包客户端.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1
 ```
 
-脚本使用仓库 `.local` 中的 Rust 1.97 工具链，离线构建 x64 桌面程序与 i686 helper/DLL，输出到 `.local\dist`：
+项目不固定 Rust 版本，所选工具链需支持 Rust 2024 edition 并满足锁定依赖的最低版本要求。脚本通过 `rustup` 使用仓库 `.local` 中已配置的默认工具链，需预先安装 x64 和 i686 Windows MSVC target；离线构建桌面程序与 helper/DLL，输出到 `.local\dist`：
 
 - `NetBurrow-<版本>-win-x64.zip`
 - `NetBurrow-<版本>-relay-source.zip`
