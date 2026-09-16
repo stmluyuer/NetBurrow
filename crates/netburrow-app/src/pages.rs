@@ -260,6 +260,17 @@ impl NetBurrowApp {
                         if self.preflight.is_some() && ui.button("取消检查").clicked() {
                             self.stop();
                         }
+                        let packing = self.diagnostic_bundle.is_some();
+                        if ui
+                            .add_enabled(
+                                !packing,
+                                egui::Button::new(if packing { "正在打包…" } else { "一键打包日志" }),
+                            )
+                            .on_hover_text("将三个运行日志和最新诊断 TXT 打包为 ZIP，并打开压缩包所在位置")
+                            .clicked()
+                        {
+                            self.begin_diagnostic_bundle(ui.ctx());
+                        }
                         if ui.button("导出诊断").clicked() {
                             self.export_diagnostics();
                         }
@@ -280,7 +291,7 @@ impl NetBurrowApp {
                         }
                     });
                     if let Some(path) = self.diagnostic_export.clone() {
-                        if ui.button("打开诊断所在文件夹").clicked() {
+                        if ui.button("打开导出文件所在文件夹").clicked() {
                             self.open_folder(&path, true);
                         }
                     }
@@ -313,6 +324,55 @@ impl NetBurrowApp {
                 }
             });
     }
+    fn begin_diagnostic_bundle(&mut self, context: &egui::Context) {
+        if self.diagnostic_bundle.is_some() {
+            return;
+        }
+        let settings = self.settings.clone();
+        let snapshot = self.diagnostic_snapshot();
+        let context = context.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        match std::thread::Builder::new()
+            .name("diagnostics-bundle".into())
+            .spawn(move || {
+                let _ = sender.send(diagnostics_bundle::export(&settings, &snapshot));
+                context.request_repaint();
+            })
+        {
+            Ok(_) => {
+                self.diagnostic_bundle = Some(receiver);
+                self.notice = Some("正在打包日志…".into());
+            }
+            Err(error) => self.notice = Some(format!("无法开始打包：{error}")),
+        }
+    }
+
+    pub(super) fn poll_diagnostic_bundle(&mut self) {
+        let Some(receiver) = &self.diagnostic_bundle else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("日志打包任务意外结束，请重试".into())
+            }
+        };
+        self.diagnostic_bundle = None;
+        match result {
+            Ok(bundle) => {
+                self.notice = Some(if bundle.missing_logs.is_empty() {
+                    "日志已打包，可直接发送 ZIP 文件".into()
+                } else {
+                    format!("日志已打包；以下日志尚未生成：{}", bundle.missing_logs.join("、"))
+                });
+                self.diagnostic_export = Some(bundle.path.clone());
+                self.open_folder(&bundle.path, true);
+            }
+            Err(error) => self.notice = Some(error),
+        }
+    }
+
     fn open_folder(&mut self, path: &Path, select: bool) {
         let mut command = std::process::Command::new("explorer.exe");
         if select {

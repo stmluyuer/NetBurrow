@@ -13,6 +13,7 @@ mod pages;
 mod recent_ui;
 mod file_picker;
 mod preview;
+mod diagnostics_bundle;
 use pages::{Page, SettingsTab, DiagnosticTab, ViewState};
 
 use std::path::Path;
@@ -91,6 +92,7 @@ struct NetBurrowApp {
     edit_server: bool,
     edit_name: bool,
     diagnostic_export: Option<std::path::PathBuf>,
+    diagnostic_bundle: Option<std::sync::mpsc::Receiver<Result<diagnostics_bundle::Bundle, String>>>,
     notifications: notifications::Notifications,
     restore_window_pending: bool,
     stop_requested: Arc<AtomicBool>,
@@ -139,6 +141,7 @@ impl NetBurrowApp {
             edit_server: false,
             edit_name: false,
             diagnostic_export: None,
+            diagnostic_bundle: None,
             notifications: notifications::Notifications::default(),
             restore_window_pending: !smoke_test,
             stop_requested,
@@ -266,7 +269,7 @@ impl NetBurrowApp {
         self.export_diagnostics_at(false);
     }
 
-    fn export_diagnostics_at(&mut self, freeze: bool) {
+    fn diagnostic_snapshot(&self) -> Snapshot {
         let mut snapshot = self.client.as_ref().map_or_else(
             || self.last_snapshot.clone(),
             |client| client.snapshot(),
@@ -275,6 +278,11 @@ impl NetBurrowApp {
             snapshot.phase = Phase::Stopped;
             snapshot.detail = "联机当前未启用；下方可能包含上次运行记录。".into();
         }
+        snapshot
+    }
+
+    fn export_diagnostics_at(&mut self, freeze: bool) {
+        let snapshot = self.diagnostic_snapshot();
         let report = if freeze {
             netburrow_core::export_freeze_report(&self.settings, &snapshot)
         } else {
@@ -467,6 +475,7 @@ impl eframe::App for NetBurrowApp {
             self.stop();
         }
         self.poll_core();
+        self.poll_diagnostic_bundle();
         self.preview_tick(context);
 
         if self

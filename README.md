@@ -84,6 +84,8 @@ NetBurrow 是给《以撒的结合：忏悔+》朋友联机使用的 Windows 工
 
 点击“查看日志 → 打开日志文件夹”，或直接打开 `%LOCALAPPDATA%\NetBurrow\logs`。
 
+要一起发送排查材料，可在“日志与诊断”点击“一键打包日志”：后台将当前 `client.log`、`injector.log`、`hook.log` 和新生成的 `diagnostics.txt` 压缩为一个 ZIP，保存到 `%LOCALAPPDATA%\NetBurrow\diagnostics`，完成后自动打开资源管理器并选中压缩包。尚未生成的日志会跳过，并在界面和压缩包内说明。打包只收集这三个日志和诊断报告，不包含配置文件；原有“导出诊断”仍可单独使用。
+
 - `client.log`：带时间的连接状态、进程识别、helper 退出结果、IPC、成员数量、断线原因；每 10 秒记录收发和延迟统计。
 - `injector.log`：目标检查、DLL 加载及初始化返回码（返回 2 表示该进程已初始化过，需重开游戏）。
 - `hook.log`：Steam 接口、回调入口、IPC 初始化/异常及捕获到的回调数量。数量为 0 可能表示回调在注入前已经注册，不代表确定故障。
