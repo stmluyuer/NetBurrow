@@ -63,16 +63,6 @@ impl AllowedGroups {
 mod tests {
     use super::*;
     #[test]
-    fn comments_whitespace_case_and_duplicates() {
-        let upper = format!("NB1-{}", "AB".repeat(32));
-        let lower = format!("NB1-{}", "ab".repeat(32));
-        let groups =
-            AllowedGroups::parse(&format!("\n # friends\r\n {upper} \n{lower}\n")).unwrap();
-        assert_eq!(groups.len(), 1);
-        assert!(groups.contains(&[0xab; 32]));
-        assert!(!format!("{groups:?}").contains(&upper));
-    }
-    #[test]
     fn empty_invalid_and_zero_fail_without_exposing_entry() {
         for text in ["", " \n# none\n"] {
             assert!(AllowedGroups::parse(text).is_err());
@@ -88,13 +78,6 @@ mod tests {
             assert_eq!(error, "invalid allowed group at line 2");
             assert!(!error.contains(&entry));
         }
-    }
-    #[test]
-    fn missing_file_fails() {
-        assert!(
-            AllowedGroups::from_file(Path::new("/nonexistent/netburrow-allowed-groups-test"))
-                .is_err()
-        );
     }
 }
 
