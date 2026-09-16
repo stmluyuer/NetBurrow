@@ -1355,7 +1355,7 @@ mod runtime {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use netburrow_relay::{Config, spawn};
+        use netburrow_relay::{AllowedGroups, Config, spawn};
 
         #[tokio::test]
         async fn hook_resume_keeps_pending_frames_and_rejects_changed_identity() {
@@ -1385,7 +1385,7 @@ mod runtime {
 
         #[tokio::test]
         async fn relay_resume_preserves_identity_queues_and_unacknowledged_reliable_data() {
-            let relay=spawn(Config{bind:"127.0.0.1:0".parse().unwrap(),..Config::default()}).await.unwrap();
+            let relay=spawn(Config{bind:"127.0.0.1:0".parse().unwrap(),allowed_groups:AllowedGroups::parse(&format!("NB1-{}", "09".repeat(32))).unwrap(),..Config::default()}).await.unwrap();
             let address=relay.local_addr().to_string();
             let mut a=Network::connect(&address,[9;32],Transport::Tcp).await.unwrap();
             let mut b=Network::connect(&address,[9;32],Transport::Tcp).await.unwrap();
@@ -1422,7 +1422,7 @@ mod runtime {
 
         #[tokio::test]
         async fn network_diagnostics_follow_tcp_udp_fallback_and_real_peer_echo() {
-            let relay = spawn(Config { bind: "127.0.0.1:0".parse().unwrap(), ..Config::default() }).await.unwrap();
+            let relay = spawn(Config { bind: "127.0.0.1:0".parse().unwrap(), allowed_groups: AllowedGroups::parse(&format!("NB1-{}", "08".repeat(32))).unwrap(), ..Config::default() }).await.unwrap();
             let address = relay.local_addr().to_string();
             let mut a = Network::connect(&address, [8;32], Transport::Udp).await.unwrap();
             let mut b = Network::connect(&address, [8;32], Transport::Udp).await.unwrap();
@@ -1552,15 +1552,17 @@ mod runtime {
 
         #[tokio::test]
         async fn preflight_probes_existing_protocol_and_rejects_unsupported_server() {
+            let group = crate::new_group().unwrap();
             let relay = spawn(Config {
                 bind: "127.0.0.1:0".parse().unwrap(),
+                allowed_groups: AllowedGroups::parse(&group).unwrap(),
                 ..Config::default()
             })
             .await
             .unwrap();
             let mut settings = Settings {
                 server: relay.local_addr().to_string(),
-                group: crate::new_group().unwrap(),
+                group,
                 ..Settings::default()
             };
             timeout(Duration::from_secs(3), probe(&settings))
@@ -2024,6 +2026,7 @@ mod runtime {
         async fn loopback_relay_keeps_reliable_packets_on_tcp_and_releases_old_connection() {
             let relay = spawn(Config {
                 bind: "127.0.0.1:0".parse().unwrap(),
+                allowed_groups: AllowedGroups::parse(&format!("NB1-{}", "05".repeat(32))).unwrap(),
                 ..Config::default()
             })
             .await

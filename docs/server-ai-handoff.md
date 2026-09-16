@@ -6,13 +6,13 @@
 
 2026-09-16 的序号诊断和队友探测需要新版 Relay 配合。扩展通过保留 Ping 值协商；旧客户端仍走原协议，新客户端连接旧 Relay 时继续通信但不启用两项诊断。部署无需新增端口、配置项或数据迁移。完整诊断需要双方客户端均更新；TCP 探测成功不代表游戏正在推进。此说明不代表当前服务器已更新，部署仍须使用用户指定的固定来源。
 
-GitHub 仓库是 `https://github.com/stmluyuer/NetBurrow.git`，当前发布分支是 `codex/independent-plan`，不是 `main`。服务器端不得用浮动的 `HEAD`、默认分支或未确认的本地改动构建。
+GitHub 仓库是 `https://github.com/stmluyuer/NetBurrow.git`，当前发布分支是 `main`。服务器端不得用浮动的 `HEAD`、默认分支或未确认的本地改动构建。
 
 先以普通部署用户取得指定分支，并把远端引用解析为固定 commit。Git 的显式 refspec 会把远端分支写到指定远端跟踪引用，`git fetch` 的行为见 [Git 官方文档](https://git-scm.com/docs/git-fetch)。
 
 ```bash
 REPO=https://github.com/stmluyuer/NetBurrow.git
-BRANCH=codex/independent-plan
+BRANCH=main
 SOURCE=/opt/netburrow/source
 
 set -euo pipefail
@@ -59,12 +59,15 @@ cd "$STAGE"
 TARGET_DIR="$STAGE/.local/target"
 RELAY_BIND=0.0.0.0:24872       # 以现有 ExecStart 的 --bind 为准
 RELAY_MAX_CLIENTS=1024         # 以现有 ExecStart 的 --max-clients 为准
-cargo +1.97.0 test -p netburrow-relay --locked --target-dir "$TARGET_DIR"
+RELAY_ALLOWED_GROUPS=/etc/netburrow/allowed-groups.txt  # 以现有 --allowed-groups-file 为准
+cargo +1.97.0 test -p netburrow-protocol -p netburrow-relay --locked --target-dir "$TARGET_DIR"
 cargo +1.97.0 build --release -p netburrow-relay --locked --target-dir "$TARGET_DIR"
-"$TARGET_DIR/release/netburrow-relay" --check-config --bind "$RELAY_BIND" --max-clients "$RELAY_MAX_CLIENTS"
+"$TARGET_DIR/release/netburrow-relay" --check-config --bind "$RELAY_BIND" --max-clients "$RELAY_MAX_CLIENTS" --allowed-groups-file "$RELAY_ALLOWED_GROUPS"
 ```
 
 `--locked` 会要求现有 `Cargo.lock` 不发生依赖解析变更，详见 [Cargo build 官方文档](https://doc.rust-lang.org/cargo/commands/cargo-build.html)。`--target-dir` 必须显式指定，因为完整仓库 `.cargo/config.toml` 把产物定向到 `.local/target`；源码 ZIP 也使用同样的显式 target 目录。命令在完整 Linux workspace 中执行，不需要安装 `i686-pc-windows-msvc` 或 `x86_64-pc-windows-msvc` target。构建或检查失败时删除临时工作树并保留旧服务，不停服。
+
+组白名单在启动时从现有 `--allowed-groups-file` 加载，不输出组码。参数缺失、文件不可读、内容无效或名单为空时拒绝启动；未授权的 Join 在分配成员编号和 UDP 凭据前被拒绝。白名单在进程内不变，Resume 只能凭恢复凭据恢复本进程中已获准的会话，不能创建新成员。保留现有名单和文件权限，不把真实组码提交到仓库。
 
 ## 经验证后切换和回滚
 

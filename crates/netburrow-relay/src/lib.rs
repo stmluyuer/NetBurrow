@@ -1,7 +1,12 @@
 //! In-memory NB v1 relay.  A group exists only while one or more TCP clients
 //! are connected; no group credential, payload, or remote endpoint is logged.
 
+mod allowed_groups;
 mod diagnostics;
+
+pub use allowed_groups::AllowedGroups;
+
+const GROUP_NOT_ALLOWED: &str = "group is not allowed";
 
 use diagnostics::{Stats, increment, record};
 
@@ -37,6 +42,7 @@ const DEFAULT_TOTAL_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind: SocketAddr,
+    pub allowed_groups: AllowedGroups,
     pub max_clients: usize,
     pub handshake_timeout: Duration,
     pub outgoing_messages: usize,
@@ -48,6 +54,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             bind: SocketAddr::from(([0, 0, 0, 0], DEFAULT_PORT)),
+            allowed_groups: AllowedGroups::default(),
             max_clients: DEFAULT_MAX_CLIENTS,
             handshake_timeout: Duration::from_secs(10),
             outgoing_messages: DEFAULT_QUEUE_MESSAGES,
@@ -59,6 +66,9 @@ impl Default for Config {
 
 impl Config {
     pub fn validate(&self) -> io::Result<()> {
+        if self.allowed_groups.is_empty() {
+            return Err(invalid("a nonempty allowed-groups file is required"));
+        }
         if self.max_clients == 0 {
             return Err(invalid("max_clients must be positive"));
         }
@@ -150,9 +160,10 @@ where
         "INFO",
         "started",
         format_args!(
-            "port={} max_clients={} protocol=NBP1 member_status=true",
+            "port={} max_clients={} allowed_groups={} protocol=NBP1 member_status=true",
             tcp.local_addr()?.port(),
-            config.max_clients
+            config.max_clients,
+            config.allowed_groups.len()
         ),
     );
     let (stopping, _) = watch::channel(false);
@@ -249,6 +260,22 @@ async fn client_loop(
         .await;
         return;
     };
+
+    // Authorize before allocating membership or generating a UDP token.
+    // Resume can only restore an existing session admitted by this same list;
+    // the list is immutable for the lifetime of the process.
+    if let Message::Join { group } = &first {
+        if !config.allowed_groups.contains(group) {
+            increment(&stats.handshake_rejected);
+            record("WARN", "group_rejected", format_args!(""));
+            let _ = tokio::time::timeout(
+                config.handshake_timeout,
+                write_tcp_message(&mut stream, &Message::Error(GROUP_NOT_ALLOWED.into())),
+            )
+            .await;
+            return;
+        }
+    }
 
     let (sender, receiver) = mpsc::channel(config.outgoing_messages);
     let (closing, _) = watch::channel(false);
@@ -1303,7 +1330,7 @@ mod tests {
 
     #[tokio::test]
     async fn initial_members_failure_closes_socket_instead_of_waiting_for_recovery() {
-        let relay = spawn(Config { bind: "127.0.0.1:0".parse().unwrap(), outgoing_messages: 1, ..Config::default() }).await.unwrap();
+        let relay = spawn(Config { bind: "127.0.0.1:0".parse().unwrap(), allowed_groups: test_allowed_groups(), outgoing_messages: 1, ..Config::default() }).await.unwrap();
         let mut socket = TcpStream::connect(relay.local_addr()).await.unwrap();
         write_tcp_message(&mut socket, &Message::Join { group: group(1) }).await.unwrap();
         let result = timeout(Duration::from_secs(1), read_tcp_message(&mut socket)).await.unwrap();
@@ -1321,6 +1348,139 @@ mod tests {
         assert!(matches!(state.enqueue(id, Message::Statuses(vec![])), Err(QueueError::Full)));
         assert!(!*state.clients[&id].closing.borrow());
         assert!(!state.clients[&id].resume_failed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn allowlist_rejects_without_membership_or_token_and_keeps_groups_isolated() {
+        let relay = spawn(Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            allowed_groups: AllowedGroups::parse(&format!(
+                "NB1-{}\nNB1-{}",
+                "01".repeat(32),
+                "02".repeat(32)
+            ))
+            .unwrap(),
+            ..Config::default()
+        })
+        .await
+        .unwrap();
+        let (mut one, one_id, _) = connect(relay.local_addr(), group(1)).await;
+        let mut denied = TcpStream::connect(relay.local_addr()).await.unwrap();
+        write_tcp_message(&mut denied, &Message::Join { group: group(3) })
+            .await
+            .unwrap();
+        assert_eq!(
+            read_tcp_message(&mut denied).await.unwrap(),
+            Message::Error(GROUP_NOT_ALLOWED.into())
+        );
+        let mut byte = [0];
+        assert_eq!(
+            timeout(Duration::from_secs(1), denied.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        let (mut two, two_id, _) = connect(relay.local_addr(), group(2)).await;
+        assert_eq!(
+            two_id,
+            one_id + 1,
+            "rejected join must not allocate membership/token"
+        );
+        bind(&mut one, 101, 1).await;
+        bind(&mut two, 202, 1).await;
+        recv_until(&mut two, |message| matches!(message, Message::Members(peers) if peers.len() == 1 && peers[0].steam_id == 202)).await;
+        recv_until(&mut one, |message| matches!(message, Message::Members(peers) if peers.len() == 1 && peers[0].steam_id == 101)).await;
+        write_tcp_message(
+            &mut one,
+            &Message::Data(packet(101, 202, 1, 1, 3, b"isolated")),
+        )
+        .await
+        .unwrap();
+        write_tcp_message(&mut one, &Message::Ping(41)).await.unwrap();
+        assert_eq!(read_tcp_message(&mut one).await.unwrap(), Message::Pong(41));
+        write_tcp_message(&mut two, &Message::Ping(42)).await.unwrap();
+        assert_eq!(read_tcp_message(&mut two).await.unwrap(), Message::Pong(42));
+        let mut empty = State::new(4096);
+        assert!(!empty.bind_udp(99, [0; 16], "127.0.0.1:12345".parse().unwrap()));
+        assert!(matches!(
+            empty.route_udp(
+                99,
+                [0; 16],
+                "127.0.0.1:12345".parse().unwrap(),
+                packet(101, 202, 1, 1, 1, b"no session")
+            ),
+            Route::Rejected(_)
+        ));
+        relay.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn allowlist_admitted_session_resumes_with_original_identity() {
+        let relay = spawn(Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            allowed_groups: test_allowed_groups(),
+            ..Config::default()
+        })
+        .await
+        .unwrap();
+        let (mut stream, id, _) = connect(relay.local_addr(), group(1)).await;
+        bind(&mut stream, 101, 111).await;
+        write_tcp_message(&mut stream, &Message::Ping(netburrow_protocol::RECOVERY_PING))
+            .await
+            .unwrap();
+        let Message::RecoveryOffer(key) = recv_until(&mut stream, |message| {
+            matches!(message, Message::RecoveryOffer(_))
+        })
+        .await else { unreachable!() };
+        // A round trip after the offer confirms recovery was enabled by the writer.
+        write_tcp_message(&mut stream, &Message::Ping(43)).await.unwrap();
+        recv_until(&mut stream, |message| matches!(message, Message::Pong(43))).await;
+        drop(stream);
+
+        let mut wrong_key = key;
+        wrong_key[0] ^= 1;
+        let mut denied = TcpStream::connect(relay.local_addr()).await.unwrap();
+        write_tcp_message(&mut denied, &Message::Resume {
+            client_id: id, key: wrong_key, received: 0,
+        }).await.unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), read_tcp_message(&mut denied)).await.unwrap().unwrap(),
+            Message::Error("session resume rejected".into())
+        );
+
+        let mut resumed = timeout(Duration::from_secs(2), async {
+            loop {
+                let mut socket = TcpStream::connect(relay.local_addr()).await.unwrap();
+                write_tcp_message(&mut socket, &Message::Resume {
+                    client_id: id, key, received: 0,
+                }).await.unwrap();
+                match read_tcp_message(&mut socket).await.unwrap() {
+                    Message::Resumed { client_id, received: 0 } => {
+                        assert_eq!(client_id, id);
+                        break socket;
+                    }
+                    Message::Error(reason) if reason == "session resume pending" => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    _ => panic!("admitted session must resume"),
+                }
+            }
+        }).await.unwrap();
+        let Message::SessionFrame { sequence, body } = recv_until(&mut resumed, |message| {
+            matches!(message, Message::SessionFrame { .. })
+        }).await else { unreachable!() };
+        let Message::Members(peers) = netburrow_protocol::decode_session_body(&body).unwrap()
+            else { panic!("expected retained membership") };
+        assert!(peers.iter().any(|peer| peer.client_id == id && peer.steam_id == 101 && peer.epoch == 111));
+        write_tcp_message(&mut resumed, &Message::SessionAck(sequence)).await.unwrap();
+        write_tcp_message(&mut resumed, &Message::Leave).await.unwrap();
+        relay.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn default_configuration_is_fail_closed() {
+        assert!(Config::default().validate().is_err());
     }
 
     #[tokio::test]
@@ -1397,7 +1557,7 @@ mod tests {
 
     #[tokio::test]
     async fn negotiated_clients_exchange_metadata_and_probes_while_legacy_stays_compatible() {
-        let relay = spawn(Config { bind: "127.0.0.1:0".parse().unwrap(), ..Config::default() }).await.unwrap();
+        let relay = spawn(Config { bind: "127.0.0.1:0".parse().unwrap(), allowed_groups: test_allowed_groups(), ..Config::default() }).await.unwrap();
         let (mut a, aid, _) = connect(relay.local_addr(), group(1)).await;
         let (mut b, bid, _) = connect(relay.local_addr(), group(1)).await;
         let (mut old, _, _) = connect(relay.local_addr(), group(1)).await;
@@ -1643,6 +1803,7 @@ mod tests {
         }
         let relay = spawn(Config {
             bind: "127.0.0.1:0".parse().unwrap(),
+            allowed_groups: test_allowed_groups(),
             ..Config::default()
         })
         .await
@@ -1703,6 +1864,7 @@ mod tests {
     async fn peer_unbind_restart_and_disconnect_do_not_fail_remaining_clients() {
         let relay = spawn(Config {
             bind: "127.0.0.1:0".parse().unwrap(),
+            allowed_groups: test_allowed_groups(),
             ..Config::default()
         })
         .await
@@ -1994,6 +2156,7 @@ mod tests {
     async fn status_burst_keeps_heartbeat_and_reliable_data_working() {
         let relay = spawn(Config {
             bind: "127.0.0.1:0".parse().unwrap(),
+            allowed_groups: test_allowed_groups(),
             ..Config::default()
         })
         .await
@@ -2036,6 +2199,7 @@ mod tests {
     async fn loopback_tcp_udp_and_group_isolation() {
         let relay = spawn(Config {
             bind: "127.0.0.1:0".parse().unwrap(),
+            allowed_groups: test_allowed_groups(),
             ..Config::default()
         })
         .await
@@ -2130,6 +2294,7 @@ mod tests {
     async fn rejects_duplicate_old_epochs_and_cleans_unbind_disconnect() {
         let relay = spawn(Config {
             bind: "127.0.0.1:0".parse().unwrap(),
+            allowed_groups: test_allowed_groups(),
             ..Config::default()
         })
         .await
@@ -2170,4 +2335,13 @@ mod tests {
         assert!(matches!(members, Message::Members(_)));
         relay.shutdown().await.unwrap();
     }
+}
+
+#[cfg(test)]
+fn test_allowed_groups() -> AllowedGroups {
+    let text = (1u8..=16)
+        .map(|byte| format!("NB1-{}", format!("{byte:02x}").repeat(32)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    AllowedGroups::parse(&text).unwrap()
 }
