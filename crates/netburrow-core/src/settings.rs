@@ -43,6 +43,8 @@ pub struct Settings {
     #[serde(default = "enabled_by_default")]
     pub notifications_enabled: bool,
     #[serde(default)]
+    pub auto_check_updates: bool,
+    #[serde(default)]
     pub window_placement: Option<WindowPlacement>,
     #[serde(default)]
     pub start_minimized: bool,
@@ -63,6 +65,7 @@ impl Default for Settings {
             display_name: String::new(),
             minimize_on_close: false,
             notifications_enabled: true,
+            auto_check_updates: false,
             window_placement: None,
             start_minimized: false,
             recent_connections: Vec::new(),
@@ -203,6 +206,14 @@ pub fn save_notifications_enabled(enabled: bool) -> Result<(), String> {
     update_preferences_in(&config_directory(), |settings| settings.notifications_enabled = enabled)
 }
 
+pub fn save_auto_check_updates(enabled: bool) -> Result<(), String> {
+    save_auto_check_updates_in(&config_directory(), enabled)
+}
+
+fn save_auto_check_updates_in(dir: &Path, enabled: bool) -> Result<(), String> {
+    update_preferences_in(dir, |settings| settings.auto_check_updates = enabled)
+}
+
 pub fn save_window_placement(placement: WindowPlacement) -> Result<(), String> {
     update_preferences_in(&config_directory(), |settings| settings.window_placement = Some(placement))
 }
@@ -293,8 +304,10 @@ mod tests {
         let saved = Settings { server: "saved.example:24872".into(), group: new_group().unwrap(), ..Settings::default() };
         save_settings_in(&dir, &saved).unwrap();
         save_minimize_on_close_in(&dir, true).unwrap();
+        save_auto_check_updates_in(&dir, true).unwrap();
         let loaded = read_settings(&dir.join("settings.json")).unwrap();
         assert!(loaded.minimize_on_close);
+        assert!(loaded.auto_check_updates);
         assert_eq!(loaded.server, saved.server);
         assert_eq!(loaded.group, saved.group);
         let draft = Settings { server: "unsaved.example:24872".into(), group: new_group().unwrap(), game_path: "new-game-path".into(), transport: Transport::Udp, allow_late_hook: true, ..saved.clone() };
@@ -305,6 +318,7 @@ mod tests {
         assert_eq!(merged.game_path, draft.game_path);
         assert_eq!(merged.transport, Transport::Udp);
         assert!(merged.allow_late_hook && merged.minimize_on_close);
+        assert!(merged.auto_check_updates);
         let placement = WindowPlacement { normal: [50, 60, 690, 880], maximized: true };
         update_preferences_in(&dir, |settings| {
             settings.notifications_enabled = false;
@@ -327,6 +341,7 @@ mod tests {
         assert!(after_remove.start_minimized);
         fs::write(dir.join("settings.json"), b"{broken}").unwrap();
         assert!(save_minimize_on_close_in(&dir, false).is_err());
+        assert!(save_auto_check_updates_in(&dir, false).is_err());
         assert!(save_game_settings_in(&dir, &draft).is_err());
         assert_eq!(fs::read(dir.join("settings.json")).unwrap(), b"{broken}");
         fs::remove_file(dir.join("settings.json")).unwrap();
@@ -363,6 +378,7 @@ mod tests {
             display_name: "测试玩家".into(),
             minimize_on_close: true,
             notifications_enabled: false,
+            auto_check_updates: true,
             window_placement: Some(WindowPlacement { normal: [50, 60, 690, 880], maximized: false }),
             start_minimized: true,
             recent_connections: vec![RecentConnection { server: "localhost:24872".into(), group: new_group().unwrap() }],
@@ -374,6 +390,7 @@ mod tests {
         assert!(decoded.allow_late_hook);
         assert!(decoded.minimize_on_close);
         assert!(!decoded.notifications_enabled);
+        assert!(decoded.auto_check_updates);
         assert_eq!(decoded.window_placement, value.window_placement);
         assert!(decoded.start_minimized);
         assert_eq!(decoded.recent_connections, value.recent_connections);
@@ -383,6 +400,7 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("display_name");
         legacy.as_object_mut().unwrap().remove("minimize_on_close");
         legacy.as_object_mut().unwrap().remove("notifications_enabled");
+        legacy.as_object_mut().unwrap().remove("auto_check_updates");
         legacy.as_object_mut().unwrap().remove("window_placement");
         legacy.as_object_mut().unwrap().remove("start_minimized");
         legacy.as_object_mut().unwrap().remove("recent_connections");
@@ -390,6 +408,8 @@ mod tests {
         assert!(!legacy.allow_late_hook);
         assert!(!legacy.minimize_on_close);
         assert!(legacy.notifications_enabled);
+        assert!(!legacy.auto_check_updates);
+        assert!(!Settings::default().auto_check_updates);
         assert!(legacy.window_placement.is_none());
         assert!(!legacy.start_minimized);
         assert!(legacy.recent_connections.is_empty());

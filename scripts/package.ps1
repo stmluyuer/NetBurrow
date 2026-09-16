@@ -5,7 +5,9 @@ param(
     [switch]$ClientOnly,
     [switch]$KeepVersion,
     [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$')]
-    [string]$Version
+    [string]$Version,
+    [ValidateNotNullOrEmpty()]
+    [string]$ReleaseNotesPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,6 +16,9 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
 $PSDefaultParameterValues['*:Encoding'] = 'utf8'
 
+if ($PSBoundParameters.ContainsKey('ReleaseNotesPath')) {
+    $ReleaseNotesPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ReleaseNotesPath)
+}
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $repoRoot
 $cargoHome = Join-Path $repoRoot '.local\cargo'
@@ -44,6 +49,52 @@ $appZip = Join-Path $distRoot "NetBurrow-$Version-win-x64.zip"
 $relayZip = Join-Path $distRoot "NetBurrow-$Version-relay-source.zip"
 $appStage = Join-Path $distRoot "NetBurrow-$Version-win-x64"
 $relayStage = Join-Path $distRoot "NetBurrow-$Version-relay-source"
+
+function New-ReleaseManifestJson {
+    param([string]$NotesPath, [string]$ReleaseVersion)
+
+    if (-not (Test-Path -LiteralPath $NotesPath -PathType Leaf)) {
+        throw "更新说明文件不存在：$NotesPath"
+    }
+    if ((Get-Item -LiteralPath $NotesPath).Length -gt 65536) {
+        throw '更新说明文件超过 64 KiB，请缩短说明。'
+    }
+    $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+    $notes = [IO.File]::ReadAllText($NotesPath, $strictUtf8)
+    $characterCount = 0
+    for ($i = 0; $i -lt $notes.Length; $i++) {
+        $characterCount++
+        if ([char]::IsHighSurrogate($notes[$i]) -and $i + 1 -lt $notes.Length -and [char]::IsLowSurrogate($notes[$i + 1])) { $i++ }
+    }
+    if ([string]::IsNullOrWhiteSpace($notes) -or $characterCount -gt 12000) {
+        throw '更新说明不能为空，且不能超过 12000 个字符。'
+    }
+    $json = ([ordered]@{ version = $ReleaseVersion; notes = $notes } | ConvertTo-Json) + "`n"
+    if ($strictUtf8.GetByteCount($json) -gt 65536) {
+        throw '生成的更新清单超过 64 KiB，请缩短说明。'
+    }
+    return $json
+}
+
+# Validate before builds, version changes, or replacing existing package files.
+$releaseManifestJson = $null
+if ($PSBoundParameters.ContainsKey('ReleaseNotesPath')) {
+    $releaseManifestJson = New-ReleaseManifestJson -NotesPath $ReleaseNotesPath -ReleaseVersion $Version
+}
+
+function Write-UpdateManifest {
+    if ($null -eq $releaseManifestJson) { return }
+    $updateDirectory = Join-Path $distRoot "updates\$Version"
+    New-Item -ItemType Directory -Force -Path $updateDirectory | Out-Null
+    $updateManifestPath = Join-Path $updateDirectory 'latest.json'
+    [IO.File]::WriteAllText($updateManifestPath, $releaseManifestJson, [Text.UTF8Encoding]::new($false))
+    Write-Output "已生成：$updateManifestPath"
+    Write-Output '公开发行仓库：https://github.com/stmluyuer/NetBurrow-Releases'
+    Write-Output "创建标签 v$Version 的 Draft Release，仅上传以下两个文件，确认附件齐全后发布为 Latest："
+    Write-Output "  $appZip"
+    Write-Output "  $updateManifestPath"
+    Write-Output '不要上传 relay-source.zip、配置、日志或整个 dist 目录。'
+}
 
 if (-not (Test-Path -LiteralPath $cargo -PathType Leaf)) {
     throw "未找到仓库指定的 Rust 工具链：$cargo"
@@ -92,54 +143,6 @@ function Write-PortableZip {
     }
 }
 
-function Write-ThirdPartyNotices {
-    param(
-        [Parameter(Mandatory = $true)][string]$ManifestPath,
-        [Parameter(Mandatory = $true)][string]$Destination,
-        [string[]]$PackageNames
-    )
-
-    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
-    $metadataText = (& $cargo metadata --format-version 1 --manifest-path $ManifestPath --locked --offline | Out-String)
-    if ($LASTEXITCODE -ne 0) {
-        throw "无法读取 Cargo 依赖许可证元信息：$ManifestPath"
-    }
-    $metadata = $metadataText | ConvertFrom-Json
-    $lines = New-Object System.Collections.Generic.List[string]
-    $lines.Add('# Third-party notices')
-    $lines.Add('')
-    $lines.Add('This package was assembled from Cargo metadata. Each dependency has its own directory below, containing license, licence, copying, and notice material found in its locally resolved crate root or legal-material subdirectories.')
-    $lines.Add('')
-
-    foreach ($package in @($metadata.packages | Where-Object { $_.source -and (-not $PackageNames -or $_.name -in $PackageNames) } | Sort-Object name, version)) {
-        $license = if ($package.license) { $package.license } else { 'Not declared in Cargo metadata' }
-        $lines.Add("- $($package.name) $($package.version): $license")
-        $safePackage = ("{0}-{1}" -f $package.name, $package.version) -replace '[^A-Za-z0-9._-]', '_'
-        $packageDestination = Join-Path $Destination $safePackage
-        New-Item -ItemType Directory -Force -Path $packageDestination | Out-Null
-        $crateRoot = Split-Path -Parent $package.manifest_path
-        $legalItems = Get-ChildItem -LiteralPath $crateRoot -Force -Recurse | Where-Object {
-            $_.Name -like 'LICENSE*' -or $_.Name -like 'LICENCE*' -or $_.Name -like 'COPYING*' -or $_.Name -like 'NOTICE*'
-        }
-        foreach ($item in $legalItems) {
-            $relative = ($item.FullName.Substring($crateRoot.Length) -replace '^[\\/]+', '')
-            $destinationPath = Join-Path $packageDestination $relative
-            if ($item.PSIsContainer) {
-                Copy-Item -LiteralPath $item.FullName -Destination $destinationPath -Recurse -Force
-            } else {
-                New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destinationPath) | Out-Null
-                Copy-Item -LiteralPath $item.FullName -Destination $destinationPath -Force
-            }
-        }
-        if ($package.license_file -and (Test-Path -LiteralPath $package.license_file -PathType Leaf)) {
-            $leaf = Split-Path -Leaf $package.license_file
-            $safeName = ("metadata-{0}" -f $leaf) -replace '[^A-Za-z0-9._-]', '_'
-            Copy-Item -LiteralPath $package.license_file -Destination (Join-Path $packageDestination $safeName) -Force
-        }
-    }
-    Set-Content -LiteralPath (Join-Path $Destination 'THIRD-PARTY-NOTICES.md') -Value $lines -Encoding UTF8
-}
-
 New-Item -ItemType Directory -Force -Path $distRoot | Out-Null
 
 $appBinary = Join-Path $targetRoot 'x86_64-pc-windows-msvc\release\NetBurrow.exe'
@@ -181,11 +184,11 @@ Copy-Item -LiteralPath $appBinary -Destination (Join-Path $appStage 'NetBurrow.e
 Copy-Item -LiteralPath $injectorBinary -Destination (Join-Path $appStage 'netburrow-injector.exe') -Force
 Copy-Item -LiteralPath $hookDll -Destination (Join-Path $appStage 'netburrow_hook.dll') -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot 'README.md') -Destination (Join-Path $appStage 'README.md') -Force
-Write-ThirdPartyNotices -ManifestPath (Join-Path $repoRoot 'crates\netburrow-app\Cargo.toml') -Destination (Join-Path $appStage 'LICENSES') -PackageNames @('zip', 'typed-path')
 Get-ChildItem -LiteralPath $appStage -File -Recurse | Where-Object { $_.LastWriteTime.Year -lt 1980 -or $_.LastWriteTime.Year -gt 2107 } | ForEach-Object { $_.LastWriteTime = Get-Date }
 Write-PortableZip -Source $appStage -Destination $appZip
 Write-Output "已生成：$appZip"
 if ($ClientOnly) {
+    Write-UpdateManifest
     return
 }
 
@@ -228,8 +231,8 @@ Copy-Item -LiteralPath (Join-Path $repoRoot 'crates\netburrow-relay') -Destinati
 New-Item -ItemType Directory -Force -Path (Join-Path $relayStage 'docs') | Out-Null
 Copy-Item -LiteralPath (Join-Path $repoRoot 'docs\server-ai-handoff.md') -Destination (Join-Path $relayStage 'docs\server-ai-handoff.md') -Force
 Invoke-Cargo generate-lockfile --offline --manifest-path (Join-Path $relayStage 'Cargo.toml')
-Write-ThirdPartyNotices -ManifestPath (Join-Path $relayStage 'Cargo.toml') -Destination (Join-Path $relayStage 'LICENSES')
 Get-ChildItem -LiteralPath $relayStage -File -Recurse | Where-Object { $_.LastWriteTime.Year -lt 1980 -or $_.LastWriteTime.Year -gt 2107 } | ForEach-Object { $_.LastWriteTime = Get-Date }
 Write-PortableZip -Source $relayStage -Destination $relayZip
 
 Write-Output "已生成：$relayZip"
+Write-UpdateManifest

@@ -544,15 +544,54 @@ impl NetBurrowApp {
             ui.ctx().copy_text(version);
             self.notice = Some("版本信息已复制。".into());
         }
-        ui.hyperlink_to(
-            "查看发布版本 ↗",
-            "https://github.com/stmluyuer/NetBurrow/releases",
-        );
-        ui.hyperlink_to("项目主页 ↗", "https://github.com/stmluyuer/NetBurrow");
-        ui.hyperlink_to(
-            "反馈问题 ↗",
-            "https://github.com/stmluyuer/NetBurrow/issues/new",
-        );
+        ui.add_space(8.0);
+        let mut auto_check = self.settings.auto_check_updates;
+        if ui.add_enabled(self.smoke_test.is_none() && !cfg!(test), egui::Checkbox::new(&mut auto_check, "自动检测更新")).changed() {
+            match netburrow_core::save_auto_check_updates(auto_check) {
+                Ok(()) => {
+                    self.settings.auto_check_updates = auto_check;
+                    self.saved_settings.auto_check_updates = auto_check;
+                    self.update_check_at = None;
+                    if auto_check { self.update_check.begin(); }
+                }
+                Err(error) => self.notice = Some(error),
+            }
+        }
+        ui.add(egui::Label::new(RichText::new("默认关闭；开启时检查一次，以后每次启动检查一次。").small().color(MUTED)).wrap());
+        if ui.add_enabled(!self.update_check.is_checking() && self.smoke_test.is_none() && !cfg!(test), egui::Button::new("检查更新")).clicked() {
+            self.update_check_at = None;
+            self.update_check.begin();
+        }
+        if self.update_check.is_checking() {
+            ui.horizontal(|ui| { ui.spinner(); ui.label("正在检查…"); });
+        }
+        if let Some(result) = &self.update_check.result {
+            match result {
+                Ok(checked) => {
+                    let text = match checked.comparison {
+                        std::cmp::Ordering::Equal => "当前已是最新发布版本".to_owned(),
+                        std::cmp::Ordering::Less => format!("当前版本高于公开发布版本 v{}", checked.release.version),
+                        std::cmp::Ordering::Greater => format!("发现新版本 v{}", checked.release.version),
+                    };
+                    ui.label(RichText::new(text).color(ACCENT));
+                    if checked.comparison == std::cmp::Ordering::Greater {
+                        ui.hyperlink_to("下载新版 ZIP ↗", checked.release.download_url());
+                        ui.hyperlink_to("查看发布页 ↗", checked.release.page_url());
+                        egui::ScrollArea::vertical().id_salt("update-notes").max_height(140.0).show(ui, |ui| {
+                            ui.add(egui::Label::new(&checked.release.notes).wrap());
+                        });
+                        ui.add(egui::Label::new(RichText::new("下载后，请退出游戏和 NetBurrow，将完整压缩包解压到新文件夹，再启动新版；本机设置会保留。").small().color(MUTED)).wrap());
+                    }
+                }
+                Err(error) => {
+                    ui.label("暂时无法检查更新");
+                    ui.add(egui::Label::new(RichText::new(error).small().color(MUTED)).wrap());
+                }
+            }
+        }
+        ui.hyperlink_to("查看发布版本 ↗", update_check::RELEASES);
+        ui.hyperlink_to("项目主页 ↗", update_check::REPOSITORY);
+        ui.hyperlink_to("反馈问题 ↗", update_check::ISSUES);
         ui.add_space(18.0);
         if ui.button("附上诊断信息 →").clicked() {
             self.leave_page(Page::Diagnostics);

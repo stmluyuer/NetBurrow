@@ -78,6 +78,12 @@ impl NetBurrowApp {
                 });
                 ui.add_space(4.0);
                 ui.separator();
+                if let Some(release) = self.update_check.newer_release() {
+                    if ui.link(format!("发现新版本 v{} · 查看更新", release.version)).clicked() {
+                        self.open_settings();
+                        self.view.settings_tab = SettingsTab::About;
+                    }
+                }
                 ui.horizontal(|ui| {
                     if ui
                         .add(
@@ -338,6 +344,48 @@ mod tests {
             );
         }
         output
+    }
+
+    #[test]
+    fn update_results_render_without_changing_connection_state() {
+        use std::cmp::Ordering;
+        for comparison in [Ordering::Less, Ordering::Equal, Ordering::Greater] {
+            let context = egui::Context::default();
+            configure_fonts(&context);
+            configure_style(&context);
+            let mut app = NetBurrowApp::new(context.clone(), true, None);
+            assert!(app.update_check_at.is_none());
+            app.notice = Some("原有联机提示".into());
+            app.update_check.result = Some(Ok(update_check::CheckedRelease {
+                release: update_check::Release {
+                    version: "9.0.0".into(),
+                    notes: "中文更新说明，保持纯文本。\n".repeat(100),
+                },
+                comparison,
+            }));
+            let home = render(&mut app, &context, Vec2::new(520.0, 620.0));
+            let has_hint = text_shapes(&home).iter().any(|(text, _, _)| text.contains("查看更新"));
+            assert_eq!(has_hint, comparison == Ordering::Greater);
+            assert_eq!(app.notice.as_deref(), Some("原有联机提示"));
+            app.open_settings();
+            app.notice = Some("原有联机提示".into());
+            app.view.settings_tab = SettingsTab::About;
+            let output = render(&mut app, &context, Vec2::new(520.0, 620.0));
+            let texts = text_shapes(&output);
+            let expected = match comparison {
+                Ordering::Less => "当前版本高于公开发布版本",
+                Ordering::Equal => "当前已是最新发布版本",
+                Ordering::Greater => "发现新版本",
+            };
+            assert!(texts.iter().any(|(text, _, _)| text.starts_with(expected)));
+            assert_eq!(texts.iter().any(|(text, _, _)| text == "下载新版 ZIP ↗"), comparison == Ordering::Greater);
+            assert_eq!(app.notice.as_deref(), Some("原有联机提示"));
+            assert!(app.client.is_none());
+            app.update_check.result = Some(Err("网络不可达".into()));
+            let output = render(&mut app, &context, Vec2::new(520.0, 620.0));
+            assert!(text_shapes(&output).iter().any(|(text, _, _)| text == "暂时无法检查更新"));
+            assert_eq!(app.notice.as_deref(), Some("原有联机提示"));
+        }
     }
 
     #[test]

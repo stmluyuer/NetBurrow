@@ -14,6 +14,7 @@ mod recent_ui;
 mod file_picker;
 mod preview;
 mod diagnostics_bundle;
+mod update_check;
 use pages::{Page, SettingsTab, DiagnosticTab, ViewState};
 
 use std::path::Path;
@@ -83,6 +84,8 @@ struct NetBurrowApp {
     preflight: Option<PendingPreflight>,
     preflight_report: Option<(Settings, netburrow_core::PreflightReport)>,
     startup_enabled: bool,
+    update_check: update_check::UpdateCheck,
+    update_check_at: Option<Instant>,
     client: Option<Client>,
     last_snapshot: Snapshot,
     notice: Option<String>,
@@ -124,6 +127,8 @@ impl NetBurrowApp {
         };
         let stop_requested = Arc::new(AtomicBool::new(false));
         let quit_requested = Arc::new(AtomicBool::new(false));
+        let update_check_at = (!smoke_test && !cfg!(test) && settings.auto_check_updates)
+            .then(|| Instant::now() + Duration::from_millis(500));
         let mut app = Self {
             instance,
             saved_settings: settings.clone(),
@@ -132,6 +137,8 @@ impl NetBurrowApp {
             preflight: None,
             preflight_report: None,
             startup_enabled: false,
+            update_check: update_check::UpdateCheck::default(),
+            update_check_at,
             client: None,
             last_snapshot: Snapshot::default(),
             notice: None,
@@ -476,6 +483,11 @@ impl eframe::App for NetBurrowApp {
         }
         self.poll_core();
         self.poll_diagnostic_bundle();
+        if self.update_check_at.is_some_and(|at| Instant::now() >= at) {
+            self.update_check_at = None;
+            self.update_check.begin();
+        }
+        self.update_check.poll();
         self.preview_tick(context);
 
         if self

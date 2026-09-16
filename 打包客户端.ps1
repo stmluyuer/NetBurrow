@@ -4,7 +4,9 @@ param(
     [switch]$NonInteractive,
     [switch]$KeepVersion,
     [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$')]
-    [string]$Version
+    [string]$Version,
+    [ValidateNotNullOrEmpty()]
+    [string]$ReleaseNotesPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -22,6 +24,7 @@ try {
     Write-Host '首次构建可能较慢；后续运行会自动复用未变更的编译结果。'
     $packageArgs = @{ ClientOnly = $true; KeepVersion = $KeepVersion }
     if ($Version) { $packageArgs.Version = $Version }
+    if ($PSBoundParameters.ContainsKey('ReleaseNotesPath')) { $packageArgs.ReleaseNotesPath = $ReleaseNotesPath }
     & $packageScript @packageArgs
     Write-Host ''
     Write-Host '打包成功！文件路径见上方“已生成”，产物目录：' -ForegroundColor Green
