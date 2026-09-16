@@ -38,6 +38,9 @@ const DEFAULT_MAX_CLIENTS: usize = 1_024;
 const DEFAULT_QUEUE_MESSAGES: usize = 32;
 const DEFAULT_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_TOTAL_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+// Clients send a heartbeat every second. Bound silence and incomplete frames so
+// a lost FIN cannot keep an old socket attached throughout the recovery window.
+const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -349,7 +352,11 @@ async fn client_loop(
         }
         tokio::select! {
             _ = &mut writer_task => {terminal=failed.load(Ordering::Acquire);break;},
-            message = read_tcp_message(&mut reader) => {
+            message = tokio::time::timeout(CLIENT_READ_TIMEOUT, read_tcp_message(&mut reader)) => {
+                // Expiration closes this socket; never retry a partially consumed frame.
+                let message = message.unwrap_or_else(|_| {
+                    Err(io::Error::new(ErrorKind::TimedOut, "TCP receive deadline"))
+                });
                 let mut message = match message {
                     Ok(message) => message,
                     Err(error) => {
@@ -1475,6 +1482,108 @@ mod tests {
         assert!(peers.iter().any(|peer| peer.client_id == id && peer.steam_id == 101 && peer.epoch == 111));
         write_tcp_message(&mut resumed, &Message::SessionAck(sequence)).await.unwrap();
         write_tcp_message(&mut resumed, &Message::Leave).await.unwrap();
+        relay.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn silent_and_partial_connections_detach_without_fin_and_replay_on_resume() {
+        let relay = spawn(Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            allowed_groups: test_allowed_groups(),
+            ..Config::default()
+        })
+        .await
+        .unwrap();
+        let address = relay.local_addr();
+        let mut stalled = Vec::new();
+        for (index, partial) in [false, true].into_iter().enumerate() {
+            let (mut stream, id, _) = connect(address, group(index as u8 + 1)).await;
+            write_tcp_message(&mut stream, &Message::Ping(netburrow_protocol::RECOVERY_PING))
+                .await
+                .unwrap();
+            let Message::RecoveryOffer(key) = recv_until(&mut stream, |message| {
+                matches!(message, Message::RecoveryOffer(_))
+            }).await else { unreachable!() };
+            assert_healthy(&mut stream).await;
+            write_tcp_message(&mut stream, &Message::SessionFrame {
+                sequence: 1,
+                body: encode(&Message::Bind { steam_id: 101, epoch: 111 }).unwrap(),
+            }).await.unwrap();
+            let retained = recv_until(&mut stream, |message| {
+                matches!(message, Message::SessionFrame { .. })
+            }).await;
+            assert_eq!(
+                recv_until(&mut stream, |message| matches!(message, Message::SessionAck(_))).await,
+                Message::SessionAck(1)
+            );
+            // Keep the socket open and leave the membership record unacknowledged.
+            if partial {
+                let frame = encode(&Message::Ping(99)).unwrap();
+                stream.write_all(&frame[..2]).await.unwrap();
+            }
+            let mut early = TcpStream::connect(address).await.unwrap();
+            write_tcp_message(&mut early, &Message::Resume { client_id: id, key, received: 0 })
+                .await
+                .unwrap();
+            assert_eq!(
+                recv_until(&mut early, |_| true).await,
+                Message::Error("session resume pending".into())
+            );
+            stalled.push((stream, id, key, retained));
+        }
+
+        // Normal heartbeats keep another idle client attached for the whole wait.
+        let (mut healthy, _, _) = connect(address, group(3)).await;
+        let (stop, mut stopped) = oneshot::channel();
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                assert_healthy(&mut healthy).await;
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                }
+            }
+            healthy
+        });
+        for (stream, ..) in &mut stalled {
+            let closed = timeout(CLIENT_READ_TIMEOUT + Duration::from_secs(2), read_tcp_message(stream))
+                .await
+                .expect("Relay must close the stale socket without a client FIN");
+            assert!(closed.is_err());
+        }
+        stop.send(()).unwrap();
+        let mut healthy = heartbeat.await.unwrap();
+        assert_healthy(&mut healthy).await;
+
+        for (_old_socket, id, key, retained) in stalled {
+            let mut resumed = timeout(Duration::from_secs(2), async {
+                loop {
+                    let mut socket = TcpStream::connect(address).await.unwrap();
+                    write_tcp_message(&mut socket, &Message::Resume { client_id: id, key, received: 0 })
+                        .await
+                        .unwrap();
+                    match read_tcp_message(&mut socket).await.unwrap() {
+                        Message::Resumed { client_id, received } => {
+                            assert_eq!((client_id, received), (id, 1));
+                            break socket;
+                        }
+                        Message::Error(reason) if reason == "session resume pending" => {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        other => panic!("stale session must resume: {other:?}"),
+                    }
+                }
+            }).await.unwrap();
+            assert_eq!(recv_until(&mut resumed, |_| true).await, retained);
+            let Message::SessionFrame { sequence, body } = recv_until(&mut resumed, |_| true).await
+                else { panic!("expected current membership after replay") };
+            let Message::Members(peers) = netburrow_protocol::decode_session_body(&body).unwrap()
+                else { panic!("expected retained game binding") };
+            assert_eq!(peers, vec![Peer { client_id: id, steam_id: 101, epoch: 111 }]);
+            write_tcp_message(&mut resumed, &Message::SessionAck(sequence)).await.unwrap();
+            assert_healthy(&mut resumed).await;
+            write_tcp_message(&mut resumed, &Message::Leave).await.unwrap();
+        }
         relay.shutdown().await.unwrap();
     }
 

@@ -527,7 +527,7 @@ mod runtime {
                     if *stop.borrow(){return Err(io::Error::new(io::ErrorKind::Interrupted,"recovery stopped"));}
                     if Instant::now()>=deadline{return Err(io::Error::new(io::ErrorKind::TimedOut,"Relay session recovery exhausted"));}
                     let attempt=async {
-                        let mut socket=TcpStream::connect(&server).await?;socket.set_nodelay(true)?;
+                        let mut socket=TcpStream::connect(server.trim()).await?;socket.set_nodelay(true)?;
                         write(&mut socket,&Message::Resume{client_id,key,received}).await?;
                         match read(&mut socket).await? {
                             Message::Resumed {client_id:id,received} if id==client_id=>Ok((socket,received)),
@@ -1384,7 +1384,7 @@ mod runtime {
         }
 
         #[tokio::test]
-        async fn relay_resume_preserves_identity_queues_and_unacknowledged_reliable_data() {
+        async fn relay_resume_trims_address_and_preserves_identity_and_reliable_data() {
             let relay=spawn(Config{bind:"127.0.0.1:0".parse().unwrap(),allowed_groups:AllowedGroups::parse(&format!("NB1-{}", "09".repeat(32))).unwrap(),..Config::default()}).await.unwrap();
             let address=relay.local_addr().to_string();
             let mut a=Network::connect(&address,[9;32],Transport::Tcp).await.unwrap();
@@ -1403,7 +1403,8 @@ mod runtime {
             for i in 0..8 {assert_eq!(wait_packet(&mut b,false).await.payload,vec![i]);}
             assert!(a.writer.session.window.lock().unwrap().pending_len()>0);
             let (_stop,stopped)=watch::channel(false);
-            let recovery=a.begin_resume(address.clone(),stopped).await.unwrap();
+            // Settings validation and the initial connection accept surrounding whitespace.
+            let recovery=a.begin_resume(format!(" \t{address}\r\n"),stopped).await.unwrap();
             for _ in 0..256 {a.send(&Message::Ping(123)).await.unwrap();}
             // The source can keep accepting game data while its connection is being restored.
             for i in 8..16 {let mut p=packet(101,202,1001,2002,3);p.payload=vec![i];a.packet(p).await.unwrap();}
