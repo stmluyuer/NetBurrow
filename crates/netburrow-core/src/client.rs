@@ -463,8 +463,12 @@ mod runtime {
         }
         async fn send(&mut self, message: &Message) -> io::Result<()> {
             if self.recovering && !netburrow_protocol::replayable(message) {return Ok(());}
-            if matches!(message, Message::Bind { .. }) {
+            if let Message::Bind { epoch, .. } = message {
                 self.udp_bound = false;
+                // These queues outlive Hook instances, including games restarted during recovery.
+                for queue in [&self.writer.queue, &self.events.tcp, &self.events.udp] {
+                    queue.set_local_epoch(*epoch);
+                }
             }
             self.writer.send(message.clone()).map(|_| ())
         }
@@ -1393,8 +1397,22 @@ mod runtime {
             b.send(&Message::Bind{steam_id:202,epoch:2002}).await.unwrap();
             wait_member(&mut a,202,2002).await;wait_member(&mut b,101,1001).await;
             for n in [&mut a,&mut b] {
+                // Startup queues both negotiations and a heartbeat without yielding.
+                n.send(&Message::Ping(netburrow_protocol::DIAGNOSTICS_PING)).await.unwrap();
                 n.send(&Message::Ping(netburrow_protocol::RECOVERY_PING)).await.unwrap();
-                timeout(Duration::from_secs(2),async{loop{if let Some(NetworkEvent::Tcp(Message::RecoveryOffer(key)))=n.events.recv().await{n.resume_key=Some(key);break;}}}).await.unwrap();
+                n.send(&Message::Ping(123)).await.unwrap();
+                let mut diagnostics = false;
+                let mut heartbeat = false;
+                timeout(Duration::from_secs(2), async {
+                    while !diagnostics || !heartbeat || n.resume_key.is_none() {
+                        match n.events.recv().await {
+                            Some(NetworkEvent::Tcp(Message::RecoveryOffer(key))) => n.resume_key = Some(key),
+                            Some(NetworkEvent::Tcp(Message::DiagnosticsPeers(peers))) => diagnostics = peers.contains(&n.client_id),
+                            Some(NetworkEvent::Tcp(Message::Pong(123))) => heartbeat = true,
+                            _ => {}
+                        }
+                    }
+                }).await.expect("startup lost a capability negotiation or heartbeat");
             }
             let original_id=a.client_id;
             // Lose ACKs without losing the application's outbound reliable frames.
@@ -1608,6 +1626,84 @@ mod runtime {
                     .contains("状态检查")
             );
             task.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn game_restart_clears_isolation_but_session_resume_preserves_it() {
+            use netburrow_protocol::local::Admission;
+
+            let relay = spawn(Config {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                allowed_groups: AllowedGroups::parse(&format!("NB1-{}", "06".repeat(32))).unwrap(),
+                ..Config::default()
+            }).await.unwrap();
+            let address = relay.local_addr().to_string();
+            let mut a = Network::connect(&address, [6; 32], Transport::Tcp).await.unwrap();
+            let mut b = Network::connect(&address, [6; 32], Transport::Tcp).await.unwrap();
+            a.send(&Message::Bind { steam_id: 101, epoch: 1001 }).await.unwrap();
+            b.send(&Message::Bind { steam_id: 202, epoch: 2002 }).await.unwrap();
+            wait_member(&mut a, 202, 2002).await;
+            wait_member(&mut b, 101, 1001).await;
+            a.send(&Message::Ping(netburrow_protocol::RECOVERY_PING)).await.unwrap();
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(NetworkEvent::Tcp(Message::RecoveryOffer(key))) = a.events.recv().await {
+                        a.resume_key = Some(key);
+                        break;
+                    }
+                }
+            }).await.unwrap();
+
+            let outgoing = Message::Data(packet(101, 202, 1001, 2002, 2));
+            let incoming = Message::Data(packet(202, 101, 2002, 1001, 2));
+            for (queue, message) in [
+                (&a.writer.queue, &outgoing),
+                (&a.events.tcp, &incoming),
+                (&a.events.udp, &incoming),
+            ] {
+                queue.fail_peer(202, 2002);
+                assert_eq!(queue.post(message.clone()).unwrap(), Admission::Dropped);
+            }
+            let original_id = a.client_id;
+            let (_stop, stopped) = watch::channel(false);
+            let recovery = a.begin_resume(address, stopped).await.unwrap();
+            let (socket, received) = timeout(Duration::from_secs(3), recovery).await.unwrap().unwrap().unwrap();
+            a.finish_resume(socket, received).unwrap();
+            // Rebinding the same game must not undo its terminal peer fault either.
+            a.send(&Message::Bind { steam_id: 101, epoch: 1001 }).await.unwrap();
+            for (queue, message) in [
+                (&a.writer.queue, &outgoing),
+                (&a.events.tcp, &incoming),
+                (&a.events.udp, &incoming),
+            ] {
+                assert_eq!(queue.post(message.clone()).unwrap(), Admission::Dropped);
+            }
+
+            disconnect_hook(&mut None, &mut None, &mut a).await;
+            a.send(&Message::Bind { steam_id: 101, epoch: 1002 }).await.unwrap();
+            for (queue, old) in [
+                (&a.writer.queue, &outgoing),
+                (&a.events.tcp, &incoming),
+                (&a.events.udp, &incoming),
+            ] {
+                assert_eq!(queue.fault(), None, "old faults leaked into the new game");
+                assert_eq!(queue.post(old.clone()).unwrap(), Admission::Dropped, "late old-game data must not refill the new queue");
+            }
+            wait_member(&mut a, 101, 1002).await;
+            wait_member(&mut b, 101, 1002).await;
+            let outgoing = packet(101, 202, 1002, 2002, 2);
+            let incoming = packet(202, 101, 2002, 1002, 2);
+            a.packet(outgoing.clone()).await.unwrap();
+            assert_eq!(wait_packet(&mut b, false).await, outgoing);
+            b.packet(incoming.clone()).await.unwrap();
+            assert_eq!(wait_packet(&mut a, false).await, incoming);
+            let udp = Message::Data(packet(202, 101, 2002, 1002, 0));
+            assert_eq!(a.events.udp.post(udp.clone()).unwrap(), Admission::Queued);
+            assert_eq!(a.events.udp.recv().await.unwrap().unwrap(), udp);
+            assert_eq!(a.client_id, original_id);
+            drop(a);
+            drop(b);
+            relay.shutdown().await.unwrap();
         }
 
         #[tokio::test]

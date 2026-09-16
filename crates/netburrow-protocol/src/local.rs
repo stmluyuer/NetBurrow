@@ -71,6 +71,7 @@ pub struct Frames {
     failed: HashSet<(u64, u64)>,
     faults: VecDeque<(u64, u64)>,
     incoming: bool,
+    local_epoch: Option<u64>,
     bytes: usize,
     packets: usize,
     pub dropped: u64,
@@ -102,6 +103,7 @@ impl Frames {
             failed: HashSet::new(),
             faults: VecDeque::new(),
             incoming,
+            local_epoch: None,
             bytes: 0,
             packets: 0,
             dropped: 0,
@@ -114,6 +116,24 @@ impl Frames {
         } else {
             (p.to, p.target_epoch)
         }
+    }
+    /// Game replacement resets isolation; resuming the same epoch does not.
+    pub fn set_local_epoch(&mut self, epoch: u64) {
+        if self.local_epoch == Some(epoch) {
+            return;
+        }
+        self.local_epoch = Some(epoch);
+        self.failed.clear();
+        self.faults.clear();
+        let incoming = self.incoming;
+        self.messages.retain(|m| match &m.message {
+            Message::Data(p) => {
+                epoch != 0 && (if incoming { p.target_epoch } else { p.source_epoch }) == epoch
+            }
+            _ => true,
+        });
+        self.last_peer = None;
+        self.recount();
     }
     pub fn fail(&mut self, peer: u64, epoch: u64) {
         if self.failed.insert((peer, epoch)) {
@@ -145,6 +165,10 @@ impl Frames {
                 .retain(|(id, epoch)| peers.iter().any(|p| p.steam_id == *id && p.epoch == *epoch));
         }
         if let Message::Data(p) = &message {
+            let local_epoch = if self.incoming { p.target_epoch } else { p.source_epoch };
+            if self.local_epoch.is_some_and(|epoch| epoch == 0 || epoch != local_epoch) {
+                return Ok(Admission::Dropped);
+            }
             let key = self.key(p);
             if self.failed.contains(&key) {
                 return Ok(Admission::Dropped);
@@ -239,10 +263,7 @@ impl Frames {
             self.packets += 1;
         } else {
             // Replace snapshots/probes only inside the current barrier segment.
-            if matches!(
-                message,
-                Message::IpcHealth(_) | Message::Status(_) | Message::Ping(_) | Message::SessionAck(_)
-            ) {
+            if coalescible(&message) {
                 let kind = std::mem::discriminant(&message);
                 let start = self
                     .messages
@@ -250,7 +271,10 @@ impl Frames {
                     .rposition(|m| barrier(m))
                     .map_or(0, |i| i + 1);
                 if let Some(index) = (start..self.messages.len())
-                    .find(|&i| std::mem::discriminant(&self.messages[i].message) == kind)
+                    .find(|&i| {
+                        coalescible(&self.messages[i].message)
+                            && std::mem::discriminant(&self.messages[i].message) == kind
+                    })
                 {
                     self.messages[index] = Queued { message, udp };
                     return Ok(Admission::Queued);
@@ -303,6 +327,14 @@ impl Frames {
                 self.bytes += p.payload.len();
             }
         }
+    }
+}
+fn coalescible(message: &Message) -> bool {
+    match message {
+        Message::IpcHealth(_) | Message::Status(_) | Message::SessionAck(_) => true,
+        // Capability negotiation must survive both other negotiations and heartbeats.
+        Message::Ping(value) => !matches!(*value, crate::DIAGNOSTICS_PING | crate::RECOVERY_PING),
+        _ => false,
     }
 }
 fn barrier(m: &Message) -> bool {

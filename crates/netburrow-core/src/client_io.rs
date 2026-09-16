@@ -141,6 +141,13 @@ impl Mailbox {
             .fail(peer, epoch);
         self.notify.notify_one();
     }
+    pub fn set_local_epoch(&self, epoch: u64) {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .frames
+            .set_local_epoch(epoch);
+    }
     pub fn dropped(&self) -> u64 {
         self.state
             .lock()
