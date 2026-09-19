@@ -342,6 +342,7 @@ mod runtime {
         }
     }
     struct Network {
+        group: Group,
         resume_key: Option<Token>,
         recovering: bool,
         diagnostics: crate::path_diagnostics::Tracker,
@@ -365,6 +366,9 @@ mod runtime {
     }
     impl Network {
         async fn connect(server: &str, group: Group, transport: Transport) -> io::Result<Self> {
+            Self::connect_with_budgets(server, group, transport, Budget::default(), Budget::default()).await
+        }
+        async fn connect_with_budgets(server: &str, group: Group, transport: Transport, incoming_budget: Budget, outgoing_budget: Budget) -> io::Result<Self> {
             let socket = timeout(IO_TIMEOUT, TcpStream::connect(server))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))??;
@@ -402,8 +406,6 @@ mod runtime {
                     ));
                 }
             };
-            let incoming_budget = Budget::default();
-            let outgoing_budget = Budget::default();
             let events = NetworkEvents {
                 tcp: Mailbox::with_budget(true, incoming_budget.clone()),
                 udp: Mailbox::with_budget(true, incoming_budget.clone()),
@@ -447,6 +449,7 @@ mod runtime {
                 None
             };
             Ok(Self {
+                group,
                 resume_key:None,recovering:false,
                 diagnostics: Default::default(),
                 writer,
@@ -513,8 +516,12 @@ mod runtime {
     fn recoverable(error:&io::Error)->bool {
         !matches!(error.kind(),io::ErrorKind::InvalidData|io::ErrorKind::InvalidInput|io::ErrorKind::PermissionDenied|io::ErrorKind::Unsupported)
     }
+    enum RelayRecovery {
+        Resumed(TcpStream, u64),
+        Rejoined(Box<Network>),
+    }
     impl Network {
-        async fn begin_resume(&mut self,server:String,mut stop:watch::Receiver<bool>)->io::Result<Task<io::Result<(TcpStream,u64)>>> {
+        async fn begin_resume(&mut self,server:String,mut stop:watch::Receiver<bool>)->io::Result<Task<io::Result<RelayRecovery>>> {
             let key=self.resume_key.ok_or_else(||io::Error::new(io::ErrorKind::ConnectionReset,"Relay disconnected; original session recovery unavailable"))?;
             self.recovering=true;self.udp_bound=false;
             for task in &self.tasks {task.abort();}
@@ -525,8 +532,12 @@ mod runtime {
             self.udp=None;
             self.tasks.truncate(1);
             let received=self.writer.session.received();let client_id=self.client_id;
+            let group=self.group;
+            let incoming_budget=self.incoming_budget.clone();
+            let outgoing_budget=self.outgoing_budget.clone();
             Ok(tokio::spawn(async move {
                 let deadline=Instant::now()+netburrow_protocol::RECOVERY_TIMEOUT;
+                let mut attempts=0_u32;
                 loop {
                     if *stop.borrow(){return Err(io::Error::new(io::ErrorKind::Interrupted,"recovery stopped"));}
                     if Instant::now()>=deadline{return Err(io::Error::new(io::ErrorKind::TimedOut,"Relay session recovery exhausted"));}
@@ -534,16 +545,33 @@ mod runtime {
                         let mut socket=TcpStream::connect(server.trim()).await?;socket.set_nodelay(true)?;
                         write(&mut socket,&Message::Resume{client_id,key,received}).await?;
                         match read(&mut socket).await? {
-                            Message::Resumed {client_id:id,received} if id==client_id=>Ok((socket,received)),
+                            Message::Resumed {client_id:id,received} if id==client_id=>Ok(RelayRecovery::Resumed(socket,received)),
+                            Message::Error(reason) if reason==netburrow_protocol::RESUME_REJOIN_ALLOWED=>{
+                                drop(socket);
+                                let replacement=Self::connect_with_budgets(server.trim(),group,Transport::Tcp,incoming_budget.clone(),outgoing_budget.clone()).await?;
+                                Ok(RelayRecovery::Rejoined(Box::new(replacement)))
+                            }
                             Message::Error(reason) if reason=="session resume pending"=>Err(io::Error::new(io::ErrorKind::WouldBlock,"waiting for old connection to detach")),
                             _=>Err(io::Error::new(io::ErrorKind::PermissionDenied,"Relay rejected original session recovery")),
                         }
                     };
                     let attempt_limit=Duration::from_secs(5).min(deadline.saturating_duration_since(Instant::now()));
                     let result=tokio::select!{_=stop.changed()=>return Err(io::Error::new(io::ErrorKind::Interrupted,"recovery stopped")),r=timeout(attempt_limit,attempt)=>r};
-                    match result {Ok(Ok(result))=>return Ok(result),Ok(Err(e)) if !recoverable(&e)=>return Err(e),_=>{}}
+                    attempts=attempts.saturating_add(1);
+                    match result {
+                        Ok(Ok(result))=>return Ok(result),
+                        result=>{
+                            let kind=match result {Ok(Err(e))=>e.kind(),_=>io::ErrorKind::TimedOut};
+                            // A rejected attempt is not the end of the recovery budget.
+                            // Keep the Hook alive; never infer permission to Join from a generic error.
+                            if attempts==1 || attempts%20==0 {
+                                log("WARN","relay recovery",&format!("attempt={attempts} failed kind={kind:?}; retrying within 120s budget"));
+                            }
+                        }
+                    }
                     if Instant::now()>=deadline {return Err(io::Error::new(io::ErrorKind::TimedOut,"Relay session recovery exhausted"));}
-                    tokio::select!{_=stop.changed()=>return Err(io::Error::new(io::ErrorKind::Interrupted,"recovery stopped")),_=tokio::time::sleep(Duration::from_millis(250))=>{}}
+                    let delay=Duration::from_millis(250).min(deadline.saturating_duration_since(Instant::now()));
+                    tokio::select!{_=stop.changed()=>return Err(io::Error::new(io::ErrorKind::Interrupted,"recovery stopped")),_=tokio::time::sleep(delay)=>{}}
                 }
             }))
         }
@@ -552,6 +580,29 @@ mod runtime {
             let(input,output)=socket.into_split();self.events.tcp.reopen();self.writer.rebind(output);
             self.tasks[0]=socket_reader(input,self.events.tcp.clone(),false,self.writer.session.clone(),self.writer.queue.clone());
             self.recovering=false;Ok(())
+        }
+        async fn finish_recovery(&mut self, recovery: RelayRecovery, hook: &mut Option<Hook>) -> io::Result<bool> {
+            let RelayRecovery::Rejoined(mut replacement)=recovery else {
+                if let RelayRecovery::Resumed(socket,received)=recovery {self.finish_resume(socket,received)?;}
+                return Ok(false);
+            };
+            replacement.writer.completed.fetch_add(self.writer.count(),std::sync::atomic::Ordering::Relaxed);
+            replacement.udp_written=self.udp_written;
+            // A fresh Relay has no receive watermark for the old replay window.
+            // Drop that window and its queues instead of replaying possibly delivered data twice.
+            *self=*replacement;
+            if let Some(h)=hook.as_mut() {
+                h.bound=false;
+                h.acknowledged=false;
+                self.send(&Message::Bind {steam_id:h.steam_id,epoch:h.epoch}).await?;
+                // Rejoining the Relay does not reset failed peers in the same game instance.
+                for &(peer,epoch) in &h.failed {
+                    for queue in [&self.writer.queue,&self.events.tcp,&self.events.udp] {queue.fail_peer(peer,epoch);}
+                }
+            }
+            self.send(&Message::Ping(netburrow_protocol::DIAGNOSTICS_PING)).await?;
+            self.send(&Message::Ping(netburrow_protocol::RECOVERY_PING)).await?;
+            Ok(true)
         }
     }
 
@@ -960,7 +1011,7 @@ mod runtime {
         let mut candidate: Option<Task<io::Result<Hook>>> = None;
         let mut discovery: Option<Task<io::Result<Vec<GameProcess>>>> = None;
         let mut next_discovery = Instant::now();
-        let mut relay_recovery:Option<Task<io::Result<(TcpStream,u64)>>>=None;
+        let mut relay_recovery:Option<Task<io::Result<RelayRecovery>>>=None;
         let mut ipc_recovery:Option<Task<io::Result<TcpStream>>>=None;
         let result = async {
             network.send(&Message::Ping(netburrow_protocol::DIAGNOSTICS_PING)).await?;
@@ -970,11 +1021,20 @@ mod runtime {
                     _ = stop.changed() => return Ok(()),
                     recovered=async {match relay_recovery.as_mut(){Some(task)=>task.await,None=>std::future::pending().await}}=>{
                         relay_recovery=None;
-                        let(socket,received)=recovered.map_err(io::Error::other)??;
-                        network.finish_resume(socket,received)?;network.bind_udp().await?;
+                        let recovery=recovered.map_err(io::Error::other)??;
+                        let rejoined=network.finish_recovery(recovery,&mut hook).await?;
+                        network.bind_udp().await?;
                         change(state,|s|{s.relay_recovering=false;s.relay_recoveries+=1;s.ping_ms=None;s.rtt_samples.clear();});
-                        log("INFO","relay recovery","original session resumed; pending reliable frames replayed with duplicate suppression");
-                        status(state,if hook.as_ref().is_some_and(|h|h.acknowledged){Phase::Ready}else{Phase::WaitingForGame},"原 Relay 会话已恢复；请确认游戏是否继续推进");
+                        if rejoined {
+                            peers.clear();status_supported=false;
+                            change(state,|s|{s.peers.clear();s.path_diagnostics=Default::default();});
+                            last_report=Instant::now()-Duration::from_secs(3);
+                            log("WARN","relay recovery","Relay allowed fresh join; keeping Hook and rebinding current game; old Relay replay data discarded");
+                            status(state,if hook.is_some(){Phase::Attaching}else{Phase::WaitingForGame},"已重新加入 Relay，正在恢复游戏接入；请确认游戏是否继续推进");
+                        } else {
+                            log("INFO","relay recovery","original session resumed; pending reliable frames replayed with duplicate suppression");
+                            status(state,if hook.as_ref().is_some_and(|h|h.acknowledged){Phase::Ready}else{Phase::WaitingForGame},"原 Relay 会话已恢复；请确认游戏是否继续推进");
+                        }
                     }
                     event = network.events.recv(), if relay_recovery.is_none() => {
                         match event {
@@ -1362,6 +1422,112 @@ mod runtime {
         use netburrow_relay::{AllowedGroups, Config, spawn};
 
         #[tokio::test]
+        async fn relay_resume_rejection_retries_until_cancelled_without_joining() {
+            let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address=listener.local_addr().unwrap().to_string();
+            let (retried, retry_seen)=tokio::sync::oneshot::channel();
+            let server=tokio::spawn(async move {
+                let (mut socket,_)=listener.accept().await.unwrap();
+                assert!(matches!(read(&mut socket).await.unwrap(),Message::Join {..}));
+                write(&mut socket,&Message::Welcome {client_id:7,udp_token:[0;16]}).await.unwrap();
+                for _ in 0..2 {
+                    let (mut retry,_)=listener.accept().await.unwrap();
+                    assert!(matches!(read(&mut retry).await.unwrap(),Message::Resume {client_id:7,..}),"generic rejection must not permit Join");
+                    write(&mut retry,&Message::Error("session resume rejected".into())).await.unwrap();
+                }
+                let _=retried.send(());
+                std::future::pending::<()>().await;
+            });
+            let mut network=Network::connect(&address,[9;32],Transport::Tcp).await.unwrap();
+            network.resume_key=Some([7;16]);
+            let (stop,stopped)=watch::channel(false);
+            let recovery=network.begin_resume(address,stopped).await.unwrap();
+            timeout(Duration::from_secs(2),retry_seen).await.expect("rejection ended recovery instead of retrying").unwrap();
+            assert!(!recovery.is_finished());
+            stop.send(true).unwrap();
+            let outcome=timeout(Duration::from_secs(1),recovery).await.unwrap().unwrap();
+            assert!(matches!(outcome,Err(e) if e.kind()==io::ErrorKind::Interrupted));
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn relay_resume_rejection_can_later_resume_original_session() {
+            let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address=listener.local_addr().unwrap().to_string();
+            let server=tokio::spawn(async move {
+                let (mut socket,_)=listener.accept().await.unwrap();
+                assert!(matches!(read(&mut socket).await.unwrap(),Message::Join {..}));
+                write(&mut socket,&Message::Welcome {client_id:7,udp_token:[0;16]}).await.unwrap();
+                let (mut retry,_)=listener.accept().await.unwrap();
+                assert!(matches!(read(&mut retry).await.unwrap(),Message::Resume {client_id:7,..}));
+                write(&mut retry,&Message::Error("session resume rejected".into())).await.unwrap();
+                let (mut retry,_)=listener.accept().await.unwrap();
+                assert!(matches!(read(&mut retry).await.unwrap(),Message::Resume {client_id:7,..}));
+                write(&mut retry,&Message::Resumed {client_id:7,received:0}).await.unwrap();
+                assert_eq!(read(&mut retry).await.unwrap(),Message::Ping(42));
+                write(&mut retry,&Message::Pong(42)).await.unwrap();
+                std::future::pending::<()>().await;
+            });
+            let mut network=Network::connect(&address,[9;32],Transport::Tcp).await.unwrap();
+            network.resume_key=Some([7;16]);
+            let (_stop,stopped)=watch::channel(false);
+            let recovery=network.begin_resume(address,stopped).await.unwrap();
+            let recovery=timeout(Duration::from_secs(2),recovery).await.unwrap().unwrap().unwrap();
+            assert!(!network.finish_recovery(recovery,&mut None).await.unwrap());
+            assert_eq!(network.client_id,7);
+            network.send(&Message::Ping(42)).await.unwrap();
+            assert!(matches!(timeout(Duration::from_secs(1),network.events.recv()).await.unwrap(),Some(NetworkEvent::Tcp(Message::Pong(42)))));
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn relay_fresh_join_keeps_hook_identity_and_discards_old_replay() {
+            let config=Config {bind:"127.0.0.1:0".parse().unwrap(),allowed_groups:AllowedGroups::parse(&format!("NB1-{}","09".repeat(32))).unwrap(),..Config::default()};
+            let relay=spawn(config.clone()).await.unwrap();
+            let address=relay.local_addr();
+            let mut network=Network::connect(&address.to_string(),[9;32],Transport::Tcp).await.unwrap();
+            network.send(&Message::Bind {steam_id:101,epoch:1001}).await.unwrap();
+            wait_member(&mut network,101,1001).await;
+            network.send(&Message::Ping(netburrow_protocol::RECOVERY_PING)).await.unwrap();
+            timeout(Duration::from_secs(2),async {
+                loop {if let Some(NetworkEvent::Tcp(Message::RecoveryOffer(key)))=network.events.recv().await {network.resume_key=Some(key);break;}}
+            }).await.unwrap();
+            // Model an attached game with a live IPC socket throughout Relay restart.
+            let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut game=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (socket,_)=listener.accept().await.unwrap();
+            write(&mut game,&Message::IpcHelloV2 {nonce:[7;16],pid:42,steam_id:101,epoch:1001,capabilities:IPC_CAPABILITIES}).await.unwrap();
+            let mut hook=Some(Hook::accept(socket,42,[7;16],1001,network.incoming_budget.clone(),network.outgoing_budget.clone()).await.unwrap());
+            assert_eq!(read(&mut game).await.unwrap(),Message::IpcAccepted(IPC_CAPABILITIES));
+            {let h=hook.as_mut().unwrap();h.ready=true;h.bound=true;h.acknowledged=true;h.failed.insert((303,3003));}
+            relay.shutdown().await.unwrap();
+            // This old record must not be sent to a fresh Relay with a new receive watermark.
+            network.writer.session.window.lock().unwrap().retain(encode(&Message::Bind {steam_id:999,epoch:9999}).unwrap()).unwrap();
+            let relay=spawn(Config {bind:address,..config}).await.unwrap();
+            let (_stop,stopped)=watch::channel(false);
+            let recovery=network.begin_resume(address.to_string(),stopped).await.unwrap();
+            let recovery=timeout(Duration::from_secs(3),recovery).await.unwrap().unwrap().unwrap();
+            assert!(network.finish_recovery(recovery,&mut hook).await.unwrap());
+            assert_eq!(network.writer.session.window.lock().unwrap().pending_len(),0);
+            let h=hook.as_ref().unwrap();
+            assert_eq!((h.pid,h.steam_id,h.epoch),(42,101,1001));
+            assert!(h.ready && !h.bound && !h.acknowledged);
+            assert!(h.failed.contains(&(303,3003)));
+            assert_eq!(network.writer.queue.post(Message::Data(packet(101,303,1001,3003,2))).unwrap(),netburrow_protocol::local::Admission::Dropped);
+            wait_member(&mut network,101,1001).await;
+            let mut peer=Network::connect(&address.to_string(),[9;32],Transport::Tcp).await.unwrap();
+            peer.send(&Message::Bind {steam_id:202,epoch:2002}).await.unwrap();
+            wait_member(&mut network,202,2002).await;
+            wait_member(&mut peer,101,1001).await;
+            network.packet(packet(101,202,1001,2002,2)).await.unwrap();
+            assert_eq!(wait_packet(&mut peer,false).await.from,101);
+            // The same local socket remains usable; no Stop or new injection occurred.
+            hook.as_mut().unwrap().send(&Message::Pong(42)).await.unwrap();
+            assert_eq!(read(&mut game).await.unwrap(),Message::Pong(42));
+            drop(network);drop(peer);drop(hook);relay.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
         async fn hook_resume_keeps_pending_frames_and_rejects_changed_identity() {
             let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
             let mut game=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
@@ -1428,7 +1594,7 @@ mod runtime {
             for i in 8..16 {let mut p=packet(101,202,1001,2002,3);p.payload=vec![i];a.packet(p).await.unwrap();}
             let mut incoming=packet(202,101,2002,1001,2);incoming.payload=b"during recovery".to_vec();
             b.packet(incoming.clone()).await.unwrap();
-            let (socket,received)=timeout(Duration::from_secs(3),recovery).await.unwrap().unwrap().unwrap();
+            let RelayRecovery::Resumed(socket,received)=timeout(Duration::from_secs(3),recovery).await.unwrap().unwrap().unwrap() else {panic!("expected original session");};
             a.finish_resume(socket,received).unwrap();
             assert_eq!(a.client_id,original_id);
             for i in 8..16 {assert_eq!(wait_packet(&mut b,false).await.payload,vec![i]);}
@@ -1480,7 +1646,7 @@ mod runtime {
             let original_id = a.client_id;
             let (_stop, stopped) = watch::channel(false);
             let recovery = a.begin_resume(address, stopped).await.unwrap();
-            let (socket, received) = timeout(Duration::from_secs(3), recovery).await.unwrap().unwrap().unwrap();
+            let RelayRecovery::Resumed(socket, received) = timeout(Duration::from_secs(3), recovery).await.unwrap().unwrap().unwrap() else {panic!("expected original session");};
             a.finish_resume(socket, received).unwrap();
             // Rebinding the same game must not undo its terminal peer fault either.
             a.send(&Message::Bind { steam_id: 101, epoch: 1001 }).await.unwrap();

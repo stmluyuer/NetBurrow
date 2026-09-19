@@ -53,6 +53,9 @@ pub const UDP_LIMIT: usize = 1200;
 pub const DIAGNOSTICS_PING: u64 = 0x4e42_4449_4147_0001;
 pub const RECOVERY_PING: u64 = 0x4e42_5253_554d_0001;
 pub const RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Explicit permission to attempt a fresh, group-authorized Join on a new connection.
+/// This does not authorize replaying records from the lost session.
+pub const RESUME_REJOIN_ALLOWED: &str = "session resume unavailable; rejoin allowed";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Delivery {

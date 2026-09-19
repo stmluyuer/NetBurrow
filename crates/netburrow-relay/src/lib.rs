@@ -35,7 +35,7 @@ use tokio::{
 
 const DEFAULT_PORT: u16 = 24_872;
 const DEFAULT_MAX_CLIENTS: usize = 1_024;
-const DEFAULT_QUEUE_MESSAGES: usize = 32;
+const DEFAULT_QUEUE_MESSAGES: usize = 320;
 const DEFAULT_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_TOTAL_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 // Clients send a heartbeat every second. Bound silence and incomplete frames so
@@ -303,7 +303,16 @@ async fn client_loop(
     };
     let joined = match joined {Ok(joined)=>joined,Err(error)=>{
         increment(&stats.capacity_rejected);
-        let reason=if resumed {if error.kind()==ErrorKind::WouldBlock {"session resume pending"}else{"session resume rejected"}} else {"relay is full"};
+        let reason=if resumed {
+            record("WARN", "session_resume_rejected", format_args!("kind={:?} reason={error}", error.kind()));
+            match error.kind() {
+                ErrorKind::WouldBlock => "session resume pending",
+                // No old membership remains to take over. A fresh Join must still
+                // pass the group allowlist and the ordinary game identity checks.
+                ErrorKind::NotFound => netburrow_protocol::RESUME_REJOIN_ALLOWED,
+                _ => "session resume rejected",
+            }
+        } else {"relay is full"};
         let _ = write_tcp_message(&mut stream, &Message::Error(reason.into())).await;
         return;
     }};
@@ -556,7 +565,7 @@ async fn execute_route(
         Route::Tcp { target, message } => {
             let queued = { state.lock().await.enqueue(target, message) };
             match queued {
-                Err(QueueError::Full) => {
+                Err(QueueError::Full(_)) => {
                     disconnect(target, state).await;
                     send_error(client_id, state, "target connection is slow").await;
                 }
@@ -770,7 +779,7 @@ struct Notice {
 
 #[derive(Debug)]
 enum QueueError {
-    Full,
+    Full(&'static str),
     Closed,
     Invalid,
 }
@@ -864,7 +873,7 @@ impl State {
     }
 
     fn resume(&mut self,id:u64,key:Token,received:u64,now:Instant)->io::Result<(u64,Token,Vec<Peer>,Vec<Notice>)> {
-        let client=self.clients.get_mut(&id).ok_or_else(||invalid("unknown resume session"))?;
+        let client=self.clients.get_mut(&id).ok_or_else(||io::Error::new(ErrorKind::NotFound,"unknown resume session"))?;
         if client.resume_key!=Some(key)||!client.recovery_enabled.load(Ordering::Acquire)||client.resume_failed.load(Ordering::Acquire) {return Err(invalid("invalid resume session"));}
         match client.detached_until {None=>return Err(io::Error::new(ErrorKind::WouldBlock,"session still attached")),Some(deadline) if now>=deadline=>return Err(invalid("expired resume session")),_=>{}}
         client.window.lock().unwrap_or_else(|p|p.into_inner()).acknowledge(received)?;
@@ -1072,6 +1081,16 @@ impl State {
             self.total_queue_limit,
             self.queued_total.clone(),
         );
+        if let Err(QueueError::Full(reason)) = &result {
+            // Concurrent sending/ACKs can advance these snapshots after the rejection.
+            let replay_bytes = client.window.lock().unwrap_or_else(|p| p.into_inner()).pending_bytes();
+            record("WARN", "queue_full", format_args!(
+                "client={client_id} reason={reason} queued_messages={} max_messages={} queued_bytes={} max_bytes={} replay_bytes={replay_bytes} total_queued_bytes={} total_max_bytes={}",
+                client.output.max_capacity() - client.output.capacity(), client.output.max_capacity(),
+                client.queued_bytes.load(Ordering::Acquire), client.max_queued_bytes,
+                self.queued_total.load(Ordering::Acquire), self.total_queue_limit,
+            ));
+        }
         if result.is_err() {
             increment(&self.stats.queue_failed);
             if members {
@@ -1172,7 +1191,7 @@ fn enqueue(
         current.checked_add(bytes).filter(|next| *next <= maximum)
     });
     if reserved.is_err() {
-        return Err(QueueError::Full);
+        return Err(QueueError::Full("client_bytes"));
     }
     let total_reserved =
         total_budget.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -1182,7 +1201,7 @@ fn enqueue(
         });
     if total_reserved.is_err() {
         budget.fetch_sub(bytes, Ordering::AcqRel);
-        return Err(QueueError::Full);
+        return Err(QueueError::Full("total_bytes"));
     }
     match output.try_send(Queued {
         message,
@@ -1193,7 +1212,7 @@ fn enqueue(
     }) {
         Ok(()) => Ok(()),
         // The returned Queued owns the reservation and releases it on drop.
-        Err(mpsc::error::TrySendError::Full(_)) => Err(QueueError::Full),
+        Err(mpsc::error::TrySendError::Full(_)) => Err(QueueError::Full("messages")),
         Err(mpsc::error::TrySendError::Closed(_)) => Err(QueueError::Closed),
     }
 }
@@ -1220,7 +1239,11 @@ mod tests {
             let maximum = if rejection == "client_bytes" { frame_bytes } else { 1024 };
             let total_maximum = if rejection == "total_bytes" { frame_bytes } else { 4096 };
             let result = enqueue(&sender, Message::Ping(2), maximum, budget.clone(), total_maximum, total.clone());
-            assert!(matches!(result, Err(QueueError::Full | QueueError::Closed)), "{rejection}");
+            match result {
+                Err(QueueError::Full(reason)) => assert_eq!(reason, rejection),
+                Err(QueueError::Closed) => assert_eq!(rejection, "closed"),
+                other => panic!("unexpected result for {rejection}: {other:?}"),
+            }
             assert_eq!(budget.load(Ordering::Acquire), frame_bytes, "{rejection}");
             assert_eq!(total.load(Ordering::Acquire), frame_bytes, "{rejection}");
             drop(receiver.try_recv().unwrap());
@@ -1304,6 +1327,15 @@ mod tests {
         .await
         .unwrap();
         let (mut one, one_id, _) = connect(relay.local_addr(), group(1)).await;
+        // Only missing sessions permit a fresh Join, which still needs group authorization.
+        for (client_id,expected) in [
+            (one_id,"session resume rejected"),
+            (u64::MAX,netburrow_protocol::RESUME_REJOIN_ALLOWED),
+        ] {
+            let mut resume=TcpStream::connect(relay.local_addr()).await.unwrap();
+            write_tcp_message(&mut resume,&Message::Resume {client_id,key:[0;16],received:0}).await.unwrap();
+            assert_eq!(read_tcp_message(&mut resume).await.unwrap(),Message::Error(expected.into()));
+        }
         let mut denied = TcpStream::connect(relay.local_addr()).await.unwrap();
         write_tcp_message(&mut denied, &Message::Join { group: group(3) })
             .await
@@ -1371,7 +1403,7 @@ mod tests {
         let frame=timeout(Duration::from_secs(1),read_tcp_message(&mut receiving)).await.unwrap().unwrap();
         let Message::SessionFrame{sequence,..}=frame else{panic!("expected replay frame")};
         assert_eq!(state.queued_total.load(Ordering::Acquire),encode(&message).unwrap().len());
-        assert!(matches!(state.enqueue(id,message.clone()),Err(QueueError::Full)));
+        assert!(matches!(state.enqueue(id,message.clone()),Err(QueueError::Full(_))));
         window.lock().unwrap().acknowledge(sequence).unwrap();
         assert_eq!(state.queued_total.load(Ordering::Acquire),0);
         assert!(state.enqueue(id,message).is_ok());
