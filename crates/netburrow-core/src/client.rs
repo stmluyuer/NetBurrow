@@ -1002,6 +1002,7 @@ mod runtime {
         let mut clock = interval(Duration::from_millis(250));
         clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let since = Instant::now();
+        let mut status_since = since;
         let mut last_ping = Instant::now() - Duration::from_secs(1);
         let mut last_stats = Instant::now();
         let mut last_report = Instant::now() - Duration::from_secs(3);
@@ -1027,6 +1028,8 @@ mod runtime {
                         change(state,|s|{s.relay_recovering=false;s.relay_recoveries+=1;s.ping_ms=None;s.rtt_samples.clear();});
                         if rejoined {
                             peers.clear();status_supported=false;
+                            // A fresh join gets its own handshake budget; keep the ping clock unchanged.
+                            status_since=Instant::now();
                             change(state,|s|{s.peers.clear();s.path_diagnostics=Default::default();});
                             last_report=Instant::now()-Duration::from_secs(3);
                             log("WARN","relay recovery","Relay allowed fresh join; keeping Hook and rebinding current game; old Relay replay data discarded");
@@ -1275,7 +1278,7 @@ mod runtime {
                         }
                         // Confirm the Relay extension before attaching a game to an old server.
                         if !status_supported {
-                            if since.elapsed() > Duration::from_secs(10) { return Err(io::Error::new(io::ErrorKind::Unsupported, "Relay member status handshake timed out")); }
+                            if status_since.elapsed() > Duration::from_secs(10) { return Err(io::Error::new(io::ErrorKind::Unsupported, "Relay member status handshake timed out")); }
                             continue;
                         }
                         let mut games=Vec::new();
@@ -1525,6 +1528,83 @@ mod runtime {
             hook.as_mut().unwrap().send(&Message::Pong(42)).await.unwrap();
             assert_eq!(read(&mut game).await.unwrap(),Message::Pong(42));
             drop(network);drop(peer);drop(hook);relay.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn relay_fresh_join_restarts_member_status_timeout() {
+            for sends_status in [true, false] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = listener.local_addr().unwrap().to_string();
+                let (stop, mut stopped) = watch::channel(false);
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    assert!(matches!(read(&mut socket).await.unwrap(), Message::Join { .. }));
+                    write(&mut socket, &Message::Welcome { client_id: 7, udp_token: [0; 16] }).await.unwrap();
+                    write(&mut socket, &Message::Statuses(vec![])).await.unwrap();
+                    write(&mut socket, &Message::RecoveryOffer([7; 16])).await.unwrap();
+                    // Keep the original connection alive beyond its ten-second handshake budget.
+                    let disconnect_at = Instant::now() + Duration::from_secs(11);
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(disconnect_at) => break,
+                            message = read(&mut socket) => {
+                                if let Message::Ping(n) = message.unwrap() {
+                                    write(&mut socket, &Message::Pong(n)).await.unwrap();
+                                }
+                            }
+                        }
+                    }
+                    drop(socket);
+                    let (mut retry, _) = listener.accept().await.unwrap();
+                    assert!(matches!(read(&mut retry).await.unwrap(), Message::Resume { .. }));
+                    write(&mut retry, &Message::Error(netburrow_protocol::RESUME_REJOIN_ALLOWED.into())).await.unwrap();
+                    drop(retry);
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    assert!(matches!(read(&mut socket).await.unwrap(), Message::Join { .. }));
+                    write(&mut socket, &Message::Welcome { client_id: 8, udp_token: [0; 16] }).await.unwrap();
+                    let rejoined_at = Instant::now();
+                    let mut status_sent = false;
+                    loop {
+                        match read(&mut socket).await.unwrap() {
+                            Message::Ping(n) => {
+                                if sends_status && rejoined_at.elapsed() >= Duration::from_secs(1) {
+                                    if status_sent {
+                                        stop.send(true).unwrap();
+                                        std::future::pending::<()>().await;
+                                    }
+                                    // Delay status across several client timer ticks after rejoining.
+                                    write(&mut socket, &Message::Statuses(vec![])).await.unwrap();
+                                    status_sent = true;
+                                }
+                                write(&mut socket, &Message::Pong(n)).await.unwrap();
+                            }
+                            Message::Leave => return,
+                            _ => {}
+                        }
+                    }
+                });
+                let mut network = Network::connect(&endpoint, [9; 32], Transport::Tcp).await.unwrap();
+                let ipc = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let state = Arc::new(Mutex::new(Snapshot::default()));
+                let settings = Settings { server: endpoint, ..Settings::default() };
+                let started = Instant::now();
+                let result = timeout(Duration::from_secs(26), connected(
+                    &settings, Path::new("missing-binaries"), Path::new("missing-game"),
+                    &ipc, ipc.local_addr().unwrap().port(), &mut HashSet::new(),
+                    &mut network, &mut stopped, &state,
+                )).await.unwrap();
+                server.abort();
+                let _ = server.await;
+                assert_eq!(state.lock().unwrap().relay_recoveries, 1);
+                if sends_status {
+                    result.expect("fresh join must allow time for delayed member status");
+                } else {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+                    assert_eq!(error.to_string(), "Relay member status handshake timed out");
+                    assert!(started.elapsed() >= Duration::from_secs(21), "fresh join must receive a new ten-second timeout");
+                }
+            }
         }
 
         #[tokio::test]

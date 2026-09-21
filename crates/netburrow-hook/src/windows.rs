@@ -674,18 +674,37 @@ unsafe extern "thiscall" fn available(this: *mut c_void, size: *mut u32, channel
             LOCK_BUSY.fetch_add(1, Ordering::Relaxed);
             return false;
         };
-        if let Some(length) = bridge.available(channel) {
-            size.write(length as u32);
-            return true;
+        match bridge.available(channel) {
+            Ok(Some(length)) => {
+                size.write(length as u32);
+                return true;
+            }
+            Ok(None) => {
+                // Reserve the source before releasing the lock: Hook data may
+                // arrive while Steam reports the native packet's size.
+                if bridge.native_query(channel).is_err() {
+                    return false;
+                }
+            }
+            Err(_) => return false,
         }
     }
     let address = original(1);
-    if address == 0 {
-        return false;
+    let found = if address == 0 {
+        false
+    } else {
+        let f: unsafe extern "thiscall" fn(*mut c_void, *mut u32, i32) -> bool = transmute(address);
+        API_NATIVE[1].fetch_add(1, Ordering::Relaxed);
+        f(this, size, channel)
+    };
+    if !found {
+        if let Some(shared) = BRIDGE.get() {
+            if let Ok(mut bridge) = shared.bridge.try_lock() {
+                bridge.clear_native_query(channel);
+            }
+        }
     }
-    let f: unsafe extern "thiscall" fn(*mut c_void, *mut u32, i32) -> bool = transmute(address);
-    API_NATIVE[1].fetch_add(1, Ordering::Relaxed);
-    f(this, size, channel)
+    found
 }
 unsafe extern "thiscall" fn read(
     this: *mut c_void,
@@ -706,7 +725,13 @@ unsafe extern "thiscall" fn read(
             LOCK_BUSY.fetch_add(1, Ordering::Relaxed);
             return false;
         };
-        if let Some(packet) = bridge.read(channel) {
+        let packet = match bridge.read(channel) {
+            Ok(packet) => packet,
+            // The game still has the old Hook packet's buffer size. Do not
+            // replace an invalidated query with a packet from native Steam.
+            Err(_) => return false,
+        };
+        if let Some(packet) = packet {
             drop(bridge);
             // Steam's documented ABI consumes/truncates a packet when the caller's buffer is small.
             let count = packet.payload.len().min(capacity as usize);
@@ -733,24 +758,29 @@ unsafe extern "thiscall" fn read(
         *mut u64,
         i32,
     ) -> bool = transmute(address);
-    // Discard a bounded number of stale native-path packets from already-owned peers.
-    for _ in 0..16 {
-        API_NATIVE[2].fetch_add(1, Ordering::Relaxed);
-        if !f(this, destination, capacity, size, remote, channel) {
-            return false;
-        }
-        let ours = BRIDGE.get().is_some_and(|s| {
-            s.bridge
-                .try_lock()
-                .map(|b| b.known(remote.read_unaligned()))
-                .unwrap_or(true)
-        });
-        if !ours {
-            return true;
-        }
-        NATIVE_DISCARDED.fetch_add(1, Ordering::Relaxed);
+    API_NATIVE[2].fetch_add(1, Ordering::Relaxed);
+    if !f(this, destination, capacity, size, remote, channel) {
+        return false;
     }
-    false
+    let ours = BRIDGE.get().is_some_and(|s| {
+        s.bridge
+            .try_lock()
+            .map(|mut b| {
+                let ours = b.known(remote.read_unaligned());
+                if !ours {
+                    b.clear_native_query(channel);
+                }
+                ours
+            })
+            .unwrap_or(true)
+    });
+    if ours {
+        // The next native packet can be larger than the queried one. Require a
+        // fresh size query instead of consuming it with the old buffer.
+        NATIVE_DISCARDED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    true
 }
 unsafe extern "thiscall" fn accept(this: *mut c_void, remote: u64) -> bool {
     API_CALLS[3].fetch_add(1, Ordering::Relaxed);

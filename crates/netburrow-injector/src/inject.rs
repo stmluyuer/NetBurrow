@@ -8,7 +8,10 @@ use std::{
     ptr,
 };
 use windows_sys::Win32::{
-    Foundation::{FreeLibrary, HANDLE, HMODULE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Foundation::{
+        ERROR_BAD_LENGTH, ERROR_NO_MORE_FILES, ERROR_PARTIAL_COPY, FreeLibrary, HANDLE, HMODULE,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
+    },
     System::{
         Diagnostics::{
             Debug::WriteProcessMemory,
@@ -81,7 +84,7 @@ pub fn run() -> io::Result<()> {
     }
     process::validate_x86_image(&exe)?;
     process::validate_x86_image(&dll)?;
-    let target = process::describe_process(pid)?;
+    let target = step("validate target", process::describe_process(pid))?;
     crate::diagnostics::record(
         "INFO",
         "target",
@@ -95,27 +98,40 @@ pub fn run() -> io::Result<()> {
     if nonce == [0; 16] {
         return Err(io::Error::other("invalid IPC nonce"));
     }
-    let process = Handle::new(unsafe {
-        OpenProcess(
-            PROCESS_CREATE_THREAD
-                | PROCESS_QUERY_INFORMATION
-                | PROCESS_VM_OPERATION
-                | PROCESS_VM_READ
-                | PROCESS_VM_WRITE,
-            0,
-            pid,
-        )
-    })?;
+    let process = step(
+        "OpenProcess",
+        Handle::new(unsafe {
+            OpenProcess(
+                PROCESS_CREATE_THREAD
+                    | PROCESS_QUERY_INFORMATION
+                    | PROCESS_VM_OPERATION
+                    | PROCESS_VM_READ
+                    | PROCESS_VM_WRITE,
+                0,
+                pid,
+            )
+        }),
+    )?;
     // Verify again after opening the process. PID reuse cannot redirect an already-open HANDLE.
-    if process::describe_process(pid)? != target {
-        return Err(io::Error::other("target changed during preparation"));
-    }
+    let load = prepare_loader(
+        || {
+            if process::describe_process(pid)? != target {
+                return Err(io::Error::other("target changed during preparation"));
+            }
+            Ok(())
+        },
+        || remote_load_library(pid),
+        std::thread::sleep,
+    )?;
     let dll_name = wide(&dll);
     let bytes =
         unsafe { std::slice::from_raw_parts(dll_name.as_ptr().cast::<u8>(), dll_name.len() * 2) };
-    let mut path_memory = RemoteMemory::new(process.0, bytes)?;
-    let load = remote_load_library(pid)?;
-    let loaded = call_remote(process.0, load, &mut path_memory)?;
+    let mut path_memory = step("prepare DLL path", RemoteMemory::new(process.0, bytes))?;
+    // No retry may encompass this call: a started remote thread can outlive its timeout.
+    let loaded = step(
+        "execute LoadLibraryW",
+        call_remote(process.0, load, &mut path_memory),
+    )?;
     crate::diagnostics::record(
         "INFO",
         "LoadLibraryW",
@@ -124,12 +140,15 @@ pub fn run() -> io::Result<()> {
     if loaded == 0 {
         return Err(io::Error::other("LoadLibraryW failed in game"));
     }
-    let remote_base = modules(pid)?
+    let remote_base = step("find loaded Hook", modules(pid))?
         .into_iter()
         .find(|(_, p)| process::same_path(p, &dll))
         .map(|(base, _)| base)
         .ok_or_else(|| io::Error::other("loaded DLL not found in target"))?;
-    let init_rva = export_rva(&dll, b"NetBurrowInit\0")?;
+    let init_rva = step(
+        "resolve NetBurrowInit",
+        export_rva(&dll, b"NetBurrowInit\0"),
+    )?;
     let init = HookInit {
         version: HOOK_INIT_VERSION,
         port: port as u32,
@@ -144,13 +163,16 @@ pub fn run() -> io::Result<()> {
             size_of::<HookInit>(),
         )
     };
-    let mut init_memory = RemoteMemory::new(process.0, bytes)?;
-    let code = call_remote(
-        process.0,
-        remote_base
-            .checked_add(init_rva)
-            .ok_or_else(|| io::Error::other("invalid initialization address"))?,
-        &mut init_memory,
+    let mut init_memory = step("prepare HookInit", RemoteMemory::new(process.0, bytes))?;
+    let code = step(
+        "execute NetBurrowInit",
+        call_remote(
+            process.0,
+            remote_base
+                .checked_add(init_rva)
+                .ok_or_else(|| io::Error::other("invalid initialization address"))?,
+            &mut init_memory,
+        ),
     )?;
     if code != 0 {
         crate::diagnostics::record(
@@ -173,6 +195,50 @@ pub fn run() -> io::Result<()> {
     Ok(())
 }
 
+// Preserve the OS code for classification while recording the exact failing operation.
+fn step<T>(name: &str, result: io::Result<T>) -> io::Result<T> {
+    result.inspect_err(|error| {
+        crate::diagnostics::record("ERROR", name, &error.to_string());
+    })
+}
+
+fn prepare_loader(
+    mut verify: impl FnMut() -> io::Result<()>,
+    mut resolve: impl FnMut() -> io::Result<usize>,
+    mut wait: impl FnMut(std::time::Duration),
+) -> io::Result<usize> {
+    let delays = [200, 500];
+    for attempt in 0..=delays.len() {
+        // Identity/permission/exit failures are terminal, including during a retry.
+        step("revalidate target", verify())?;
+        match step("resolve loader before remote thread", resolve()) {
+            Ok(address) => return Ok(address),
+            Err(error) => {
+                let transient = matches!(
+                    error.raw_os_error(),
+                    Some(code) if code == ERROR_BAD_LENGTH as i32 || code == ERROR_PARTIAL_COPY as i32
+                );
+                if !transient || attempt == delays.len() {
+                    return Err(error);
+                }
+                crate::diagnostics::record(
+                    "WARN",
+                    "prepare retry",
+                    &format!(
+                        "attempt={} next_attempt={} delay_ms={} remote_thread_started=false os_error={:?}",
+                        attempt + 1,
+                        attempt + 2,
+                        delays[attempt],
+                        error.raw_os_error()
+                    ),
+                );
+                wait(std::time::Duration::from_millis(delays[attempt]));
+            }
+        }
+    }
+    unreachable!()
+}
+
 struct RemoteMemory {
     process: HANDLE,
     address: *mut c_void,
@@ -190,7 +256,7 @@ impl RemoteMemory {
             )
         };
         if address.is_null() {
-            return Err(io::Error::last_os_error());
+            return step("VirtualAllocEx", Err(io::Error::last_os_error()));
         }
         let value = Self {
             process,
@@ -207,9 +273,14 @@ impl RemoteMemory {
                 &mut written,
             )
         } == 0
-            || written != bytes.len()
         {
-            return Err(io::Error::last_os_error());
+            return step("WriteProcessMemory", Err(io::Error::last_os_error()));
+        }
+        if written != bytes.len() {
+            return step(
+                "WriteProcessMemory",
+                Err(io::Error::from_raw_os_error(ERROR_PARTIAL_COPY as i32)),
+            );
         }
         Ok(value)
     }
@@ -227,45 +298,67 @@ impl Drop for RemoteMemory {
 fn call_remote(process: HANDLE, entry: usize, argument: &mut RemoteMemory) -> io::Result<u32> {
     let function: unsafe extern "system" fn(*mut c_void) -> u32 =
         unsafe { std::mem::transmute(entry) };
-    let thread = Handle::new(unsafe {
-        CreateRemoteThread(
-            process,
-            ptr::null(),
-            0,
-            Some(function),
-            argument.address,
-            0,
-            ptr::null_mut(),
-        )
-    })?;
+    let thread = step(
+        "CreateRemoteThread",
+        Handle::new(unsafe {
+            CreateRemoteThread(
+                process,
+                ptr::null(),
+                0,
+                Some(function),
+                argument.address,
+                0,
+                ptr::null_mut(),
+            )
+        }),
+    )?;
+    crate::diagnostics::record(
+        "INFO",
+        "remote thread",
+        "started; automatic reinjection disabled",
+    );
     let wait = unsafe { WaitForSingleObject(thread.0, 10_000) };
     if wait != WAIT_OBJECT_0 {
         // A running remote thread may still be reading these bytes. Leave this tiny allocation
         // to the game's normal process teardown, rather than freeing beneath it or killing it.
         argument.release = false;
-        return Err(if wait == WAIT_TIMEOUT {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                "remote initialization timed out; restart the game",
-            )
-        } else {
-            io::Error::last_os_error()
-        });
+        return step(
+            "WaitForSingleObject",
+            Err(if wait == WAIT_TIMEOUT {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "remote initialization timed out; restart the game",
+                )
+            } else {
+                io::Error::last_os_error()
+            }),
+        );
     }
     let mut result = 0;
     if unsafe { GetExitCodeThread(thread.0, &mut result) } == 0 {
-        return Err(io::Error::last_os_error());
+        return step("GetExitCodeThread", Err(io::Error::last_os_error()));
     }
     Ok(result)
 }
 
 fn modules(pid: u32) -> io::Result<Vec<(usize, PathBuf)>> {
-    let snapshot = Handle::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid) })?;
+    let snapshot = step(
+        "CreateToolhelp32Snapshot",
+        Handle::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid) }),
+    )?;
     let mut entry: MODULEENTRY32W = unsafe { zeroed() };
     entry.dwSize = size_of::<MODULEENTRY32W>() as u32;
-    let mut next = unsafe { Module32FirstW(snapshot.0, &mut entry) } != 0;
+    let mut next = unsafe { Module32FirstW(snapshot.0, &mut entry) };
+    let mut operation = "Module32FirstW";
     let mut out = Vec::new();
-    while next {
+    loop {
+        if next == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                break;
+            }
+            return step(operation, Err(error));
+        }
         let end = entry
             .szExePath
             .iter()
@@ -275,7 +368,8 @@ fn modules(pid: u32) -> io::Result<Vec<(usize, PathBuf)>> {
             entry.modBaseAddr as usize,
             PathBuf::from(String::from_utf16_lossy(&entry.szExePath[..end])),
         ));
-        next = unsafe { Module32NextW(snapshot.0, &mut entry) } != 0;
+        operation = "Module32NextW";
+        next = unsafe { Module32NextW(snapshot.0, &mut entry) };
     }
     Ok(out)
 }
@@ -331,4 +425,101 @@ fn export_rva(path: &Path, name: &[u8]) -> io::Result<usize> {
         FreeLibrary(local);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{cell::RefCell, time::Duration};
+
+    #[test]
+    fn loader_preparation_revalidates_after_each_delay_and_recovers() {
+        let events = RefCell::new(Vec::new());
+        let mut results = [
+            Err(io::Error::from_raw_os_error(ERROR_PARTIAL_COPY as i32)),
+            Err(io::Error::from_raw_os_error(ERROR_BAD_LENGTH as i32)),
+            Ok(123),
+        ]
+        .into_iter();
+        let address = prepare_loader(
+            || {
+                events.borrow_mut().push("verify");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("resolve");
+                results.next().unwrap()
+            },
+            |delay| {
+                events.borrow_mut().push(match delay.as_millis() {
+                    200 => "wait 200",
+                    500 => "wait 500",
+                    _ => panic!("unexpected delay"),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(address, 123);
+        assert_eq!(
+            *events.borrow(),
+            [
+                "verify", "resolve", "wait 200", "verify", "resolve", "wait 500", "verify",
+                "resolve"
+            ]
+        );
+    }
+
+    #[test]
+    fn loader_preparation_caps_transient_failures_and_does_not_retry_access_denied() {
+        for (code, expected_calls) in [(ERROR_PARTIAL_COPY as i32, 3), (5, 1)] {
+            let mut calls = 0;
+            let mut delays = Vec::new();
+            let error = prepare_loader(
+                || Ok(()),
+                || {
+                    calls += 1;
+                    Err(io::Error::from_raw_os_error(code))
+                },
+                |delay| delays.push(delay),
+            )
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+            assert_eq!(calls, expected_calls);
+            assert_eq!(
+                delays,
+                if expected_calls == 3 {
+                    vec![Duration::from_millis(200), Duration::from_millis(500)]
+                } else {
+                    vec![]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn loader_preparation_stops_if_target_changes_or_exits_during_delay() {
+        for code in [None, Some(87)] {
+            let mut verified = false;
+            let mut calls = 0;
+            let error = prepare_loader(
+                || {
+                    if verified {
+                        return Err(code.map(io::Error::from_raw_os_error).unwrap_or_else(|| {
+                            io::Error::other("target changed during preparation")
+                        }));
+                    }
+                    verified = true;
+                    Ok(())
+                },
+                || {
+                    calls += 1;
+                    Err(io::Error::from_raw_os_error(ERROR_PARTIAL_COPY as i32))
+                },
+                |_| {},
+            )
+            .unwrap_err();
+            assert_eq!(calls, 1);
+            assert_eq!(error.raw_os_error(), code);
+        }
+    }
 }

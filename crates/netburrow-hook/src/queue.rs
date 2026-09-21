@@ -26,6 +26,9 @@ struct Remote {
 struct Incoming {
     packet: Packet,
     queued: Instant,
+    // Keep IsP2PPacketAvailable and ReadP2PPacket on the same packet even if
+    // another peer becomes eligible between the two game calls.
+    advertised: bool,
 }
 impl std::ops::Deref for Incoming {
     type Target = Packet;
@@ -109,6 +112,20 @@ pub struct SendRejections {
     pub peer_full: u64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReadError {
+    QueryInvalidated,
+    TooManyQueries,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QuerySource {
+    Hook,
+    Native,
+    // Keep failed or discarded native reads from switching to a new packet.
+    NativeRead,
+}
+
 pub struct Bridge {
     pub steam_id: u64,
     pub epoch: u64,
@@ -123,6 +140,10 @@ pub struct Bridge {
     pub telemetry: crate::telemetry::Telemetry,
     faults: VecDeque<(u64, u64)>,
     read_cursors: BTreeMap<i32, (u64, u64)>,
+    // Outlive packet cleanup so a stale size query cannot select another packet.
+    // A fresh query renews or clears it; a successful read clears it.
+    // Bounded by DATA_PACKETS, including queries whose packets were removed.
+    pending_queries: BTreeMap<i32, QuerySource>,
 }
 
 impl Bridge {
@@ -141,6 +162,7 @@ impl Bridge {
             telemetry: crate::telemetry::Telemetry::default(),
             faults: VecDeque::new(),
             read_cursors: BTreeMap::new(),
+            pending_queries: BTreeMap::new(),
         }
     }
     pub fn known(&self, id: u64) -> bool {
@@ -400,10 +422,14 @@ impl Bridge {
                 let victim = self
                     .inbound
                     .iter()
-                    .position(|p| p.from == peer_id && p.send_type <= 1)
+                    .position(|p| p.from == peer_id && p.send_type <= 1 && !p.advertised)
                     .or_else(|| {
                         (!peer_full)
-                            .then(|| self.inbound.iter().position(|p| p.send_type <= 1))
+                            .then(|| {
+                                self.inbound
+                                    .iter()
+                                    .position(|p| p.send_type <= 1 && !p.advertised)
+                            })
                             .flatten()
                     });
                 let Some(index) = victim else {
@@ -440,17 +466,53 @@ impl Bridge {
         self.inbound.push_back(Incoming {
             packet,
             queued: Instant::now(),
+            advertised: false,
         });
         Admission::Queued
     }
-    pub fn available(&mut self, channel: i32) -> Option<usize> {
-        let result = self
-            .read_index(channel)
-            .map(|i| self.inbound[i].payload.len());
-        self.telemetry.poll(channel, false, result.is_some());
+    pub fn available(&mut self, channel: i32) -> Result<Option<usize>, ReadError> {
+        let result = match self.read_index(channel) {
+            Some(_)
+                if !self.pending_queries.contains_key(&channel)
+                    && self.pending_queries.len() >= DATA_PACKETS =>
+            {
+                Err(ReadError::TooManyQueries)
+            }
+            Some(i) => {
+                self.pending_queries.insert(channel, QuerySource::Hook);
+                let packet = &mut self.inbound[i];
+                packet.advertised = true;
+                Ok(Some(packet.payload.len()))
+            }
+            None => {
+                self.pending_queries.remove(&channel);
+                Ok(None)
+            }
+        };
+        self.telemetry
+            .poll(channel, false, matches!(result, Ok(Some(_))));
         result
     }
+    pub fn native_query(&mut self, channel: i32) -> Result<(), ReadError> {
+        if !self.pending_queries.contains_key(&channel) && self.pending_queries.len() >= DATA_PACKETS {
+            return Err(ReadError::TooManyQueries);
+        }
+        self.pending_queries.insert(channel, QuerySource::Native);
+        Ok(())
+    }
+    pub fn clear_native_query(&mut self, channel: i32) {
+        if self.pending_queries.get(&channel).is_some_and(|source| *source != QuerySource::Hook) {
+            self.pending_queries.remove(&channel);
+        }
+    }
     fn read_index(&self, channel: i32) -> Option<usize> {
+        if let Some(index) = self.inbound.iter().position(|p| {
+            p.channel == channel
+                && p.advertised
+                && self.remotes.get(&p.from).is_some_and(|r| r.accepted)
+        }) {
+            return Some(index);
+        }
         fair_index(
             self.inbound.iter().enumerate().filter_map(|(i, p)| {
                 (p.channel == channel && self.remotes.get(&p.from).is_some_and(|r| r.accepted))
@@ -459,12 +521,28 @@ impl Bridge {
             self.read_cursors.get(&channel).copied(),
         )
     }
-    pub fn read(&mut self, channel: i32) -> Option<Packet> {
+    pub fn read(&mut self, channel: i32) -> Result<Option<Packet>, ReadError> {
         self.health.read_calls += 1;
+        let source = self.pending_queries.get(&channel).copied();
+        if source == Some(QuerySource::Native) {
+            self.pending_queries.insert(channel, QuerySource::NativeRead);
+            self.telemetry.poll(channel, true, false);
+            return Ok(None);
+        }
         let index = self.read_index(channel);
+        if source == Some(QuerySource::NativeRead)
+            || (source == Some(QuerySource::Hook)
+                && !index.is_some_and(|i| self.inbound[i].advertised))
+        {
+            self.telemetry.poll(channel, true, false);
+            return Err(ReadError::QueryInvalidated);
+        }
         self.telemetry.poll(channel, true, index.is_some());
-        let index = index?;
-        let packet = self.inbound.remove(index)?;
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        let packet = self.inbound.remove(index).unwrap();
+        self.pending_queries.remove(&channel);
         self.read_cursors
             .insert(channel, (packet.from, packet.source_epoch));
         if !self.inbound.iter().any(|p| p.channel == channel) {
@@ -483,7 +561,7 @@ impl Bridge {
                 flow.last_read = Some(Instant::now());
             }
         }
-        Some(packet.packet)
+        Ok(Some(packet.packet))
     }
     pub fn accept(&mut self, id: u64) -> Option<bool> {
         let peer = self.remotes.get_mut(&id)?;
@@ -674,6 +752,101 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
+    fn advertised_packet_survives_arrivals_and_reads_on_other_channels() {
+        let mut b = bridge();
+        b.members(&[
+            Peer { client_id: 2, steam_id: 20, epoch: 200 },
+            Peer { client_id: 3, steam_id: 30, epoch: 300 },
+        ]);
+        let other_channel = incoming(1);
+        assert_eq!(b.receive(other_channel.clone()), Admission::Queued);
+        let mut small = incoming(0);
+        small.from = 30;
+        small.source_epoch = 300;
+        small.send_type = 1;
+        small.payload = vec![3; 16];
+        assert_eq!(b.receive(small.clone()), Admission::Queued);
+        let capacity = b.available(0).unwrap().unwrap();
+        assert_eq!(capacity, 16);
+
+        let mut large = incoming(0);
+        large.send_type = 1;
+        large.payload = vec![2; 40];
+        assert_eq!(b.receive(large.clone()), Admission::Queued);
+        assert_eq!(b.available(1).unwrap(), Some(other_channel.payload.len()));
+        assert_eq!(b.read(1).unwrap(), Some(other_channel));
+        let selected = b.read(0).unwrap().unwrap();
+        assert!(selected.payload.len() <= capacity);
+        assert_eq!(selected, small);
+        assert_eq!(b.available(0).unwrap(), Some(40));
+        assert_eq!(b.available(0).unwrap(), Some(40));
+        assert_eq!(b.read(0).unwrap(), Some(large));
+        assert!(b.read(0).unwrap().is_none());
+    }
+
+    #[test]
+    fn reliable_arrival_does_not_evict_an_advertised_lossy_packet() {
+        let mut b = bridge();
+        let mut selected = incoming(0);
+        selected.send_type = 1;
+        selected.payload = vec![1; 16];
+        assert_eq!(b.receive(selected.clone()), Admission::Queued);
+        assert_eq!(b.available(0).unwrap(), Some(16));
+        let mut evictable = incoming(0);
+        evictable.send_type = 1;
+        evictable.payload = vec![2; 40];
+        assert_eq!(b.receive(evictable), Admission::Queued);
+        for _ in 2..PEER_PACKETS {
+            assert_eq!(b.receive(incoming(0)), Admission::Queued);
+        }
+        assert_eq!(b.receive(incoming(0)), Admission::Queued);
+        assert_eq!(b.read(0).unwrap(), Some(selected));
+        assert_eq!(b.health().dropped, 1);
+        assert!(!b.peer_failed(20));
+    }
+
+    #[test]
+    fn removed_advertised_packet_requires_a_fresh_query() {
+        let mut b = bridge();
+        let remaining = Peer { client_id: 3, steam_id: 30, epoch: 300 };
+        b.members(&[
+            Peer { client_id: 2, steam_id: 20, epoch: 200 },
+            remaining.clone(),
+        ]);
+        let mut small = incoming(0);
+        small.payload = vec![1; 16];
+        assert_eq!(b.receive(small), Admission::Queued);
+        assert_eq!(b.available(0).unwrap(), Some(16));
+        let mut large = incoming(0);
+        large.from = 30;
+        large.source_epoch = 300;
+        large.payload = vec![2; 40];
+        assert_eq!(b.receive(large.clone()), Admission::Queued);
+        b.members(&[remaining]);
+        assert_eq!(b.read(0), Err(ReadError::QueryInvalidated));
+        assert_eq!(b.read(0), Err(ReadError::QueryInvalidated));
+        assert_eq!(b.available(0).unwrap(), Some(40));
+        assert_eq!(b.read(0).unwrap(), Some(large));
+    }
+
+    #[test]
+    fn abandoned_queries_are_bounded_and_can_be_requeried() {
+        let mut b = bridge();
+        for channel in 0..DATA_PACKETS as i32 {
+            assert_eq!(b.receive(incoming(channel)), Admission::Queued);
+            assert_eq!(b.available(channel).unwrap(), Some(3));
+            assert_eq!(b.close(20, Some(channel)), Some(true));
+        }
+        let next = DATA_PACKETS as i32;
+        let packet = incoming(next);
+        assert_eq!(b.receive(packet.clone()), Admission::Queued);
+        assert_eq!(b.available(next), Err(ReadError::TooManyQueries));
+        assert_eq!(b.available(0).unwrap(), None);
+        assert_eq!(b.available(next).unwrap(), Some(packet.payload.len()));
+        assert_eq!(b.read(next).unwrap(), Some(packet));
+    }
+
+    #[test]
     fn channel_metadata_is_bounded_when_unread_lossy_packets_are_evicted() {
         let mut b = bridge();
         let mut peers = vec![
@@ -700,14 +873,14 @@ mod tests {
         }
         for channel in 2049..PEER_CHANNEL_LIMIT as i32 {
             assert_eq!(b.receive(incoming(0)), Admission::Queued);
-            assert!(b.read(0).is_some());
+            assert!(b.read(0).unwrap().is_some());
             assert_eq!(b.receive(lossy(channel)), Admission::Queued);
             assert_eq!(b.inbound.iter().filter(|p| p.from == 20).count(), PEER_PACKETS);
         }
         assert_eq!(b.remotes[&20].channels.len(), PEER_CHANNEL_LIMIT);
         assert!(!b.peer_failed(20));
         assert_eq!(b.receive(incoming(0)), Admission::Queued);
-        assert!(b.read(0).is_some());
+        assert!(b.read(0).unwrap().is_some());
         assert_eq!(b.receive(lossy(PEER_CHANNEL_LIMIT as i32)), Admission::PeerFailed(20, 200));
         assert!(b.remotes[&20].channels.is_empty());
         assert_eq!(b.pop_fault(), Some((20, 200)));
@@ -717,7 +890,7 @@ mod tests {
         assert_eq!(b.accept(20), Some(false));
         assert_eq!(b.send(20, b"failed", 2, 0), Some(false));
         assert_eq!(b.session(20), Some((false, 0, 0)));
-        assert_eq!(b.read(77), Some(healthy));
+        assert_eq!(b.read(77).unwrap(), Some(healthy));
         assert_eq!(b.pop_outgoing().unwrap().to, 30);
         assert!(b.pop_outgoing().is_none());
         assert!(!b.peer_failed(30) && !b.stopped);
@@ -881,8 +1054,8 @@ mod tests {
                         if source == game.steam_id {
                             continue;
                         }
-                        assert_eq!(game.available(channel), Some(4));
-                        let p = game.read(channel).unwrap();
+                        assert_eq!(game.available(channel).unwrap(), Some(4));
+                        let p = game.read(channel).unwrap().unwrap();
                         assert_eq!((p.from, p.payload[0]), (source, n as u8));
                     }
                 }
@@ -963,6 +1136,7 @@ mod tests {
         for _ in 0..PEER_PACKETS {
             assert_eq!(b.receive(incoming(0)), Admission::Queued);
         }
+        assert_eq!(b.available(0).unwrap(), Some(3));
         assert_eq!(b.receive(incoming(0)), Admission::PeerFailed(20, 200));
         assert!(!b.stopped);
         b.members(&peers);
@@ -974,7 +1148,9 @@ mod tests {
         other.from = 30;
         other.source_epoch = 300;
         assert_eq!(b.receive(other), Admission::Queued);
-        assert_eq!(b.read(0).unwrap().from, 30);
+        assert_eq!(b.read(0), Err(ReadError::QueryInvalidated));
+        assert_eq!(b.available(0).unwrap(), Some(3));
+        assert_eq!(b.read(0).unwrap().unwrap().from, 30);
         let mut renewed = peers;
         renewed[0].epoch = 201;
         b.members(&renewed);

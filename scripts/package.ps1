@@ -24,7 +24,20 @@ Set-Location -LiteralPath $repoRoot
 $cargoHome = Join-Path $repoRoot '.local\cargo'
 $rustupHome = Join-Path $repoRoot '.local\rustup'
 $env:RUSTUP_HOME = $rustupHome
-$cargo = & rustup which cargo
+$rustupCommand = Get-Command rustup.exe -ErrorAction SilentlyContinue
+if (-not $rustupCommand) {
+    $userRustup = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.cargo\bin\rustup.exe'
+    if (Test-Path -LiteralPath $userRustup -PathType Leaf) {
+        $rustupCommand = Get-Item -LiteralPath $userRustup
+    }
+}
+if (-not $rustupCommand) { throw '无法找到 rustup.exe，请先安装 Rust 或将 Cargo bin 目录加入 PATH。' }
+$rustupPath = if ($rustupCommand -is [System.IO.FileInfo]) {
+    $rustupCommand.FullName
+} else {
+    $rustupCommand.Source
+}
+$cargo = & $rustupPath which cargo
 if ($LASTEXITCODE -ne 0) { throw '无法找到仓库本地默认 Rust 工具链。' }
 $toolBin = Split-Path -Parent $cargo
 $distRoot = Join-Path $repoRoot '.local\dist'
@@ -186,6 +199,9 @@ Copy-Item -LiteralPath $appBinary -Destination (Join-Path $appStage 'NetBurrow.e
 Copy-Item -LiteralPath $injectorBinary -Destination (Join-Path $appStage 'netburrow-injector.exe') -Force
 Copy-Item -LiteralPath $hookDll -Destination (Join-Path $appStage 'netburrow_hook.dll') -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot 'README.md') -Destination (Join-Path $appStage 'README.md') -Force
+if (Test-Path -LiteralPath (Join-Path $repoRoot 'CHANGELOG.md') -PathType Leaf) {
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'CHANGELOG.md') -Destination (Join-Path $appStage 'CHANGELOG.md') -Force
+}
 Get-ChildItem -LiteralPath $appStage -File -Recurse | Where-Object { $_.LastWriteTime.Year -lt 1980 -or $_.LastWriteTime.Year -gt 2107 } | ForEach-Object { $_.LastWriteTime = Get-Date }
 Write-PortableZip -Source $appStage -Destination $appZip
 Write-Output "已生成：$appZip"

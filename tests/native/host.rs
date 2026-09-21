@@ -113,6 +113,9 @@ unsafe fn hook_workers() -> Vec<OwnedHandle> {
     found
 }
 static NATIVE_SENDS: AtomicUsize = AtomicUsize::new(0);
+static NATIVE_READS: AtomicUsize = AtomicUsize::new(0);
+static NATIVE_PACKETS: std::sync::Mutex<std::collections::VecDeque<(u64, i32, Vec<u8>)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
 static REQUESTS: AtomicUsize = AtomicUsize::new(0);
 static FAILURES: AtomicUsize = AtomicUsize::new(0);
 unsafe extern "thiscall" fn unused(_: *mut c_void) -> bool {
@@ -129,18 +132,33 @@ unsafe extern "thiscall" fn native_send(
     NATIVE_SENDS.fetch_add(1, Ordering::SeqCst);
     true
 }
-unsafe extern "thiscall" fn native_available(_: *mut c_void, _: *mut u32, _: i32) -> bool {
-    false
+unsafe extern "thiscall" fn native_available(_: *mut c_void, size: *mut u32, channel: i32) -> bool {
+    let packets = NATIVE_PACKETS.lock().unwrap();
+    let Some((_, _, payload)) = packets.iter().find(|(_, c, _)| *c == channel) else {
+        return false;
+    };
+    size.write(payload.len() as u32);
+    true
 }
 unsafe extern "thiscall" fn native_read(
     _: *mut c_void,
-    _: *mut c_void,
-    _: u32,
-    _: *mut u32,
-    _: *mut u64,
-    _: i32,
+    destination: *mut c_void,
+    capacity: u32,
+    size: *mut u32,
+    remote: *mut u64,
+    channel: i32,
 ) -> bool {
-    false
+    NATIVE_READS.fetch_add(1, Ordering::SeqCst);
+    let mut packets = NATIVE_PACKETS.lock().unwrap();
+    let Some(index) = packets.iter().position(|(_, c, _)| *c == channel) else {
+        return false;
+    };
+    let (peer, _, payload) = packets.remove(index).unwrap();
+    let length = payload.len().min(capacity as usize);
+    std::ptr::copy_nonoverlapping(payload.as_ptr(), destination.cast::<u8>(), length);
+    size.write(length as u32);
+    remote.write_unaligned(peer);
+    true
 }
 unsafe extern "thiscall" fn native_peer(_: *mut c_void, _: u64) -> bool {
     true
@@ -364,6 +382,59 @@ unsafe fn run() {
     ));
     assert_eq!((small, count, remote), (*b"ab", 2, 202));
     assert!(!available(object, &mut count, 3));
+    // A cleared Hook reservation must fail without falling through to Steam.
+    write_message(&mut socket, &Message::Data(incoming.clone())).unwrap();
+    eventually(|| available(object, &mut count, 3));
+    assert_eq!(count, 6);
+    eventually(|| close(object, 202));
+    let native_reads = NATIVE_READS.load(Ordering::SeqCst);
+    assert!(!read(object, small.as_mut_ptr().cast(), 2, &mut count, &mut remote, 3));
+    assert_eq!(NATIVE_READS.load(Ordering::SeqCst), native_reads);
+    assert!(!read(object, small.as_mut_ptr().cast(), 2, &mut count, &mut remote, 3));
+    assert_eq!(NATIVE_READS.load(Ordering::SeqCst), native_reads);
+    assert!(!available(object, &mut count, 3));
+    assert!(!read(object, small.as_mut_ptr().cast(), 2, &mut count, &mut remote, 3));
+    assert_eq!(NATIVE_READS.load(Ordering::SeqCst), native_reads + 1);
+    println!("PASS: invalidated Hook query blocks native fallback until a fresh query");
+    // Keep the source of a native size query when Hook data arrives in between.
+    NATIVE_PACKETS.lock().unwrap().push_back((303, 12, vec![7; 16]));
+    assert!(available(object, &mut count, 12));
+    assert_eq!(count, 16);
+    let mut hook_packet = incoming.clone();
+    hook_packet.channel = 12;
+    hook_packet.payload = vec![8; 40];
+    write_message(&mut socket, &Message::Data(hook_packet)).unwrap();
+    let mut barrier = incoming.clone();
+    barrier.channel = 13;
+    barrier.payload = vec![0];
+    write_message(&mut socket, &Message::Data(barrier)).unwrap();
+    eventually(|| available(object, &mut count, 13));
+    let mut buffer = [0u8; 40];
+    assert!(read(object, buffer.as_mut_ptr().cast(), 40, &mut count, &mut remote, 13));
+    assert!(read(object, buffer.as_mut_ptr().cast(), 16, &mut count, &mut remote, 12));
+    let native_source_kept = remote == 303 && count == 16 && buffer[..16] == [7; 16];
+    // Drain the remaining packet so both regressions can report before failing.
+    while available(object, &mut count, 12) {
+        assert!(read(object, buffer.as_mut_ptr().cast(), 40, &mut count, &mut remote, 12));
+    }
+    // Discarding an owned peer's stale native packet must not consume the next one.
+    NATIVE_PACKETS.lock().unwrap().extend([(202, 14, vec![1; 8]), (303, 14, vec![9; 40])]);
+    assert!(available(object, &mut count, 14));
+    assert_eq!(count, 8);
+    let discarded_without_replacement =
+        !read(object, buffer.as_mut_ptr().cast(), 8, &mut count, &mut remote, 14);
+    let native_reads = NATIVE_READS.load(Ordering::SeqCst);
+    assert!(!read(object, buffer.as_mut_ptr().cast(), 8, &mut count, &mut remote, 14));
+    assert_eq!(NATIVE_READS.load(Ordering::SeqCst), native_reads);
+    let next_available = available(object, &mut count, 14);
+    let larger_packet_retained = next_available && count == 40;
+    if next_available {
+        assert!(read(object, buffer.as_mut_ptr().cast(), 40, &mut count, &mut remote, 14));
+        assert_eq!((remote, count, buffer), (303, 40, [9; 40]));
+    }
+    assert!(native_source_kept && discarded_without_replacement && larger_packet_retained,
+        "native source kept={native_source_kept}, stale read rejected={discarded_without_replacement}, next packet retained={larger_packet_retained}");
+    println!("PASS: native size queries keep their source and stale packets cannot substitute a larger packet");
     // Close the local session, then start solely with Isaac's no-delay send mode.
     eventually(|| close(object, 202));
     eventually(|| send(object, 202, b"out".as_ptr().cast(), 3, 1, 9));
