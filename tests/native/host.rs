@@ -116,12 +116,35 @@ static NATIVE_SENDS: AtomicUsize = AtomicUsize::new(0);
 static NATIVE_READS: AtomicUsize = AtomicUsize::new(0);
 static NATIVE_PACKETS: std::sync::Mutex<std::collections::VecDeque<(u64, i32, Vec<u8>)>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
+static SHARED_OBJECT: AtomicUsize = AtomicUsize::new(0);
+static SHARED_SENDS: AtomicUsize = AtomicUsize::new(0);
+static SHARED_AVAILABLE: AtomicUsize = AtomicUsize::new(0);
+static SHARED_READS: AtomicUsize = AtomicUsize::new(0);
+static SHARED_PEERS: AtomicUsize = AtomicUsize::new(0);
+static SHARED_CHANNELS: AtomicUsize = AtomicUsize::new(0);
+static SHARED_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+static SHARED_ABI_FAILURES: AtomicUsize = AtomicUsize::new(0);
 static REQUESTS: AtomicUsize = AtomicUsize::new(0);
 static FAILURES: AtomicUsize = AtomicUsize::new(0);
+const SHARED_REMOTE: u64 = 0x0000_0002_0000_00ca;
+const SHARED_CHANNEL: i32 = 17;
+const SHARED_PAYLOAD: &[u8] = b"shared";
+const SHARED_SESSION: [u8; 20] = [
+    1, 0, 0, 1, 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 0, 0, 0, 0, 0x34,
+    0x12, 0, 0,
+];
+fn shared_this(this: *mut c_void) -> bool {
+    this as usize == SHARED_OBJECT.load(Ordering::Acquire)
+}
+fn shared_abi(ok: bool) {
+    if !ok {
+        SHARED_ABI_FAILURES.fetch_add(1, Ordering::SeqCst);
+    }
+}
 unsafe extern "thiscall" fn unused(_: *mut c_void) -> bool {
     false
 }
-unsafe extern "thiscall" fn native_send(
+unsafe extern "thiscall" fn third_party_send(
     _: *mut c_void,
     _: u64,
     _: *const c_void,
@@ -129,19 +152,53 @@ unsafe extern "thiscall" fn native_send(
     _: i32,
     _: i32,
 ) -> bool {
-    NATIVE_SENDS.fetch_add(1, Ordering::SeqCst);
     true
 }
-unsafe extern "thiscall" fn native_available(_: *mut c_void, size: *mut u32, channel: i32) -> bool {
-    let packets = NATIVE_PACKETS.lock().unwrap();
+unsafe extern "thiscall" fn native_send(
+    this: *mut c_void,
+    remote: u64,
+    data: *const c_void,
+    length: u32,
+    kind: i32,
+    channel: i32,
+) -> bool {
+    NATIVE_SENDS.fetch_add(1, Ordering::SeqCst);
+    if shared_this(this) {
+        let bytes = (!data.is_null())
+            .then(|| std::slice::from_raw_parts(data.cast::<u8>(), length as usize));
+        shared_abi(
+            remote == SHARED_REMOTE
+                && remote >> 32 != 0
+                && bytes == Some(SHARED_PAYLOAD)
+                && kind == 2
+                && channel == SHARED_CHANNEL,
+        );
+        SHARED_SENDS.fetch_add(1, Ordering::SeqCst);
+    }
+    true
+}
+unsafe extern "thiscall" fn native_available(
+    this: *mut c_void,
+    size: *mut u32,
+    channel: i32,
+) -> bool {
+    let packets = NATIVE_PACKETS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some((_, _, payload)) = packets.iter().find(|(_, c, _)| *c == channel) else {
+        if shared_this(this) {
+            shared_abi(!size.is_null() && channel == 3);
+            SHARED_AVAILABLE.fetch_add(1, Ordering::SeqCst);
+        }
         return false;
     };
+    if shared_this(this) {
+        shared_abi(!size.is_null() && channel == SHARED_CHANNEL && payload == SHARED_PAYLOAD);
+        SHARED_AVAILABLE.fetch_add(1, Ordering::SeqCst);
+    }
     size.write(payload.len() as u32);
     true
 }
 unsafe extern "thiscall" fn native_read(
-    _: *mut c_void,
+    this: *mut c_void,
     destination: *mut c_void,
     capacity: u32,
     size: *mut u32,
@@ -149,24 +206,65 @@ unsafe extern "thiscall" fn native_read(
     channel: i32,
 ) -> bool {
     NATIVE_READS.fetch_add(1, Ordering::SeqCst);
-    let mut packets = NATIVE_PACKETS.lock().unwrap();
+    let mut packets = NATIVE_PACKETS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(index) = packets.iter().position(|(_, c, _)| *c == channel) else {
         return false;
     };
-    let (peer, _, payload) = packets.remove(index).unwrap();
+    let Some((peer, _, payload)) = packets.remove(index) else {
+        return false;
+    };
+    if shared_this(this) {
+        shared_abi(
+            !destination.is_null()
+                && !size.is_null()
+                && !remote.is_null()
+                && peer == SHARED_REMOTE
+                && peer >> 32 != 0
+                && channel == SHARED_CHANNEL
+                && capacity == SHARED_PAYLOAD.len() as u32
+                && payload == SHARED_PAYLOAD,
+        );
+        SHARED_READS.fetch_add(1, Ordering::SeqCst);
+    }
     let length = payload.len().min(capacity as usize);
     std::ptr::copy_nonoverlapping(payload.as_ptr(), destination.cast::<u8>(), length);
     size.write(length as u32);
     remote.write_unaligned(peer);
     true
 }
-unsafe extern "thiscall" fn native_peer(_: *mut c_void, _: u64) -> bool {
+unsafe extern "thiscall" fn native_peer(this: *mut c_void, remote: u64) -> bool {
+    if shared_this(this) {
+        shared_abi(remote == SHARED_REMOTE && remote >> 32 != 0);
+        SHARED_PEERS.fetch_add(1, Ordering::SeqCst);
+    }
     true
 }
-unsafe extern "thiscall" fn native_channel(_: *mut c_void, _: u64, _: i32) -> bool {
+unsafe extern "thiscall" fn native_channel(this: *mut c_void, remote: u64, channel: i32) -> bool {
+    if shared_this(this) {
+        shared_abi(remote == SHARED_REMOTE && remote >> 32 != 0 && channel == SHARED_CHANNEL);
+        SHARED_CHANNELS.fetch_add(1, Ordering::SeqCst);
+    }
     true
 }
-unsafe extern "thiscall" fn native_session(_: *mut c_void, _: u64, _: *mut c_void) -> bool {
+unsafe extern "thiscall" fn native_session(
+    this: *mut c_void,
+    remote: u64,
+    result: *mut c_void,
+) -> bool {
+    if shared_this(this) {
+        shared_abi(!result.is_null() && remote == SHARED_REMOTE && remote >> 32 != 0);
+        if !result.is_null() {
+            std::ptr::copy_nonoverlapping(
+                SHARED_SESSION.as_ptr(),
+                result.cast::<u8>(),
+                SHARED_SESSION.len(),
+            );
+        }
+        SHARED_SESSIONS.fetch_add(1, Ordering::SeqCst);
+        return true;
+    }
     false
 }
 #[repr(C)]
@@ -216,7 +314,10 @@ unsafe fn run() {
         native_channel as *const () as usize,
         native_session as *const () as usize,
     ]);
-    let mut object = Box::new(table.as_ptr() as usize);
+    let original_table = table.as_ptr() as usize;
+    let original_slots = *table;
+    let mut object = Box::new(original_table);
+    let mut shared_object = Box::new(original_table);
     FixtureSetObject((&mut *object) as *mut usize as usize);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -304,6 +405,26 @@ unsafe fn run() {
         workers = hook_workers();
         workers.len() == 2
     });
+    assert_eq!(
+        *object, original_table,
+        "target object must retain its original vtable pointer"
+    );
+    assert_eq!(
+        *shared_object, original_table,
+        "a second object sharing the table must retain its original vtable pointer"
+    );
+    assert!(
+        table[..7]
+            .iter()
+            .zip(original_slots[..7].iter())
+            .all(|(current, original)| current != original),
+        "all seven controlled slots must be replaced in the original table"
+    );
+    assert_eq!(
+        &table[7..],
+        &original_slots[7..],
+        "uncontrolled SteamNetworking006 slots must stay untouched"
+    );
     println!("IPC ready; verifying receive without synthetic callbacks");
     let callback_table = [
         callback_run as *const () as usize,
@@ -326,11 +447,18 @@ unsafe fn run() {
     SteamAPI_RegisterCallback((&mut failure as *mut Callback).cast(), 1203);
     write_message(
         &mut socket,
-        &Message::Members(vec![Peer {
-            client_id: 2,
-            steam_id: 202,
-            epoch: 22,
-        }]),
+        &Message::Members(vec![
+            Peer {
+                client_id: 2,
+                steam_id: 202,
+                epoch: 22,
+            },
+            Peer {
+                client_id: 9,
+                steam_id: SHARED_REMOTE,
+                epoch: 99,
+            },
+        ]),
     )
     .unwrap();
     write_message(&mut socket, &Message::IpcReady).unwrap();
@@ -345,7 +473,7 @@ unsafe fn run() {
         payload: b"abcdef".to_vec(),
     };
     write_message(&mut socket, &Message::Data(incoming.clone())).unwrap();
-    let patched = *object as *const usize;
+    let patched = original_table as *const usize;
     let send: unsafe extern "thiscall" fn(*mut c_void, u64, *const c_void, u32, i32, i32) -> bool =
         transmute(*patched);
     let available: unsafe extern "thiscall" fn(*mut c_void, *mut u32, i32) -> bool =
@@ -361,8 +489,92 @@ unsafe fn run() {
     let close: unsafe extern "thiscall" fn(*mut c_void, u64) -> bool = transmute(*patched.add(4));
     let object = (&mut *object as *mut usize).cast();
     let mut count = 0;
-    assert!(!available(object, &mut count, 4));
     eventually(|| available(object, &mut count, 3));
+    assert_eq!(count, 6);
+    let shared = (&mut *shared_object as *mut usize).cast();
+    SHARED_OBJECT.store(shared as usize, Ordering::Release);
+    let shared_send: unsafe extern "thiscall" fn(
+        *mut c_void,
+        u64,
+        *const c_void,
+        u32,
+        i32,
+        i32,
+    ) -> bool = transmute(*patched);
+    let shared_available: unsafe extern "thiscall" fn(*mut c_void, *mut u32, i32) -> bool =
+        transmute(*patched.add(1));
+    let shared_read: unsafe extern "thiscall" fn(
+        *mut c_void,
+        *mut c_void,
+        u32,
+        *mut u32,
+        *mut u64,
+        i32,
+    ) -> bool = transmute(*patched.add(2));
+    let shared_accept: unsafe extern "thiscall" fn(*mut c_void, u64) -> bool =
+        transmute(*patched.add(3));
+    let shared_close: unsafe extern "thiscall" fn(*mut c_void, u64) -> bool =
+        transmute(*patched.add(4));
+    let shared_close_channel: unsafe extern "thiscall" fn(*mut c_void, u64, i32) -> bool =
+        transmute(*patched.add(5));
+    let shared_session: unsafe extern "thiscall" fn(*mut c_void, u64, *mut c_void) -> bool =
+        transmute(*patched.add(6));
+    // A registered local peer on another object sharing the exact same table must
+    // use native Steam. Its calls also prove the x86 thiscall/u64 ABI is preserved.
+    let mut shared_count = 0;
+    assert!(!shared_available(shared, &mut shared_count, 3));
+    NATIVE_PACKETS
+        .lock()
+        .unwrap()
+        .push_back((SHARED_REMOTE, SHARED_CHANNEL, SHARED_PAYLOAD.to_vec()));
+    assert!(shared_available(shared, &mut shared_count, SHARED_CHANNEL));
+    assert_eq!(shared_count, SHARED_PAYLOAD.len() as u32);
+    let mut shared_bytes = [0u8; SHARED_PAYLOAD.len()];
+    let mut shared_remote = 0;
+    assert!(shared_read(
+        shared,
+        shared_bytes.as_mut_ptr().cast(),
+        shared_bytes.len() as u32,
+        &mut shared_count,
+        &mut shared_remote,
+        SHARED_CHANNEL,
+    ));
+    assert_eq!(shared_bytes.as_slice(), SHARED_PAYLOAD);
+    assert_eq!((shared_count, shared_remote), (SHARED_PAYLOAD.len() as u32, SHARED_REMOTE));
+    assert!(shared_send(
+        shared,
+        SHARED_REMOTE,
+        SHARED_PAYLOAD.as_ptr().cast(),
+        SHARED_PAYLOAD.len() as u32,
+        2,
+        SHARED_CHANNEL,
+    ));
+    assert!(shared_accept(shared, SHARED_REMOTE));
+    assert!(shared_close(shared, SHARED_REMOTE));
+    assert!(shared_close_channel(shared, SHARED_REMOTE, SHARED_CHANNEL));
+    let mut session_with_canaries = [0xa5u8; 28];
+    assert!(shared_session(
+        shared,
+        SHARED_REMOTE,
+        session_with_canaries[4..24].as_mut_ptr().cast(),
+    ));
+    assert_eq!(&session_with_canaries[..4], &[0xa5; 4]);
+    assert_eq!(&session_with_canaries[4..24], &SHARED_SESSION);
+    assert_eq!(&session_with_canaries[24..], &[0xa5; 4]);
+    assert_eq!(
+        (
+            SHARED_SENDS.load(Ordering::SeqCst),
+            SHARED_AVAILABLE.load(Ordering::SeqCst),
+            SHARED_READS.load(Ordering::SeqCst),
+            SHARED_PEERS.load(Ordering::SeqCst),
+            SHARED_CHANNELS.load(Ordering::SeqCst),
+            SHARED_SESSIONS.load(Ordering::SeqCst),
+            SHARED_ABI_FAILURES.load(Ordering::SeqCst),
+        ),
+        (1, 2, 1, 2, 1, 1, 0),
+        "shared object must forward all seven slots to native Steam without ABI damage"
+    );
+    assert!(!available(object, &mut count, 4));
     assert_eq!(count, 6);
     SteamAPI_RunCallbacks();
     assert_eq!(
@@ -461,7 +673,7 @@ unsafe fn run() {
         }
     }
     assert!(send(object, 303, b"native".as_ptr().cast(), 6, 2, 0));
-    assert_eq!(NATIVE_SENDS.load(Ordering::SeqCst), 1);
+    assert_eq!(NATIVE_SENDS.load(Ordering::SeqCst), 2);
     // Validate the actual x86 ABI and IPC path, including buffering across channels.
     for (payload, kind, channel) in [(b"a", 3, 4), (b"b", 3, 5), (b"c", 2, 4)] {
         assert!(send(object, 202, payload.as_ptr().cast(), 1, kind, channel));
@@ -605,12 +817,15 @@ unsafe fn run() {
     write_message(&mut socket, &Message::Stop).unwrap();
     let session: unsafe extern "thiscall" fn(*mut c_void, u64, *mut u8) -> bool =
         transmute(*patched.add(6));
-    let mut state = [0u32; 5];
+    let mut guarded_state = [0xa5a5_a5a5u32; 7];
+    let state = &mut guarded_state[1..6];
     eventually(|| {
         SteamAPI_RunCallbacks();
         session(object, 202, state.as_mut_ptr().cast()) && state[0].to_le_bytes()[2] == 4
     });
     assert_eq!(state[0].to_le_bytes()[0], 0);
+    assert_eq!(guarded_state[0], 0xa5a5_a5a5);
+    assert_eq!(guarded_state[6], 0xa5a5_a5a5);
     assert_eq!(
         FAILURES.load(Ordering::SeqCst),
         0,
@@ -619,8 +834,38 @@ unsafe fn run() {
     assert!(!send(object, 202, b"stopped".as_ptr().cast(), 7, 2, 0));
     assert_eq!(
         NATIVE_SENDS.load(Ordering::SeqCst),
-        1,
+        2,
         "owned peer must not fall back after stop"
+    );
+    // Callback observation must stop a changed interface without ever restoring
+    // an old object or writing over another tool's controlled slot.
+    table[0] = third_party_send as *const () as usize;
+    for _ in 0..60 {
+        SteamAPI_RunCallbacks();
+    }
+    assert!(!session(object, 202, guarded_state[1..6].as_mut_ptr().cast()),
+        "a controlled slot change must make the target Hook terminal");
+    let mut third_table = Box::new([unused as *const () as usize; 22]);
+    third_table[0] = third_party_send as *const () as usize;
+    let third_table_address = third_table.as_ptr() as usize;
+    let mut third_object = Box::new(third_table_address);
+    FixtureSetObject((&mut *third_object) as *mut usize as usize);
+    for _ in 0..60 {
+        SteamAPI_RunCallbacks();
+    }
+    assert_eq!(
+        table[0],
+        third_party_send as *const () as usize,
+        "callback detection must not write the saved hook back over a third-party slot"
+    );
+    assert_eq!(
+        *third_object, third_table_address,
+        "callback detection must not restore the original game object pointer"
+    );
+    assert_eq!(
+        third_table[0],
+        third_party_send as *const () as usize,
+        "callback detection must leave the replacement object's table alone"
     );
     SteamAPI_UnregisterCallback((&mut request as *mut Callback).cast());
     SteamAPI_UnregisterCallback((&mut failure as *mut Callback).cast());

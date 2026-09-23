@@ -46,17 +46,17 @@ pub struct Outbox {
 }
 impl Outbox {
     pub fn pop(&self) -> Option<Packet> {
-        let mut queue = self.queue.lock().unwrap_or_else(|p| p.into_inner());
+        let mut queue = self.queue.lock().expect("poisoned Outbox");
         let packet = queue.pop();
         packet
     }
     fn retain(&self, keep: impl FnMut(&Outgoing) -> bool) {
-        let mut queue = self.queue.lock().unwrap_or_else(|p| p.into_inner());
+        let mut queue = self.queue.lock().expect("poisoned Outbox");
         queue.packets.retain(keep);
         queue.recount();
     }
     fn clear(&self) {
-        let mut queue = self.queue.lock().unwrap_or_else(|p| p.into_inner());
+        let mut queue = self.queue.lock().expect("poisoned Outbox");
         *queue = OutgoingQueue::default();
     }
 }
@@ -298,7 +298,7 @@ impl Bridge {
             .outbound
             .queue
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .expect("poisoned Outbox");
         if outbound.packets.len() >= PACKET_LIMIT || outbound.bytes + bytes.len() > BYTE_LIMIT {
             self.send_rejections.global_full += 1;
             return Some(false);
@@ -593,7 +593,7 @@ impl Bridge {
             .outbound
             .queue
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .expect("poisoned Outbox");
         let (packets, bytes) = outbound
             .packets
             .iter()
@@ -660,7 +660,7 @@ impl Bridge {
             .outbound
             .queue
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .expect("poisoned Outbox")
             .packets
             .iter()
             .map(|p| p.packet.to)
@@ -718,7 +718,7 @@ impl Bridge {
                 .outbound
                 .queue
                 .lock()
-                .unwrap_or_else(|p| p.into_inner());
+                .expect("poisoned Outbox");
             let mut cleared_out = 0;
             for item in outgoing
                 .packets
@@ -749,6 +749,19 @@ impl Bridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poisoned_outbox_is_not_reused() {
+        let mut b = bridge();
+        let outbox = b.outbound.clone();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = outbox.queue.lock().unwrap();
+            panic!("test outbox failure");
+        });
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| b.send(20, b"data", 2, 0))).is_err());
+        assert!(std::panic::catch_unwind(|| outbox.pop()).is_err());
+        assert!(outbox.queue.is_poisoned());
+    }
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
