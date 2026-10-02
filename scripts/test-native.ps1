@@ -1,20 +1,55 @@
+﻿# Requires Windows PowerShell 5.1 or newer. Keep this file UTF-8 with BOM.
+[CmdletBinding()]
+param([switch]$Offline)
+
 $ErrorActionPreference = 'Stop'
 $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
 $PSDefaultParameterValues['*:Encoding'] = 'utf8'
-Set-Location (Split-Path $PSScriptRoot -Parent)
-if (Test-Path (Join-Path $PWD '.local/rustup/settings.toml')) {
-    $env:CARGO_HOME = Join-Path $PWD '.local/cargo'
-    $env:RUSTUP_HOME = Join-Path $PWD '.local/rustup'
-    $taskCargo = & rustup which cargo
-    if ($LASTEXITCODE -ne 0) { throw 'Local Rust toolchain not found' }
-    $taskBin = Split-Path -Parent $taskCargo
-    $env:RUSTC = Join-Path $taskBin 'rustc.exe'
-    $env:RUSTDOC = Join-Path $taskBin 'rustdoc.exe'
-    $env:PATH = "$taskBin;" + $env:PATH
+$repoRoot = Split-Path $PSScriptRoot -Parent
+Set-Location -LiteralPath $repoRoot
+# Use the repository toolchain only when its configured binaries are available.
+# Otherwise preserve the user's normal Rust environment.
+$cargo = $null
+$localRustup = Join-Path $repoRoot '.local\rustup'
+$localSettings = Join-Path $localRustup 'settings.toml'
+if (Test-Path -LiteralPath $localSettings -PathType Leaf) {
+    $settingsText = [IO.File]::ReadAllText($localSettings, [Text.Encoding]::UTF8)
+    $toolchainMatch = [regex]::Match($settingsText, '(?m)^default_toolchain\s*=\s*"([^"/\\]+)"\s*$')
+    if ($toolchainMatch.Success) {
+        $localBin = Join-Path $localRustup ("toolchains\{0}\bin" -f $toolchainMatch.Groups[1].Value)
+        $localCargo = Join-Path $localBin 'cargo.exe'
+        if ((Test-Path -LiteralPath $localCargo -PathType Leaf) -and
+            (Test-Path -LiteralPath (Join-Path $localBin 'rustc.exe') -PathType Leaf) -and
+            (Test-Path -LiteralPath (Join-Path $localBin 'rustdoc.exe') -PathType Leaf)) {
+            $cargo = $localCargo
+            $env:CARGO_HOME = Join-Path $repoRoot '.local\cargo'
+            $env:RUSTUP_HOME = $localRustup
+            $env:RUSTC = Join-Path $localBin 'rustc.exe'
+            $env:RUSTDOC = Join-Path $localBin 'rustdoc.exe'
+            $env:PATH = "$localBin;$env:PATH"
+        }
+    }
 }
-& cargo build -p netburrow-hook -p netburrow-injector --target i686-pc-windows-msvc --locked --offline
+if (-not $cargo) {
+    $cargoCommand = Get-Command cargo.exe -ErrorAction SilentlyContinue
+    if ($cargoCommand) {
+        $cargo = $cargoCommand.Source
+    } else {
+        $userBin = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.cargo\bin'
+        $userCargo = Join-Path $userBin 'cargo.exe'
+        if (Test-Path -LiteralPath $userCargo -PathType Leaf) {
+            $cargo = $userCargo
+            $env:PATH = "$userBin;$env:PATH"
+        }
+    }
+}
+if (-not $cargo) { throw 'Rust not found. Install Rust with the MSVC toolchain; see README.md.' }
+$targetRoot = Join-Path $repoRoot '.local/target'
+$buildArgs = @('build', '-p', 'netburrow-hook', '-p', 'netburrow-injector', '--target', 'i686-pc-windows-msvc', '--locked', '--target-dir', $targetRoot)
+if ($Offline) { $buildArgs += '--offline' }
+& $cargo @buildArgs
 if ($LASTEXITCODE) { throw 'Native build failed' }
 $fixture = Join-Path $PWD '.local/native-fixture'
 New-Item -ItemType Directory -Path $fixture -Force | Out-Null

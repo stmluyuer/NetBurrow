@@ -4,6 +4,7 @@ param(
     [switch]$SkipBuild,
     [switch]$ClientOnly,
     [switch]$KeepVersion,
+    [switch]$Offline,
     [ValidatePattern('^[a-z0-9][a-z0-9-]{0,31}$')]
     [string]$PackageLabel,
     [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$')]
@@ -23,25 +24,43 @@ if ($PSBoundParameters.ContainsKey('ReleaseNotesPath')) {
 }
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $repoRoot
-$cargoHome = Join-Path $repoRoot '.local\cargo'
-$rustupHome = Join-Path $repoRoot '.local\rustup'
-$env:RUSTUP_HOME = $rustupHome
-$rustupCommand = Get-Command rustup.exe -ErrorAction SilentlyContinue
-if (-not $rustupCommand) {
-    $userRustup = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.cargo\bin\rustup.exe'
-    if (Test-Path -LiteralPath $userRustup -PathType Leaf) {
-        $rustupCommand = Get-Item -LiteralPath $userRustup
+# Use the repository toolchain only when its configured binaries are available.
+# Otherwise preserve the user's normal Rust environment.
+$cargo = $null
+$localRustup = Join-Path $repoRoot '.local\rustup'
+$localSettings = Join-Path $localRustup 'settings.toml'
+if (Test-Path -LiteralPath $localSettings -PathType Leaf) {
+    $settingsText = [IO.File]::ReadAllText($localSettings, [Text.Encoding]::UTF8)
+    $toolchainMatch = [regex]::Match($settingsText, '(?m)^default_toolchain\s*=\s*"([^"/\\]+)"\s*$')
+    if ($toolchainMatch.Success) {
+        $localBin = Join-Path $localRustup ("toolchains\{0}\bin" -f $toolchainMatch.Groups[1].Value)
+        $localCargo = Join-Path $localBin 'cargo.exe'
+        if ((Test-Path -LiteralPath $localCargo -PathType Leaf) -and
+            (Test-Path -LiteralPath (Join-Path $localBin 'rustc.exe') -PathType Leaf) -and
+            (Test-Path -LiteralPath (Join-Path $localBin 'rustdoc.exe') -PathType Leaf)) {
+            $cargo = $localCargo
+            $env:CARGO_HOME = Join-Path $repoRoot '.local\cargo'
+            $env:RUSTUP_HOME = $localRustup
+            $env:RUSTC = Join-Path $localBin 'rustc.exe'
+            $env:RUSTDOC = Join-Path $localBin 'rustdoc.exe'
+            $env:PATH = "$localBin;$env:PATH"
+        }
     }
 }
-if (-not $rustupCommand) { throw '无法找到 rustup.exe，请先安装 Rust 或将 Cargo bin 目录加入 PATH。' }
-$rustupPath = if ($rustupCommand -is [System.IO.FileInfo]) {
-    $rustupCommand.FullName
-} else {
-    $rustupCommand.Source
+if (-not $cargo) {
+    $cargoCommand = Get-Command cargo.exe -ErrorAction SilentlyContinue
+    if ($cargoCommand) {
+        $cargo = $cargoCommand.Source
+    } else {
+        $userBin = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.cargo\bin'
+        $userCargo = Join-Path $userBin 'cargo.exe'
+        if (Test-Path -LiteralPath $userCargo -PathType Leaf) {
+            $cargo = $userCargo
+            $env:PATH = "$userBin;$env:PATH"
+        }
+    }
 }
-$cargo = & $rustupPath which cargo
-if ($LASTEXITCODE -ne 0) { throw '无法找到仓库本地默认 Rust 工具链。' }
-$toolBin = Split-Path -Parent $cargo
+if (-not $cargo) { throw 'Rust not found. Install Rust with the MSVC toolchain; see README.md.' }
 $distRoot = Join-Path $repoRoot '.local\dist'
 $targetRoot = Join-Path $repoRoot '.local\target'
 
@@ -103,6 +122,12 @@ $releaseManifestJson = $null
 if ($PSBoundParameters.ContainsKey('ReleaseNotesPath')) {
     $releaseManifestJson = New-ReleaseManifestJson -NotesPath $ReleaseNotesPath -ReleaseVersion $Version
 }
+$licenseFiles = @('LICENSE', 'THIRD_PARTY_LICENSES.txt')
+foreach ($name in $licenseFiles) {
+    if (-not (Test-Path -LiteralPath (Join-Path $repoRoot $name) -PathType Leaf)) {
+        throw "Missing required license file: $name"
+    }
+}
 
 function Write-UpdateManifest {
     if ($null -eq $releaseManifestJson) { return }
@@ -117,16 +142,6 @@ function Write-UpdateManifest {
     Write-Output "  $updateManifestPath"
     Write-Output '不要上传 relay-source.zip、配置、日志或整个 dist 目录。'
 }
-
-if (-not (Test-Path -LiteralPath $cargo -PathType Leaf)) {
-    throw "未找到仓库指定的 Rust 工具链：$cargo"
-}
-
-$env:CARGO_HOME = $cargoHome
-$env:RUSTUP_HOME = $rustupHome
-$env:RUSTC = Join-Path $toolBin 'rustc.exe'
-$env:RUSTDOC = Join-Path $toolBin 'rustdoc.exe'
-$env:PATH = "$toolBin;$env:PATH"
 
 function Remove-DistItem {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -143,7 +158,8 @@ function Remove-DistItem {
 }
 
 function Invoke-Cargo {
-    $Arguments = $args
+    $Arguments = @($args)
+    if ($Offline) { $Arguments += '--offline' }
 
     & $cargo @Arguments
     if ($LASTEXITCODE -ne 0) {
@@ -179,9 +195,9 @@ if ($Version -ne $currentVersion) {
 
 if (-not $SkipBuild) {
     # Refresh workspace package versions in Cargo.lock without updating dependencies.
-    Invoke-Cargo metadata --offline --format-version 1 | Out-Null
-    Invoke-Cargo build --release --locked --offline --target x86_64-pc-windows-msvc -p netburrow-app
-    Invoke-Cargo build --release --locked --offline --target i686-pc-windows-msvc -p netburrow-injector -p netburrow-hook
+    Invoke-Cargo metadata --format-version 1 | Out-Null
+    Invoke-Cargo build --release --locked --target-dir $targetRoot --target x86_64-pc-windows-msvc -p netburrow-app
+    Invoke-Cargo build --release --locked --target-dir $targetRoot --target i686-pc-windows-msvc -p netburrow-injector -p netburrow-hook
     $hashes = @($appBinary, $injectorBinary, $hookDll | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash })
     @{ version = $Version; hashes = $hashes } | ConvertTo-Json | Set-Content -LiteralPath $buildRecord -Encoding UTF8
 } else {
@@ -205,6 +221,9 @@ New-Item -ItemType Directory -Force -Path $appStage | Out-Null
 Copy-Item -LiteralPath $appBinary -Destination (Join-Path $appStage 'NetBurrow.exe') -Force
 Copy-Item -LiteralPath $injectorBinary -Destination (Join-Path $appStage 'netburrow-injector.exe') -Force
 Copy-Item -LiteralPath $hookDll -Destination (Join-Path $appStage 'netburrow_hook.dll') -Force
+foreach ($name in $licenseFiles) {
+    Copy-Item -LiteralPath (Join-Path $repoRoot $name) -Destination (Join-Path $appStage $name) -Force
+}
 Get-ChildItem -LiteralPath $appStage -File -Recurse | Where-Object { $_.LastWriteTime.Year -lt 1980 -or $_.LastWriteTime.Year -gt 2107 } | ForEach-Object { $_.LastWriteTime = Get-Date }
 Write-PortableZip -Source $appStage -Destination $appZip
 Write-Output "已生成：$appZip"
@@ -226,6 +245,7 @@ default-members = ["crates/netburrow-relay"]
 version = "__PACKAGE_VERSION__"
 edition = "2024"
 publish = false
+license = "MIT"
 
 [workspace.dependencies]
 netburrow-protocol = { path = "crates/netburrow-protocol" }
@@ -244,7 +264,11 @@ Copy-Item -LiteralPath (Join-Path $repoRoot 'crates\netburrow-protocol') -Destin
 Copy-Item -LiteralPath (Join-Path $repoRoot 'crates\netburrow-relay') -Destination (Join-Path $relayStage 'crates\netburrow-relay') -Recurse -Force
 New-Item -ItemType Directory -Force -Path (Join-Path $relayStage 'docs') | Out-Null
 Copy-Item -LiteralPath (Join-Path $repoRoot 'docs\server-ai-handoff.md') -Destination (Join-Path $relayStage 'docs\server-ai-handoff.md') -Force
-Invoke-Cargo generate-lockfile --offline --manifest-path (Join-Path $relayStage 'Cargo.toml')
+Copy-Item -LiteralPath (Join-Path $repoRoot 'Cargo.lock') -Destination (Join-Path $relayStage 'Cargo.lock') -Force
+foreach ($name in $licenseFiles) {
+    Copy-Item -LiteralPath (Join-Path $repoRoot $name) -Destination (Join-Path $relayStage $name) -Force
+}
+Invoke-Cargo metadata --format-version 1 --manifest-path (Join-Path $relayStage 'Cargo.toml') | Out-Null
 Get-ChildItem -LiteralPath $relayStage -File -Recurse | Where-Object { $_.LastWriteTime.Year -lt 1980 -or $_.LastWriteTime.Year -gt 2107 } | ForEach-Object { $_.LastWriteTime = Get-Date }
 Write-PortableZip -Source $relayStage -Destination $relayZip
 
