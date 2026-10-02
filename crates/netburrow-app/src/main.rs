@@ -69,7 +69,6 @@ fn main() {
         WINDOW_TITLE,
         native_options,
         Box::new(move |creation_context| {
-            configure_fonts(&creation_context.egui_ctx);
             configure_style(&creation_context.egui_ctx);
             Ok(Box::new(NetBurrowApp::new(
                 creation_context.egui_ctx.clone(),
@@ -139,6 +138,16 @@ impl NetBurrowApp {
             settings.language = netburrow_core::i18n::Language::En;
         }
         netburrow_core::i18n::set_language(settings.language);
+        let chinese_font_available = configure_fonts(&context);
+        let font_notice = if !chinese_font_available
+            && settings.language == netburrow_core::i18n::Language::ZhCn
+        {
+            // Keep the saved preference; only this session falls back to readable text.
+            netburrow_core::i18n::set_language(netburrow_core::i18n::Language::En);
+            Some("Chinese system fonts are unavailable. Using English for this session; install Simplified Chinese fonts in Windows to use Chinese.".to_owned())
+        } else {
+            None
+        };
         let stop_requested = Arc::new(AtomicBool::new(false));
         let quit_requested = Arc::new(AtomicBool::new(false));
         let update_check_at = (!smoke_test && !cfg!(test) && settings.auto_check_updates)
@@ -155,7 +164,7 @@ impl NetBurrowApp {
             update_check_at,
             client: None,
             last_snapshot: Snapshot::default(),
-            notice: None,
+            notice: font_notice,
             config_error,
             requires_explicit_save,
             view: ViewState::default(),
@@ -594,17 +603,46 @@ fn bold(size: f32) -> egui::FontId {
     egui::FontId::new(size, egui::FontFamily::Name("ui-bold".into()))
 }
 
-fn configure_fonts(context: &egui::Context) {
+#[cfg(windows)]
+fn system_font_directory() -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+
+    let mut buffer = vec![0u16; 260];
+    let mut length = unsafe { GetSystemWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    if length as usize >= buffer.len() {
+        buffer.resize(length as usize, 0);
+        length = unsafe { GetSystemWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    }
+    if length == 0 || length as usize >= buffer.len() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length as usize])).join("Fonts"))
+}
+
+#[cfg(not(windows))]
+fn system_font_directory() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Returns whether a Chinese font was loaded, so startup can avoid missing glyphs.
+fn configure_fonts(context: &egui::Context) -> bool {
     let mut fonts = egui::FontDefinitions::default();
     let mut regular = Vec::new();
     let mut heavy = Vec::new();
+    let directory = system_font_directory();
+    let mut chinese_font_available = false;
     for (name, file, is_bold) in [
         ("latin", "segoeui.ttf", false),
         ("cjk", "msyh.ttc", false),
+        ("cjk-fallback", "simsun.ttc", false),
         ("latin-bold", "segoeuib.ttf", true),
         ("cjk-bold", "msyhbd.ttc", true),
     ] {
-        if let Ok(bytes) = std::fs::read(Path::new(r"C:\Windows\Fonts").join(file)) {
+        let Some(directory) = &directory else { break };
+        if name == "cjk-fallback" && chinese_font_available { continue; }
+        if let Ok(bytes) = std::fs::read(directory.join(file)) {
+            chinese_font_available |= name == "cjk" || name == "cjk-fallback";
             fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_owned(bytes)));
             if is_bold { heavy.push(name.to_owned()); } else { regular.push(name.to_owned()); }
         }
@@ -616,6 +654,7 @@ fn configure_fonts(context: &egui::Context) {
     fonts.families.insert(egui::FontFamily::Proportional, regular);
     fonts.families.insert(egui::FontFamily::Name("ui-bold".into()), heavy);
     context.set_fonts(fonts);
+    chinese_font_available
 }
 
 #[cfg(windows)]

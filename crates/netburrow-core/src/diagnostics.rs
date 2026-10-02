@@ -58,7 +58,7 @@ pub fn record_batch<'a>(level: &str, records: impl IntoIterator<Item = (&'a str,
     );
     if let Err(error) = result {
         *LAST_ERROR.lock().unwrap_or_else(|p| p.into_inner()) =
-            Some(crate::text_format!("无法写入日志：{error}", "Cannot write logs: {error}"));
+            Some(error.to_string());
     }
 }
 #[cfg(windows)]
@@ -71,7 +71,8 @@ pub(crate) fn network_history(lines: &[String]) {
         text.push_str(&format!("{stamp} pid={} {}\n", std::process::id(), clean(line)));
     }
     if let Err(error) = append(&directory().join("network.log"), text.as_bytes(), 8 * 1024 * 1024) {
-        *LAST_ERROR.lock().unwrap_or_else(|p| p.into_inner()) = Some(format!("网络日志写入失败：{error}"));
+        *LAST_ERROR.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(format!("Cannot write network log: {error}"));
     }
 }
 fn append(path: &Path, bytes: &[u8], limit: u64) -> io::Result<()> {

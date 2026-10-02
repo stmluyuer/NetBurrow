@@ -563,7 +563,7 @@ impl NetBurrowApp {
             ui.checkbox(&mut self.view.log_follow, netburrow_core::text!("自动滚动", "Auto-scroll"));
         });
         if let Some(error) = netburrow_core::diagnostics::last_error() {
-            ui.colored_label(Color32::from_rgb(174, 65, 60), error);
+            ui.colored_label(Color32::from_rgb(174, 65, 60), netburrow_core::text_format!("无法写入日志：{error}", "Cannot write logs: {error}"));
         }
         ui.separator();
         let query = self.view.log_query.to_lowercase();
