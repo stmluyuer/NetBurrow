@@ -1,21 +1,20 @@
-# NetBurrow Relay 服务器交接
+# NetBurrow Relay 部署与更新
 
-这份说明交给 VPS 上的 AI 执行。它只更新 Relay 源码和既有服务，不部署数据库、不开放新端口、不改客户端配置，也不访问用户未授权的机器。所有命令完成后应把实际分支、commit、构建结果、服务状态和回滚点回报给用户。
+本说明供服务器管理员首次部署或更新 Relay。执行者只操作已获授权的机器；首次部署需要创建运行账户、服务和 TCP/UDP 规则，更新已有服务时保留其账户、端口、路径和配置。部署不需要数据库。记录来源、构建结果、服务状态及更新时的回滚点。
 
-## 固定来源和更新原则
+## 取得固定来源
 
-2026-09-16 的序号诊断和队友探测需要新版 Relay 配合。扩展通过保留 Ping 值协商；旧客户端仍走原协议，新客户端连接旧 Relay 时继续通信但不启用两项诊断。部署无需新增端口、配置项或数据迁移。完整诊断需要双方客户端均更新；TCP 探测成功不代表游戏正在推进。此说明不代表当前服务器已更新，部署仍须使用用户指定的固定来源。
+以下两种来源选一种。使用普通部署账户准备源码；不要在正在服务的目录执行 `git pull`。Linux 构建需要 Git（仅 Git 来源）、支持 Rust 2024 edition 及锁定依赖的 Rust 工具链、C 编译器和链接器。使用源码 ZIP 还需 unzip、sha256sum。先用 `rustc --version` 和 `cargo --version` 确认环境；首次构建需要获取依赖，源码 ZIP 本身不含离线依赖缓存。
 
-GitHub 仓库是 `https://github.com/stmluyuer/NetBurrow.git`，当前发布分支是 `main`。服务器端不得用浮动的 `HEAD`、默认分支或未确认的本地改动构建。
+### 从 Git 取得源码
 
-先以普通部署用户取得指定分支，并把远端引用解析为固定 commit。Git 的显式 refspec 会把远端分支写到指定远端跟踪引用，`git fetch` 的行为见 [Git 官方文档](https://git-scm.com/docs/git-fetch)。
+使用发布者指定的分支或标签对应的固定提交。以下示例取得 `main` 的当前提交并锁定到独立目录；部署前核对打印出的提交确为本次要部署的版本。
 
 ```bash
+set -euo pipefail
 REPO=https://github.com/stmluyuer/NetBurrow.git
 BRANCH=main
-SOURCE=/opt/netburrow/source
-
-set -euo pipefail
+SOURCE="$HOME/netburrow-source"
 if [ ! -d "$SOURCE/.git" ]; then
   git clone --branch "$BRANCH" --single-branch "$REPO" "$SOURCE"
 fi
@@ -23,20 +22,55 @@ git -C "$SOURCE" fetch --no-tags origin "refs/heads/$BRANCH:refs/remotes/origin/
 COMMIT=$(git -C "$SOURCE" rev-parse "refs/remotes/origin/$BRANCH")
 git -C "$SOURCE" cat-file -e "$COMMIT^{commit}"
 git -C "$SOURCE" show --no-patch --format='commit=%H%nsubject=%s' "$COMMIT"
-```
-
-后续步骤只使用输出的 `$COMMIT`。如已有工作树，创建一个脱离分支的临时工作树；不要在正在服务的目录执行 `git pull`。
-
-```bash
-STAGE="/opt/netburrow/stage-$COMMIT"
+SOURCE_ID="$COMMIT"
+STAGE="$HOME/netburrow-stage-$SOURCE_ID"
 git -C "$SOURCE" worktree add --detach "$STAGE" "$COMMIT"
 ```
 
-`NetBurrow-<版本>-relay-source.zip` 仍可用于离线交付；源码 ZIP 中已经裁剪为 Relay 和协议 workspace。GitHub 更新优先使用完整 workspace，因为下方检查需要在完整 workspace 中运行。使用 ZIP 时把解压根目录设为 `$STAGE`，仍显式使用 `TARGET_DIR="$STAGE/.local/target"` 和相同的 `cargo ... --target-dir "$TARGET_DIR"` 命令。
+后续只使用该 `$STAGE` 和 `$SOURCE_ID`。重试时可复用同一干净工作树，不要覆盖已有改动。
 
-## 先核查现有服务，再构建验证
+### 从 Relay 源码 ZIP 取得源码
 
-不要凭本文示例重建或覆盖现有 unit。先核查实际服务名、运行账户、工作目录、`ExecStart`、TCP/UDP 端口和当前二进制路径，保留这些既有布局：
+`NetBurrow-<版本>-relay-source.zip` 只包含 Relay 和协议 workspace，不依赖 Git。把 `ZIP` 改为收到的文件路径；包的 SHA-256 作为此次来源标识，后续备份不再依赖 Git 变量。
+
+```bash
+set -euo pipefail
+ZIP="$HOME/NetBurrow-<版本>-relay-source.zip"
+ZIP_HASH=$(sha256sum "$ZIP" | cut -d ' ' -f 1)
+SOURCE_ID="zip-$ZIP_HASH"
+STAGE="$HOME/netburrow-stage-$SOURCE_ID"
+mkdir "$STAGE"
+unzip "$ZIP" -d "$STAGE"
+printf 'source=%s\n' "$SOURCE_ID"
+```
+
+应通过可信渠道取得 ZIP；自行计算的哈希只标识该文件，并不证明发布者身份。离线构建还需提前在兼容 Linux 环境准备 Cargo 依赖缓存，再给后续 Cargo 命令添加 `--offline`。项目与第三方许可材料位于源码仓库及 ZIP 根目录，再分发时请一并保留。
+
+## 首次部署：账户和组白名单
+
+已有服务请跳到下一节。以下首次部署示例适用于使用 systemd 的 Linux，并以 `netburrow-relay.service`、端口 `24872` 为例。先确认这些路径和名称尚未用于现有服务；不要将示例直接覆盖到已有 unit 上。
+
+```bash
+set -euo pipefail
+if systemctl cat netburrow-relay.service >/dev/null 2>&1; then
+  echo 'Service already exists; use the update procedure.' >&2
+  exit 1
+fi
+if ! id netburrow >/dev/null 2>&1; then
+  sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin netburrow
+fi
+sudo install -d -o root -g netburrow -m 0750 /etc/netburrow
+sudo install -d -o root -g root -m 0755 /opt/netburrow/bin
+sudoedit /etc/netburrow/allowed-groups.txt
+sudo chown root:netburrow /etc/netburrow/allowed-groups.txt
+sudo chmod 0640 /etc/netburrow/allowed-groups.txt
+```
+
+在 `sudoedit` 中填入实际授权组码，每行一个 `NB1-` 加 64 位十六进制字符，允许空行和 `#` 开头的注释。由客户端“新建组”生成组码，再由管理员登记；不要照抄示例凭据或把真实组码提交到仓库。名单不能为空。将已登记组码私下交给参与者，客户端填写服务器的 `主机名或IP:24872`。
+
+## 核查配置并构建
+
+更新已有服务时，先核对实际服务名、运行账户、工作目录、`ExecStart`、TCP/UDP 端口、白名单与当前二进制路径：
 
 ```bash
 sudo systemctl cat netburrow-relay.service
@@ -47,51 +81,89 @@ sudo systemctl status netburrow-relay.service --no-pager
 sudo ss -ltnup | grep ':24872' || true
 ```
 
-在未停止服务前，以该 unit 的普通 `User`/`Group` 在 `$STAGE` 内构建和测试。项目不固定 Rust 版本，使用该用户已配置的工具链；需支持 Rust 2024 edition 并满足锁定依赖的最低版本要求。Linux Relay 无需安装 Windows target。先确认工具链可用，再执行构建：
+首次部署使用下方示例值；更新时按现有配置填写。源码的构建和测试由普通部署账户完成，不停止服务；配置检查用服务账户，确认实际读取权限。Linux Relay 无需安装 Windows target。
 
 ```bash
 set -euo pipefail
-rustc --version
-cargo --version
-
 cd "$STAGE"
 TARGET_DIR="$STAGE/.local/target"
-RELAY_BIND=0.0.0.0:24872       # 以现有 ExecStart 的 --bind 为准
-RELAY_MAX_CLIENTS=1024         # 以现有 ExecStart 的 --max-clients 为准
-RELAY_ALLOWED_GROUPS=/etc/netburrow/allowed-groups.txt  # 以现有 --allowed-groups-file 为准
+SERVICE_USER=netburrow
+RELAY_BIND=0.0.0.0:24872
+RELAY_MAX_CLIENTS=1024
+RELAY_ALLOWED_GROUPS=/etc/netburrow/allowed-groups.txt
 cargo test -p netburrow-protocol -p netburrow-relay --locked --target-dir "$TARGET_DIR"
 cargo build --release -p netburrow-relay --locked --target-dir "$TARGET_DIR"
-"$TARGET_DIR/release/netburrow-relay" --check-config --bind "$RELAY_BIND" --max-clients "$RELAY_MAX_CLIENTS" --allowed-groups-file "$RELAY_ALLOWED_GROUPS"
+# The service account may not traverse the deploy user's home directory.
+# Check with a temporary executable accessible to that account.
+CHECK_BINARY=$(mktemp /tmp/netburrow-check.XXXXXX)
+trap 'rm -f "$CHECK_BINARY"' EXIT
+install -m 0755 "$TARGET_DIR/release/netburrow-relay" "$CHECK_BINARY"
+sudo -u "$SERVICE_USER" "$CHECK_BINARY" --check-config --bind "$RELAY_BIND" --max-clients "$RELAY_MAX_CLIENTS" --allowed-groups-file "$RELAY_ALLOWED_GROUPS"
+rm -f "$CHECK_BINARY"
+trap - EXIT
 ```
 
-`--locked` 会要求现有 `Cargo.lock` 不发生依赖解析变更，详见 [Cargo build 官方文档](https://doc.rust-lang.org/cargo/commands/cargo-build.html)。`--target-dir` 必须显式指定，因为完整仓库 `.cargo/config.toml` 把产物定向到 `.local/target`；源码 ZIP 也使用同样的显式 target 目录。命令在完整 Linux workspace 中执行，不需要安装 `i686-pc-windows-msvc` 或 `x86_64-pc-windows-msvc` target。构建或检查失败时删除临时工作树并保留旧服务，不停服。
+`--locked` 要求不修改锁定依赖。显式 `--target-dir` 使完整 Git workspace 和裁剪 ZIP 使用相同产物路径。构建或检查失败时保留旧服务，不切换二进制。
 
-组白名单在启动时从现有 `--allowed-groups-file` 加载，不输出组码。参数缺失、文件不可读、内容无效或名单为空时拒绝启动；未授权的 Join 在分配成员编号和 UDP 凭据前被拒绝。白名单在进程内不变，Resume 只能凭恢复凭据恢复本进程中已获准的会话，不能创建新成员。保留现有名单和文件权限，不把真实组码提交到仓库。
+组白名单仅在启动时加载，缺失、不可读、无效或为空时拒绝启动。新增组需修改名单，并在没有对局时重启 Relay；只修改文件不会立即生效。未授权 Join 在分配成员编号和 UDP 凭据前被拒绝。Resume 只能恢复本进程已获准的会话。
 
-## 经验证后切换和回滚
+队列和可靠重放共同计入内存预算。默认总预算为 64 MiB，按白名单中的授权组数均分；同时保留每客户端 4 MiB 上限。不要堆积无用的授权组，否则每组可用预算会下降。组码不是 Steam 账号认证，连接没有 TLS；此工具不适合作为公开匹配服务。
 
-只有上述构建、测试和 `--check-config` 都通过后，才安排一局结束后的短暂停服。把下列变量替换为核查得到的真实值；保持端口、账户、unit 名称、参数和工作目录不变。
+## 首次部署：安装并启动
+
+仅在上述测试、构建和配置检查通过后执行。下面 unit 对应首次部署示例值；修改地址、端口或白名单路径时，同步修改并重新运行配置检查。
+
+```bash
+set -euo pipefail
+sudo install -o root -g root -m 0755 "$TARGET_DIR/release/netburrow-relay" /opt/netburrow/bin/netburrow-relay
+# noclobber prevents replacing an existing unit file.
+sudo sh -c 'set -C; cat > /etc/systemd/system/netburrow-relay.service' <<'UNIT'
+[Unit]
+Description=NetBurrow Relay
+After=network.target
+
+[Service]
+User=netburrow
+Group=netburrow
+ExecStart=/opt/netburrow/bin/netburrow-relay --bind 0.0.0.0:24872 --max-clients 1024 --allowed-groups-file /etc/netburrow/allowed-groups.txt
+Restart=on-failure
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+sudo systemctl daemon-reload
+sudo systemctl enable --now netburrow-relay.service
+sudo systemctl status netburrow-relay.service --no-pager
+sudo ss -ltnup | grep ':24872'
+```
+
+按服务器实际防火墙和云安全组放行所选端口的 TCP 与 UDP，范围限于需要接入的网络；不要增加其他管理端口。先检查端口监听，再进行小范围客户端连接测试。失败时查看本服务 journal，不要反复覆盖 unit。
+
+## 更新已有服务：切换和回滚
+
+仅在构建、测试和配置检查通过后，安排一局结束后的短暂停服。把下列变量改为核查得到的真实值，保持既有布局；`$SOURCE_ID` 对 Git 和 ZIP 路径都已定义。
 
 ```bash
 set -euo pipefail
 SERVICE=netburrow-relay.service
-SERVICE_USER=netburrow                  # 以 systemctl show 的 User 为准
-SERVICE_GROUP=netburrow                 # 以 systemctl show 的 Group 为准
-CURRENT_BINARY=/opt/netburrow/target/release/netburrow-relay  # 以 ExecStart 实际路径为准
+SERVICE_USER=netburrow
+SERVICE_GROUP=netburrow
+CURRENT_BINARY=/opt/netburrow/bin/netburrow-relay
 NEW_BINARY="$STAGE/.local/target/release/netburrow-relay"
 BACKUP_DIR=/opt/netburrow/backups
-
+BACKUP_BINARY="$BACKUP_DIR/netburrow-relay.$(date +%Y%m%d-%H%M%S).$SOURCE_ID.previous"
 sudo install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$BACKUP_DIR"
-sudo cp --preserve=mode,timestamps "$CURRENT_BINARY" "$BACKUP_DIR/netburrow-relay.$(date +%Y%m%d-%H%M%S).$COMMIT.previous"
+sudo cp --preserve=mode,timestamps "$CURRENT_BINARY" "$BACKUP_BINARY"
+printf 'backup=%s\n' "$BACKUP_BINARY"
 sudo systemctl stop "$SERVICE"
 sudo install -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0755 "$NEW_BINARY" "$CURRENT_BINARY"
 sudo systemctl start "$SERVICE"
 sudo systemctl status "$SERVICE" --no-pager
 ```
 
-如果启动、监听或小范围连接检查失败，停止 service，把刚才的 `.previous` 备份复制回 `$CURRENT_BINARY`，再启动 service；不要删除旧二进制或修改全局 systemd/journald 设置。成功后也保留旧 binary 和 `$COMMIT`，供下一次回滚使用。
-
-Relay 默认使用 `0.0.0.0:24872`，同一端口需要 TCP 与 UDP。仅在既有 VPS 防火墙和云安全组中核查这两条规则；本更新不应新增管理端口。Relay 组码不是完整认证体系，也没有 TLS，不应作为公开匹配服务。
+如果启动、监听或小范围连接检查失败，停止 service，把记录的 `$BACKUP_BINARY` 复制回 `$CURRENT_BINARY`，再启动；不要删除旧二进制。成功后仍保留旧 binary 和来源标识。更新不应新增端口或修改全局 systemd/journald 设置。
 
 ## 成员状态与兼容性
 
@@ -103,7 +175,7 @@ Relay 默认使用 `0.0.0.0:24872`，同一端口需要 TCP 与 UDP。仅在既�
 
 ### 原会话恢复兼容性
 
-客户端通过保留的 `Ping(0x4e425253554d0001)` 协商恢复能力。新版 Relay 对意外断开的已协商会话保留原成员与游戏绑定约 120 秒，恢复握手核对原连接编号、随机恢复凭据和可靠接收水位。可靠消息保留至确认，重发记录仍计入单连接和全局队列字节预算；过期、明确退出或协议错误会清理。旧客户端保持原断线行为，旧 Relay 不提供此功能。
+客户端通过保留的 `Ping(0x4e425253554d0001)` 协商恢复能力。新版 Relay 对意外断开的已协商会话保留原成员与游戏绑定约 120 秒，恢复握手核对原连接编号、随机恢复凭据和可靠接收水位。可靠消息保留至确认，重发记录仍计入单连接、组和全局队列字节预算；过期、明确退出或协议错误会清理。旧客户端保持原断线行为，旧 Relay 不提供此功能。
 
 新版客户端遇到恢复拒绝仍在 120 秒总预算内重试。Relay 仅在原会话不存在时，以现有 Error 消息返回 `session resume unavailable; rejoin allowed`，明确允许客户端在新连接上重新 Join；Join 仍检查组白名单，Bind 仍检查游戏身份唯一性。仍存在但凭据错误或状态无效的会话不获得该许可；已过期会话先由原清理逻辑移除，随后才允许重新加入。旧客户端收到此错误仍按原逻辑结束恢复，旧 Relay 不返回许可时新版客户端只重试原会话。`session_resume_rejected` 日志记录拒绝类型和原因，不记录恢复凭据。
 
@@ -146,4 +218,4 @@ sudo systemd-analyze cat-config systemd/journald.conf
 
 ## 验收边界
 
-向用户报告固定 `$COMMIT`、Relay 测试和构建结果、旧 binary 备份路径、service 状态、现有 TCP/UDP 规则和 journal 核查结果。然后由两台获授权 Windows 机器测试同组连接、正常 Steam 邀请、开局、过房间、退出以及 UDP 优先收发。不要把 Linux 构建、回环测试或 service 运行描述为真实游戏已验证。
+报告固定 `$SOURCE_ID`、Relay 测试和构建结果、更新时的旧 binary 备份路径、service 状态、TCP/UDP 规则和 journal 核查结果。然后由两台获授权 Windows 机器测试同组连接、正常 Steam 邀请、开局、过房间、退出以及 UDP 优先收发。不要把 Linux 构建、回环测试或 service 运行描述为真实游戏已验证。

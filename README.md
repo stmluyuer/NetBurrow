@@ -4,24 +4,28 @@ NetBurrow 是给《以撒的结合：忏悔+》朋友联机使用的 Windows 工
 
 最近修复了什么、更新时需要注意什么，请看[更新日志](CHANGELOG.md)。
 
+参与开发前可先看[架构、实现来源与验证边界](docs/architecture.md)。当前为实验性工具，构建和本地测试通过不代表真实游戏长时间联机已经稳定。
+
+NetBurrow 自有代码采用 [MIT 许可证](LICENSE)。TractorBeam 仅作为 Hook 策略参考，不是本项目的代码依赖；第三方依赖、字体和资产保留各自许可，见 [第三方许可材料](THIRD_PARTY_LICENSES.txt)。
+
 当前开发版的游戏内接入采用 [TractorBeam 的 Windows Hook 策略](https://github.com/mcthesw/TractorBeam/blob/ea0393f5665dd1e0775d9dc1d0c987304461191c/crates/native-hook/src/windows/steam.rs)：拦截接口创建与 Steam 回调，只替换收发入口并观察原生会话状态；会话接受、关闭和状态结果由 Steam 处理。收发采用替代模式，数据只通过 NetBurrow，不混用原生 Steam 数据通路；同组朋友都应启用工具。Hook 内发送立即按入队顺序处理，接收按频道先进先出；入口被还原后会在回调中重新接管。
 
 本次保留 NetBurrow 的注入初始化、组码、IPC/Relay 协议、成员与游戏实例校验、可靠队列上限及短断恢复，因此无需为这次策略调整更新 Relay。实际收发队列不是逐行复制参考实现，仍保留查询后数据包被清除时要求重新查包的保护。此改动尚未证明原有偶发闪退已消失，需退出游戏并使用完整新包验证真实联机。
 
 ## 使用前准备
 
-先让服务器端 AI 按 [服务器部署说明](docs/server-ai-handoff.md) 构建并启动 Relay。客户端填写的服务器格式是 `主机名或IP:端口`，默认端口为 `24872`，TCP 和 UDP 使用同一个端口。
+由服务器管理员按 [服务器部署说明](docs/server-ai-handoff.md) 首次部署 Relay，或更新已有服务，并登记本次使用的组码。客户端填写的服务器格式是 `主机名或IP:端口`，默认端口为 `24872`，TCP 和 UDP 使用同一个端口。
 
-解压 `NetBurrow-<版本>-win-x64.zip` 到固定目录，不要单独移动其中的 `NetBurrow.exe`、`netburrow-injector.exe` 或 `netburrow_hook.dll`。从 0.2.1 起，客户端 ZIP 只包含这三个文件；闪退采集脚本已内置，文档和手动采集入口仅保留在源码仓库。首次运行时会在 `%LOCALAPPDATA%\NetBurrow\settings.json` 保存本机设置；压缩包不会包含该文件。
+解压 `NetBurrow-<版本>-win-x64.zip` 到固定目录，不要单独移动其中的 `NetBurrow.exe`、`netburrow-injector.exe` 或 `netburrow_hook.dll`。客户端 ZIP 包含这三个程序文件，以及 `LICENSE` 和 `THIRD_PARTY_LICENSES.txt`，再分发时请一并保留许可材料。闪退采集脚本已内置，使用文档和手动采集入口保留在源码仓库。首次运行时会在 `%LOCALAPPDATA%\NetBurrow\settings.json` 保存本机设置；压缩包不会包含该文件。
 
 ## 连接步骤
 
 “启用联机”会先在后台自检配置、32 位游戏与工具文件，再用现有协议短暂连接 Relay 检查握手与成员状态支持；通过后才启用。也可单独点击“启用前自检”。自检不启动游戏或加载 Hook；游戏文件版本会显示，但没有版本白名单，兼容性仍需实际接入确认。检查期间修改连接设置后需重新检查。
 
 1. 打开 `NetBurrow.exe`，填写 Relay 地址。在“游戏与传输设置”中确认游戏路径是实际的 `isaac-ng.exe`。
-2. 点击“创建联机组”创建 `NB1-` 开头的组码，私下发给同一局的朋友；朋友在自己的工具中粘贴同一个组码。
+2. 粘贴管理员提供的已授权组码；同一局的朋友使用相同组码。也可点击“新建组”生成 `NB1-` 开头的组码，先交管理员加入 Relay 白名单，并在无对局时重启 Relay 生效，再私下分享。新建组只在本机生成组码，不会自动获得服务器授权。
 3. 默认选择 TCP。两端和 Relay 都确认可用后，可改为“UDP 优先”：不可靠游戏包走 UDP，可靠包仍走 TCP。
-4. 点击“启用联机”，状态显示“Relay 已连接，请从 Steam 正常启动游戏”后，从 Steam 正常启动游戏并使用原有邀请、开局流程。
+4. 点击“连接”，确认 Relay 已连接并等待游戏后，从 Steam 正常启动游戏并使用原有邀请、开局流程。
 
 启动游戏前工具可以长期等待。游戏关闭后会回到等待状态；重新启动游戏会使用新的实例代号。默认关闭窗口会退出工具并停止联机；开启“关闭窗口时最小化”后，关闭窗口会正常最小化到任务栏，联机继续。该选项切换后自动保存，不会保存尚未确认的连接设置；保存失败会恢复原值。托盘可显示窗口、停止联机或退出。重复启动工具会唤回现有窗口。
 
@@ -110,11 +114,41 @@ Relay 的 stderr 由服务器上的 systemd journal 收集。它只记录生命�
 
 成员退出或重开游戏时，Relay 会丢弃仍发往旧目标的 TCP/UDP 数据，避免发送方因残留包而退出联机。汇总中的 `target_unavailable` 表示同组目标当前不可用，`target_epoch_expired` 表示目标游戏实例已改变；发送方身份或实例不匹配仍记录为 `packet source or epoch is invalid` 并拒绝。此修复需要更新 Relay 才会生效，仅更新客户端不能修复旧 Relay 的连带断线；它也不保证游戏在房主退出后能够继续当前对局。
 
+## 开发者构建与测试
+
+Windows 客户端需要 x64 Windows、Rust MSVC 工具链，以及 Visual Studio Build Tools 的“使用 C++ 的桌面开发”（MSVC x86/x64 工具和 Windows SDK）。安装后打开新的 PowerShell；需要手动配置编译环境时使用 Visual Studio Developer PowerShell。Rust 版本应支持 Rust 2024 edition，并满足 `Cargo.lock` 中依赖的要求；首次构建需要联网下载依赖。
+
+在干净 clone 的仓库根目录执行：
+
+```powershell
+rustup update stable
+rustup default stable
+rustup target add x86_64-pc-windows-msvc i686-pc-windows-msvc
+cargo fetch --locked
+cargo build --locked --target x86_64-pc-windows-msvc -p netburrow-app
+cargo build --locked --target i686-pc-windows-msvc -p netburrow-injector -p netburrow-hook
+```
+
+如果仓库已有 `.local/rustup/settings.toml` 指定且完整可用的工具链，打包和原生测试脚本优先复用它及 `.local/cargo`；否则使用 PATH 或当前用户 `.cargo/bin` 下的正常 Rust 安装。无需复制维护者的 `.local` 目录。常规 `cargo` 命令使用当前 shell 的 Rust 环境。
+
+按改动运行相关检查：
+
+```powershell
+# 协议、Relay、客户端及核心逻辑
+cargo test --locked -p netburrow-protocol -p netburrow-relay -p netburrow-core -p netburrow-app
+# Hook 队列和统计等独立逻辑
+cargo test --locked -p netburrow-hook
+# x86 注入、ABI、Hook 和 IPC；仅 Windows，不会启动真实游戏
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-native.ps1
+```
+
+原生宿主检查会构建并注入项目自带的模拟 `isaac-ng.exe`。它不能代替两台机器上的真实游戏联机验证。已经准备好所需工具链和缓存时，Cargo 命令可加 `--offline`，上述脚本可加 `-Offline`。
+
 ## 开发者打包
 
 ### 公开发布客户端更新
 
-源码仓库与发行仓库分开；公开发行地址固定为 [NetBurrow-Releases](https://github.com/stmluyuer/NetBurrow-Releases)。在 GitHub 创建该公开仓库并启用 Issues，只放面向用户的说明和发行包，不复制源码或私有仓库历史。首次支持更新检查的客户端仍需朋友手动下载一次。
+源码和客户端发行使用独立仓库；当前客户端更新地址固定为 [NetBurrow-Releases](https://github.com/stmluyuer/NetBurrow-Releases)。维护者在该仓库发布面向用户的完整包和更新清单。分支项目若自行发布，需要同步调整客户端更新地址。首次安装仍需手动下载。
 
 准备 UTF-8 更新说明文件（非空、最多 12000 个字符），调用现有客户端打包入口：
 
@@ -131,7 +165,7 @@ Relay 的 stderr 由服务器上的 systemd journal 收集。它只记录生命�
 
 客户端读取公开 JSON，按数字比较版本；更新说明按纯文本显示。下载链接固定指向所显示版本的 ZIP。请求使用 Windows 系统 HTTPS 和代理设置，不需要 GitHub 令牌，不上传组码或配置。更新源不可达或尚无 `latest.json` 时会显示检查失败；可以手动进入发布页。本期不验证 ZIP 签名、不自动安装，也不检查 Relay 协议兼容性；需要同时更新 Relay 时须在发布说明中明确说明。
 
-**不要公开上传 `*-relay-source.zip` 或整个 `.local\dist`。** 通用打包脚本会生成含源码的 Relay 包；公开发行只选上述客户端 ZIP 与清单。客户端 ZIP 不包含 `LICENSES`。发布步骤由用户执行，打包脚本不会创建仓库、上传或发布。
+客户端更新流程只上传上述 ZIP 和清单。Relay 源码包可单独提供给服务器管理员；不要上传配置、日志或整个 `.local\dist`。两种 ZIP 都随包携带项目及第三方许可材料。发布时记录客户端版本对应的最终源码提交，源仓库的该提交应包含许可文件；工作区中存在文件不代表它已进入提交。发布步骤由维护者执行，打包脚本不会创建仓库、上传或发布。
 
 ### 常规打包
 
@@ -143,7 +177,7 @@ Relay 的 stderr 由服务器上的 systemd journal 收集。它只记录生命�
 powershell -NoProfile -ExecutionPolicy Bypass -File .\打包客户端.ps1
 ```
 
-自动化调用可添加 `-NonInteractive`，关闭等待回车和打开目录；成功返回退出码 0，失败返回 1。脚本依赖本仓库已准备好的 `.local` Rust 工具链、离线依赖及 MSVC 构建环境，不会自动安装环境。
+自动化调用可添加 `-NonInteractive`，关闭等待回车和打开目录；成功返回退出码 0，失败返回 1。脚本使用前述 Rust 与 MSVC 构建环境，默认允许 Cargo 下载缺失依赖，不会自动安装编译工具链。
 
 版本只在准备分发时递增，普通编辑或 `cargo build` 不改版本。修复和界面小调整递增修订号；新增完整功能时指定次版本（例如 `0.2.0`）；准备正式发布时指定 `1.0.0`。界面、诊断报告、启动日志及 Relay 源码包统一读取根配置版本。
 
@@ -162,11 +196,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\打包客户端.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1
 ```
 
-项目不固定 Rust 版本，所选工具链需支持 Rust 2024 edition 并满足锁定依赖的最低版本要求。脚本通过 `rustup` 使用仓库 `.local` 中已配置的默认工具链，需预先安装 x64 和 i686 Windows MSVC target；离线构建桌面程序与 helper/DLL，输出到 `.local\dist`：
+脚本按前述规则选择可用工具链，构建 x64 客户端和 i686 helper/DLL，输出到 `.local\dist`：
 
 - `NetBurrow-<版本>-win-x64.zip`
 - `NetBurrow-<版本>-relay-source.zip`
 
+需要离线打包时运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\package.ps1 -ClientOnly -KeepVersion -Offline`；首次需先准备好所选工具链的依赖缓存。
+
 `scripts\package.ps1 -SkipBuild` 仅重新压缩已记录的构建产物，自动保留版本；版本或二进制文件与记录不符时会拒绝打包，需改用 `-KeepVersion` 重建。首次使用必须正常构建一次。
 
-客户端包和 Relay 源码包均不生成或包含 `LICENSES`；开源时另行整理许可证材料。打包脚本不部署 Relay、不访问 VPS，也不包含 `.local`、研究资料、日志或真实配置。
+`LICENSE` 与 `THIRD_PARTY_LICENSES.txt` 保留在源码仓库根目录，并复制到客户端包和 Relay 源码包根目录；缺少其中任一文件时，脚本会在构建和版本递增前停止。Relay 包随附的是整个工作区的保守许可清单，并不表示 Relay 使用了所有列出的依赖。打包脚本不部署 Relay、不访问 VPS，也不包含开发工具链、研究资料、日志或真实配置。
+
+更新依赖后，用 Python 3.11 或更新版本运行 `python scripts/generate-third-party-licenses.py` 更新许可清单；`--check` 只比较现有文件。需要已下载的 Cargo 源码，以及访问固定上游提交以补齐随 crate 缺失的许可文件；可用 `--registry <Cargo缓存的registry/src目录>` 指定缓存。
+
+清单保守列出全部锁定依赖。当前 `dispatch 0.2.0` 的上游只有 MIT 声明，没有许可全文；它不在 Windows 客户端、x86 Hook/注入器或 Linux Relay 的依赖图中，已明确列为例外。生成器仍会以非零退出码提示此缺项；变更发布目标时需重新核对。
