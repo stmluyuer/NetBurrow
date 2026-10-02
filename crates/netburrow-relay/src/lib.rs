@@ -29,7 +29,7 @@ use netburrow_protocol::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::{Mutex, mpsc, oneshot, watch},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     task::{JoinHandle, JoinSet},
 };
 
@@ -38,6 +38,9 @@ const DEFAULT_MAX_CLIENTS: usize = 1_024;
 const DEFAULT_QUEUE_MESSAGES: usize = 320;
 const DEFAULT_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_TOTAL_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PENDING_HANDSHAKES: usize = 64;
+// Both Join and Resume contain 37 bytes, excluding the length prefix.
+const MAX_HANDSHAKE_BODY: usize = 37;
 // Clients send a heartbeat every second. Bound silence and incomplete frames so
 // a lost FIN cannot keep an old socket attached throughout the recovery window.
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -157,7 +160,10 @@ async fn run<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let state = Arc::new(Mutex::new(State::new(config.total_outgoing_bytes)));
+    let mut initial_state = State::new(config.total_outgoing_bytes);
+    initial_state.group_queue_limit = config.total_outgoing_bytes / config.allowed_groups.len();
+    let state = Arc::new(Mutex::new(initial_state));
+    let handshakes = Arc::new(Semaphore::new(config.max_clients.min(MAX_PENDING_HANDSHAKES)));
     let stats = state.lock().await.stats.clone();
     record(
         "INFO",
@@ -197,8 +203,11 @@ where
                     if clients.len() >= config.max_clients.saturating_mul(2) {
                         increment(&stats.capacity_rejected);
                         drop(stream);
+                    } else if let Ok(permit) = handshakes.clone().try_acquire_owned() {
+                        clients.spawn(client_loop(stream, address, state.clone(), config.clone(), stopping.subscribe(), permit));
                     } else {
-                        clients.spawn(client_loop(stream, address, state.clone(), config.clone(), stopping.subscribe()));
+                        increment(&stats.capacity_rejected);
+                        drop(stream);
                     }
                 }
                 Err(error) => {
@@ -238,6 +247,7 @@ async fn client_loop(
     state: Arc<Mutex<State>>,
     config: Config,
     mut stopping: watch::Receiver<bool>,
+    handshake: OwnedSemaphorePermit,
 ) {
     let stats = state.lock().await.stats.clone();
     // Game traffic consists of latency-sensitive small frames in both directions.
@@ -251,15 +261,15 @@ async fn client_loop(
         return;
     }
     let first = tokio::select! {
-        result = tokio::time::timeout(config.handshake_timeout, read_tcp_message(&mut stream)) => result,
+        result = tokio::time::timeout(config.handshake_timeout, read_tcp_message_limited(&mut stream, MAX_HANDSHAKE_BODY)) => result,
         _ = stopping.changed() => return,
     };
     let Ok(Ok(first)) = first else {
         increment(&stats.handshake_rejected);
-        let _ = write_tcp_message(
+        let _ = tokio::time::timeout(config.handshake_timeout, write_tcp_message(
             &mut stream,
             &Message::Error("first message must be Join".into()),
-        )
+        ))
         .await;
         return;
     };
@@ -313,10 +323,12 @@ async fn client_loop(
                 _ => "session resume rejected",
             }
         } else {"relay is full"};
-        let _ = write_tcp_message(&mut stream, &Message::Error(reason.into())).await;
+        let _ = tokio::time::timeout(config.handshake_timeout,
+            write_tcp_message(&mut stream, &Message::Error(reason.into()))).await;
         return;
     }};
     let (client_id, token, members, notices) = joined;
+    drop(handshake);
     let (receiver,window,enabled,failed,generation,mut closed)={
         let locked=state.lock().await;
         let client=&locked.clients[&client_id];
@@ -675,8 +687,12 @@ async fn resumable_writer_loop(mut writer:tokio::net::tcp::OwnedWriteHalf,receiv
 }
 
 async fn read_tcp_message<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Message> {
+    read_tcp_message_limited(reader, netburrow_protocol::MAX_FRAME - 4).await
+}
+
+async fn read_tcp_message_limited<R: AsyncRead + Unpin>(reader: &mut R, maximum: usize) -> io::Result<Message> {
     let length = reader.read_u32().await? as usize;
-    if !(5..=netburrow_protocol::MAX_FRAME - 4).contains(&length) {
+    if !(5..=maximum).contains(&length) {
         return Err(invalid("invalid frame length"));
     }
     let mut body = vec![0; length];
@@ -696,6 +712,8 @@ struct State {
     clients: HashMap<u64, Client>,
     queued_total: Arc<AtomicUsize>,
     total_queue_limit: usize,
+    group_queue_limit: usize,
+    group_budgets: HashMap<Group, Arc<AtomicUsize>>,
     stats: Arc<Stats>,
 }
 
@@ -703,18 +721,19 @@ struct ReplayWindow {
     frames:netburrow_protocol::resume::Window,
     budget:Arc<AtomicUsize>,
     total:Arc<AtomicUsize>,
+    group:Arc<AtomicUsize>,
 }
 impl ReplayWindow {
-    fn new(budget:Arc<AtomicUsize>,total:Arc<AtomicUsize>)->Self{Self{frames:Default::default(),budget,total}}
+    fn new(budget:Arc<AtomicUsize>,total:Arc<AtomicUsize>,group:Arc<AtomicUsize>)->Self{Self{frames:Default::default(),budget,total,group}}
     fn acknowledge(&mut self,n:u64)->io::Result<()> {
         let before=self.frames.pending_bytes();self.frames.acknowledge(n)?;
         let released=before-self.frames.pending_bytes();
-        self.budget.fetch_sub(released,Ordering::AcqRel);self.total.fetch_sub(released,Ordering::AcqRel);Ok(())
+        self.budget.fetch_sub(released,Ordering::AcqRel);self.total.fetch_sub(released,Ordering::AcqRel);self.group.fetch_sub(released,Ordering::AcqRel);Ok(())
     }
 }
 impl std::ops::Deref for ReplayWindow {type Target=netburrow_protocol::resume::Window;fn deref(&self)->&Self::Target{&self.frames}}
 impl std::ops::DerefMut for ReplayWindow {fn deref_mut(&mut self)->&mut Self::Target{&mut self.frames}}
-impl Drop for ReplayWindow {fn drop(&mut self){let bytes=self.frames.pending_bytes();self.budget.fetch_sub(bytes,Ordering::AcqRel);self.total.fetch_sub(bytes,Ordering::AcqRel);}}
+impl Drop for ReplayWindow {fn drop(&mut self){let bytes=self.frames.pending_bytes();self.budget.fetch_sub(bytes,Ordering::AcqRel);self.total.fetch_sub(bytes,Ordering::AcqRel);self.group.fetch_sub(bytes,Ordering::AcqRel);}}
 
 struct Client {
     receiver: Option<Arc<Mutex<mpsc::Receiver<Queued>>>>,
@@ -735,6 +754,7 @@ struct Client {
     udp_address: Option<SocketAddr>,
     output: mpsc::Sender<Queued>,
     queued_bytes: Arc<AtomicUsize>,
+    group_queued_bytes: Arc<AtomicUsize>,
     max_queued_bytes: usize,
     closing: watch::Sender<bool>,
     status_subscribed: bool,
@@ -753,6 +773,7 @@ struct Queued {
     bytes: usize,
     budget: Arc<AtomicUsize>,
     total_budget: Arc<AtomicUsize>,
+    group_budget: Arc<AtomicUsize>,
     released: bool,
 }
 
@@ -761,6 +782,7 @@ impl Queued {
         if !self.released {
             self.budget.fetch_sub(self.bytes, Ordering::AcqRel);
             self.total_budget.fetch_sub(self.bytes, Ordering::AcqRel);
+            self.group_budget.fetch_sub(self.bytes, Ordering::AcqRel);
             self.released = true;
         }
     }
@@ -806,6 +828,8 @@ impl State {
             clients: HashMap::new(),
             queued_total: Arc::new(AtomicUsize::new(0)),
             total_queue_limit,
+            group_queue_limit: total_queue_limit,
+            group_budgets: HashMap::new(),
             stats: Arc::new(Stats::default()),
         }
     }
@@ -844,7 +868,9 @@ impl State {
         let client_id = self.next_client_id;
         let token = random_token()?;
         let queued_bytes=Arc::new(AtomicUsize::new(0));
-        let window=Arc::new(std::sync::Mutex::new(ReplayWindow::new(queued_bytes.clone(),self.queued_total.clone())));
+        // Keep the group counter after removal: old writers/replay can still own reservations.
+        let group_queued_bytes = self.group_budgets.entry(group).or_default().clone();
+        let window=Arc::new(std::sync::Mutex::new(ReplayWindow::new(queued_bytes.clone(),self.queued_total.clone(),group_queued_bytes.clone())));
         self.clients.insert(
             client_id,
             Client {
@@ -860,6 +886,7 @@ impl State {
                 udp_address: None,
                 output,
                 queued_bytes,
+                group_queued_bytes,
                 max_queued_bytes,
                 closing,
                 status_subscribed: false,
@@ -1080,6 +1107,8 @@ impl State {
             client.queued_bytes.clone(),
             self.total_queue_limit,
             self.queued_total.clone(),
+            self.group_queue_limit,
+            client.group_queued_bytes.clone(),
         );
         if let Err(QueueError::Full(reason)) = &result {
             // Concurrent sending/ACKs can advance these snapshots after the rejection.
@@ -1185,6 +1214,8 @@ fn enqueue(
     budget: Arc<AtomicUsize>,
     total_maximum: usize,
     total_budget: Arc<AtomicUsize>,
+    group_maximum: usize,
+    group_budget: Arc<AtomicUsize>,
 ) -> Result<(), QueueError> {
     let bytes = encode(&message).map_err(|_| QueueError::Invalid)?.len();
     let reserved = budget.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -1192,6 +1223,12 @@ fn enqueue(
     });
     if reserved.is_err() {
         return Err(QueueError::Full("client_bytes"));
+    }
+    if group_budget.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        current.checked_add(bytes).filter(|next| *next <= group_maximum)
+    }).is_err() {
+        budget.fetch_sub(bytes, Ordering::AcqRel);
+        return Err(QueueError::Full("group_bytes"));
     }
     let total_reserved =
         total_budget.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -1201,6 +1238,7 @@ fn enqueue(
         });
     if total_reserved.is_err() {
         budget.fetch_sub(bytes, Ordering::AcqRel);
+        group_budget.fetch_sub(bytes, Ordering::AcqRel);
         return Err(QueueError::Full("total_bytes"));
     }
     match output.try_send(Queued {
@@ -1208,6 +1246,7 @@ fn enqueue(
         bytes,
         budget: budget.clone(),
         total_budget: total_budget.clone(),
+        group_budget,
         released: false,
     }) {
         Ok(()) => Ok(()),
@@ -1227,18 +1266,53 @@ mod tests {
     use netburrow_protocol::{Group, UDP_LIMIT};
     use tokio::time::{Duration, timeout};
 
+    #[tokio::test]
+    async fn handshakes_enforce_body_and_pending_connection_limits() {
+        let relay = spawn(Config { bind: "127.0.0.1:0".parse().unwrap(),
+            max_clients: 1, allowed_groups: test_allowed_groups(), ..Config::default() }).await.unwrap();
+        let mut stream = TcpStream::connect(relay.local_addr()).await.unwrap();
+        let mut excess = TcpStream::connect(relay.local_addr()).await.unwrap();
+        let mut byte = [0];
+        let rejected = timeout(Duration::from_secs(1), excess.read(&mut byte)).await.unwrap();
+        assert!(matches!(rejected, Ok(0)) || rejected.is_err(), "pending handshake limit must close excess connections");
+        stream.write_u32(4096).await.unwrap();
+        assert!(matches!(timeout(Duration::from_secs(1), read_tcp_message(&mut stream)).await,
+            Ok(Ok(Message::Error(_)))));
+        let (mut healthy, _, _) = connect(relay.local_addr(), group(1)).await;
+        assert_healthy(&mut healthy).await;
+        relay.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queue_pressure_in_one_group_preserves_other_group_delivery() {
+        let mut state = State::new(256);
+        state.group_queue_limit = 128;
+        let (a_tx, _a_rx) = mpsc::channel(64);
+        let (b_tx, mut b_rx) = mpsc::channel(64);
+        let a = state.add(group(1), "127.0.0.1".parse().unwrap(), a_tx, watch::channel(false).0, 256, 8).unwrap().0;
+        let b = state.add(group(2), "127.0.0.1".parse().unwrap(), b_tx, watch::channel(false).0, 256, 8).unwrap().0;
+        while state.enqueue(a, Message::Ping(1)).is_ok() {}
+        let message = Message::Data(packet(11, 22, 1, 1, 2, b"healthy"));
+        let state = Arc::new(Mutex::new(state));
+        execute_route(b, Route::Tcp { target: b, message: message.clone() }, &state, None).await;
+        assert!(state.lock().await.clients.contains_key(&b), "other group's healthy target was disconnected");
+        assert_eq!(b_rx.try_recv().unwrap().message, message);
+    }
+
     #[test]
     fn rejected_queue_items_release_only_their_own_reservation() {
         let frame_bytes = encode(&Message::Ping(1)).unwrap().len();
-        for rejection in ["messages", "closed", "client_bytes", "total_bytes"] {
+        for rejection in ["messages", "closed", "client_bytes", "group_bytes", "total_bytes"] {
             let (sender, mut receiver) = mpsc::channel(1);
             let budget = Arc::new(AtomicUsize::new(0));
             let total = Arc::new(AtomicUsize::new(0));
-            enqueue(&sender, Message::Ping(1), 1024, budget.clone(), 4096, total.clone()).unwrap();
+            let group_budget = Arc::new(AtomicUsize::new(0));
+            enqueue(&sender, Message::Ping(1), 1024, budget.clone(), 4096, total.clone(), 4096, group_budget.clone()).unwrap();
             if rejection == "closed" { receiver.close(); }
             let maximum = if rejection == "client_bytes" { frame_bytes } else { 1024 };
             let total_maximum = if rejection == "total_bytes" { frame_bytes } else { 4096 };
-            let result = enqueue(&sender, Message::Ping(2), maximum, budget.clone(), total_maximum, total.clone());
+            let group_maximum = if rejection == "group_bytes" { frame_bytes } else { 4096 };
+            let result = enqueue(&sender, Message::Ping(2), maximum, budget.clone(), total_maximum, total.clone(), group_maximum, group_budget.clone());
             match result {
                 Err(QueueError::Full(reason)) => assert_eq!(reason, rejection),
                 Err(QueueError::Closed) => assert_eq!(rejection, "closed"),
@@ -1246,13 +1320,15 @@ mod tests {
             }
             assert_eq!(budget.load(Ordering::Acquire), frame_bytes, "{rejection}");
             assert_eq!(total.load(Ordering::Acquire), frame_bytes, "{rejection}");
+            assert_eq!(group_budget.load(Ordering::Acquire), frame_bytes, "{rejection}");
             drop(receiver.try_recv().unwrap());
             assert_eq!(budget.load(Ordering::Acquire), 0, "{rejection}");
             assert_eq!(total.load(Ordering::Acquire), 0, "{rejection}");
+            assert_eq!(group_budget.load(Ordering::Acquire), 0, "{rejection}");
 
             let (other, mut other_receiver) = mpsc::channel(1);
             let other_budget = Arc::new(AtomicUsize::new(0));
-            enqueue(&other, Message::Ping(3), 1024, other_budget.clone(), 4096, total.clone()).unwrap();
+            enqueue(&other, Message::Ping(3), 1024, other_budget.clone(), 4096, total.clone(), 4096, group_budget.clone()).unwrap();
             drop(other_receiver.try_recv().unwrap());
             assert_eq!(other_budget.load(Ordering::Acquire), 0);
             assert_eq!(total.load(Ordering::Acquire), 0);
@@ -1403,13 +1479,16 @@ mod tests {
         let frame=timeout(Duration::from_secs(1),read_tcp_message(&mut receiving)).await.unwrap().unwrap();
         let Message::SessionFrame{sequence,..}=frame else{panic!("expected replay frame")};
         assert_eq!(state.queued_total.load(Ordering::Acquire),encode(&message).unwrap().len());
+        assert_eq!(state.group_budgets[&group(1)].load(Ordering::Acquire),encode(&message).unwrap().len());
         assert!(matches!(state.enqueue(id,message.clone()),Err(QueueError::Full(_))));
         window.lock().unwrap().acknowledge(sequence).unwrap();
         assert_eq!(state.queued_total.load(Ordering::Acquire),0);
+        assert_eq!(state.group_budgets[&group(1)].load(Ordering::Acquire),0);
         assert!(state.enqueue(id,message).is_ok());
         assert!(matches!(timeout(Duration::from_secs(1),read_tcp_message(&mut receiving)).await.unwrap().unwrap(),Message::SessionFrame{..}));
         stop.send(true).unwrap();task.await.unwrap();drop(window);state.remove(id,Instant::now());
         assert_eq!(state.queued_total.load(Ordering::Acquire),0);
+        assert_eq!(state.group_budgets[&group(1)].load(Ordering::Acquire),0);
     }
 
     #[tokio::test]
