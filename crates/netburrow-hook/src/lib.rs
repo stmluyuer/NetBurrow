@@ -1,4 +1,5 @@
-//! NetBurrow's own SteamNetworking006 adapter. No network I/O runs in game calls.
+//! SteamNetworking006 replacement transport with native Steam session handling.
+//! No network I/O runs in game calls; the existing NetBurrow IPC carries packets.
 #[cfg(any(test, all(windows, target_arch = "x86")))]
 mod queue;
 #[cfg(any(test, all(windows, target_arch = "x86")))]

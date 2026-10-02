@@ -2,36 +2,59 @@
 //! Exercises the real helper and Hook without opening Steam or touching game files.
 #![allow(unsafe_op_in_unsafe_fn)]
 use netburrow_protocol::{Message, Packet, Peer};
-static SESSION:std::sync::Mutex<Option<netburrow_protocol::resume::Window>>=std::sync::Mutex::new(None);
-fn write_message(socket:&mut std::net::TcpStream,message:&Message)->std::io::Result<()> {
-    let mut session=SESSION.lock().unwrap();
-    if matches!(message,Message::IpcAccepted(_)){*session=Some(Default::default());}
-    let message=if netburrow_protocol::replayable(message)&&session.is_some(){
-        let body=netburrow_protocol::encode(message)?;
-        let sequence=session.as_mut().unwrap().retain(body.clone())?;
-        Message::SessionFrame{sequence,body}
-    }else{message.clone()};
-    netburrow_protocol::write_message(socket,&message)
+static SESSION: std::sync::Mutex<Option<netburrow_protocol::resume::Window>> =
+    std::sync::Mutex::new(None);
+fn write_message(socket: &mut std::net::TcpStream, message: &Message) -> std::io::Result<()> {
+    let mut session = SESSION.lock().unwrap();
+    if matches!(message, Message::IpcAccepted(_)) {
+        *session = Some(Default::default());
+    }
+    let message = if netburrow_protocol::replayable(message) && session.is_some() {
+        let body = netburrow_protocol::encode(message)?;
+        let sequence = session.as_mut().unwrap().retain(body.clone())?;
+        Message::SessionFrame { sequence, body }
+    } else {
+        message.clone()
+    };
+    netburrow_protocol::write_message(socket, &message)
 }
-fn read_message(socket:&mut std::net::TcpStream)->std::io::Result<Message> {
+fn read_message(socket: &mut std::net::TcpStream) -> std::io::Result<Message> {
     loop {
-        let message=netburrow_protocol::read_message(socket)?;
+        let message = netburrow_protocol::read_message(socket)?;
         match message {
-            Message::SessionAck(n)=>{SESSION.lock().unwrap().as_mut().unwrap().acknowledge(n)?;}
-            Message::SessionFrame{sequence,body}=>{
-                let mut session=SESSION.lock().unwrap();let session=session.as_mut().unwrap();
-                let fresh=session.classify(sequence)?;
-                let message=netburrow_protocol::decode_session_body(&body)?;
-                session.received(sequence)?;
-                netburrow_protocol::write_message(socket,&Message::SessionAck(session.received_through()))?;
-                if fresh{return Ok(message);}
+            Message::SessionAck(n) => {
+                SESSION.lock().unwrap().as_mut().unwrap().acknowledge(n)?;
             }
-            _=>return Ok(message),
+            Message::SessionFrame { sequence, body } => {
+                let mut session = SESSION.lock().unwrap();
+                let session = session.as_mut().unwrap();
+                let fresh = session.classify(sequence)?;
+                let message = netburrow_protocol::decode_session_body(&body)?;
+                session.received(sequence)?;
+                netburrow_protocol::write_message(
+                    socket,
+                    &Message::SessionAck(session.received_through()),
+                )?;
+                if fresh {
+                    return Ok(message);
+                }
+            }
+            _ => return Ok(message),
+        }
+    }
+}
+fn read_data(socket: &mut std::net::TcpStream) -> Packet {
+    loop {
+        match read_message(socket).unwrap() {
+            Message::Data(packet) => return packet,
+            Message::Ping(n) => write_message(socket, &Message::Pong(n)).unwrap(),
+            Message::IpcHealth(_) => {}
+            other => panic!("unexpected {other:?}"),
         }
     }
 }
 use std::{
-    ffi::c_void,
+    ffi::{c_char, c_void},
     io::Write,
     mem::transmute,
     net::TcpListener,
@@ -43,6 +66,13 @@ use std::{
 #[link(name = "steam_api", kind = "raw-dylib")]
 unsafe extern "C" {
     fn FixtureSetObject(value: usize);
+    fn FixtureFindCalls() -> usize;
+    fn FixtureNetworkingCalls() -> usize;
+    fn FixtureCallbackCalls() -> usize;
+    fn FixtureSetUserReady();
+    fn FixtureUserChecks() -> usize;
+    fn FixtureEarlyUserCalls() -> usize;
+    fn SteamInternal_FindOrCreateUserInterface(user: i32, version: *const c_char) -> *mut c_void;
     fn SteamAPI_RegisterCallback(object: *mut c_void, id: i32);
     fn SteamAPI_UnregisterCallback(object: *mut c_void);
     fn SteamAPI_RunCallbacks();
@@ -113,13 +143,11 @@ unsafe fn hook_workers() -> Vec<OwnedHandle> {
     found
 }
 static NATIVE_SENDS: AtomicUsize = AtomicUsize::new(0);
+static NATIVE_AVAILABLE: AtomicUsize = AtomicUsize::new(0);
 static NATIVE_READS: AtomicUsize = AtomicUsize::new(0);
 static NATIVE_PACKETS: std::sync::Mutex<std::collections::VecDeque<(u64, i32, Vec<u8>)>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 static SHARED_OBJECT: AtomicUsize = AtomicUsize::new(0);
-static SHARED_SENDS: AtomicUsize = AtomicUsize::new(0);
-static SHARED_AVAILABLE: AtomicUsize = AtomicUsize::new(0);
-static SHARED_READS: AtomicUsize = AtomicUsize::new(0);
 static SHARED_PEERS: AtomicUsize = AtomicUsize::new(0);
 static SHARED_CHANNELS: AtomicUsize = AtomicUsize::new(0);
 static SHARED_SESSIONS: AtomicUsize = AtomicUsize::new(0);
@@ -130,8 +158,7 @@ const SHARED_REMOTE: u64 = 0x0000_0002_0000_00ca;
 const SHARED_CHANNEL: i32 = 17;
 const SHARED_PAYLOAD: &[u8] = b"shared";
 const SHARED_SESSION: [u8; 20] = [
-    1, 0, 0, 1, 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 0, 0, 0, 0, 0x34,
-    0x12, 0, 0,
+    1, 0, 0, 1, 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 0, 0, 0, 0, 0x34, 0x12, 0, 0,
 ];
 fn shared_this(this: *mut c_void) -> bool {
     this as usize == SHARED_OBJECT.load(Ordering::Acquire)
@@ -144,7 +171,7 @@ fn shared_abi(ok: bool) {
 unsafe extern "thiscall" fn unused(_: *mut c_void) -> bool {
     false
 }
-unsafe extern "thiscall" fn third_party_send(
+unsafe extern "thiscall" fn native_send(
     _: *mut c_void,
     _: u64,
     _: *const c_void,
@@ -152,53 +179,22 @@ unsafe extern "thiscall" fn third_party_send(
     _: i32,
     _: i32,
 ) -> bool {
-    true
-}
-unsafe extern "thiscall" fn native_send(
-    this: *mut c_void,
-    remote: u64,
-    data: *const c_void,
-    length: u32,
-    kind: i32,
-    channel: i32,
-) -> bool {
     NATIVE_SENDS.fetch_add(1, Ordering::SeqCst);
-    if shared_this(this) {
-        let bytes = (!data.is_null())
-            .then(|| std::slice::from_raw_parts(data.cast::<u8>(), length as usize));
-        shared_abi(
-            remote == SHARED_REMOTE
-                && remote >> 32 != 0
-                && bytes == Some(SHARED_PAYLOAD)
-                && kind == 2
-                && channel == SHARED_CHANNEL,
-        );
-        SHARED_SENDS.fetch_add(1, Ordering::SeqCst);
-    }
     true
 }
-unsafe extern "thiscall" fn native_available(
-    this: *mut c_void,
-    size: *mut u32,
-    channel: i32,
-) -> bool {
-    let packets = NATIVE_PACKETS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+unsafe extern "thiscall" fn native_available(_: *mut c_void, size: *mut u32, channel: i32) -> bool {
+    NATIVE_AVAILABLE.fetch_add(1, Ordering::SeqCst);
+    let packets = NATIVE_PACKETS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some((_, _, payload)) = packets.iter().find(|(_, c, _)| *c == channel) else {
-        if shared_this(this) {
-            shared_abi(!size.is_null() && channel == 3);
-            SHARED_AVAILABLE.fetch_add(1, Ordering::SeqCst);
-        }
         return false;
     };
-    if shared_this(this) {
-        shared_abi(!size.is_null() && channel == SHARED_CHANNEL && payload == SHARED_PAYLOAD);
-        SHARED_AVAILABLE.fetch_add(1, Ordering::SeqCst);
-    }
     size.write(payload.len() as u32);
     true
 }
 unsafe extern "thiscall" fn native_read(
-    this: *mut c_void,
+    _: *mut c_void,
     destination: *mut c_void,
     capacity: u32,
     size: *mut u32,
@@ -215,19 +211,6 @@ unsafe extern "thiscall" fn native_read(
     let Some((peer, _, payload)) = packets.remove(index) else {
         return false;
     };
-    if shared_this(this) {
-        shared_abi(
-            !destination.is_null()
-                && !size.is_null()
-                && !remote.is_null()
-                && peer == SHARED_REMOTE
-                && peer >> 32 != 0
-                && channel == SHARED_CHANNEL
-                && capacity == SHARED_PAYLOAD.len() as u32
-                && payload == SHARED_PAYLOAD,
-        );
-        SHARED_READS.fetch_add(1, Ordering::SeqCst);
-    }
     let length = payload.len().min(capacity as usize);
     std::ptr::copy_nonoverlapping(payload.as_ptr(), destination.cast::<u8>(), length);
     size.write(length as u32);
@@ -265,6 +248,15 @@ unsafe extern "thiscall" fn native_session(
         SHARED_SESSIONS.fetch_add(1, Ordering::SeqCst);
         return true;
     }
+    false
+}
+unsafe extern "thiscall" fn replacement_session(
+    _: *mut c_void,
+    remote: u64,
+    result: *mut c_void,
+) -> bool {
+    assert_eq!(remote, SHARED_REMOTE);
+    std::ptr::write_bytes(result.cast::<u8>(), 0x3c, 20);
     false
 }
 #[repr(C)]
@@ -369,7 +361,27 @@ unsafe fn run() {
         "helper failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    println!("helper passed; waiting for IPC");
+    eventually(|| {
+        assert_eq!(
+            FixtureEarlyUserCalls(), 0,
+            "must wait for Steam user readiness before requesting identity"
+        );
+        FixtureUserChecks() >= 3
+    });
+    let callbacks = FixtureCallbackCalls();
+    SteamAPI_RunCallbacks();
+    assert_eq!(FixtureCallbackCalls(), callbacks + 1);
+    assert_eq!(
+        SteamInternal_FindOrCreateUserInterface(0, c"SteamNetworking006".as_ptr()),
+        (&mut *object) as *mut usize as *mut c_void
+    );
+    assert_eq!(
+        *table, original_slots,
+        "waiting for Steam must preserve native networking"
+    );
+    assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+    FixtureSetUserReady();
+    println!("helper passed; Steam ready; waiting for IPC");
     let mut socket = None;
     eventually(|| {
         socket = listener.accept().ok().map(|p| p.0);
@@ -413,18 +425,62 @@ unsafe fn run() {
         *shared_object, original_table,
         "a second object sharing the table must retain its original vtable pointer"
     );
-    assert!(
-        table[..7]
-            .iter()
-            .zip(original_slots[..7].iter())
-            .all(|(current, original)| current != original),
-        "all seven controlled slots must be replaced in the original table"
+    for slot in [0, 1, 2, 6] {
+        assert_ne!(
+            table[slot], original_slots[slot],
+            "replacement transport must patch slot {slot} in the shared table"
+        );
+    }
+    assert_eq!(
+        &table[3..6],
+        &original_slots[3..6],
+        "accept, close and close-channel must remain native Steam functions"
     );
     assert_eq!(
         &table[7..],
         &original_slots[7..],
         "uncontrolled SteamNetworking006 slots must stay untouched"
     );
+    let hooked_slots = *table;
+    let finds = FixtureFindCalls();
+    assert_eq!(
+        SteamInternal_FindOrCreateUserInterface(1, c"SteamNetworking006".as_ptr()),
+        (&mut *object as *mut usize).cast(),
+        "the imported interface factory must preserve the native result"
+    );
+    assert!(SteamInternal_FindOrCreateUserInterface(1, c"SteamNetworking005".as_ptr()).is_null());
+    assert_eq!(
+        FixtureFindCalls(),
+        finds + 2,
+        "both interface queries must reach Steam"
+    );
+    let lookups = FixtureNetworkingCalls();
+    let callbacks = FixtureCallbackCalls();
+    table[0] = original_slots[0];
+    SteamAPI_RunCallbacks();
+    assert_eq!(
+        table[0], hooked_slots[0],
+        "the first callback pass must restore the cached hook"
+    );
+    table[0] = original_slots[0];
+    for _ in 0..60 {
+        SteamAPI_RunCallbacks();
+    }
+    assert_eq!(
+        table[0], hooked_slots[0],
+        "the callback cadence must reinstall a restored slot"
+    );
+    assert_eq!(
+        FixtureCallbackCalls(),
+        callbacks + 61,
+        "every callback call must reach Steam"
+    );
+    assert_eq!(
+        FixtureNetworkingCalls(),
+        lookups,
+        "cached-table checks must not recreate the interface"
+    );
+    assert_eq!(&table[3..6], &original_slots[3..6]);
     println!("IPC ready; verifying receive without synthetic callbacks");
     let callback_table = [
         callback_run as *const () as usize,
@@ -519,15 +575,23 @@ unsafe fn run() {
         transmute(*patched.add(5));
     let shared_session: unsafe extern "thiscall" fn(*mut c_void, u64, *mut c_void) -> bool =
         transmute(*patched.add(6));
-    // A registered local peer on another object sharing the exact same table must
-    // use native Steam. Its calls also prove the x86 thiscall/u64 ABI is preserved.
+    // Shared vtables route every object through the replacement transport. A native
+    // packet cannot leak into the game, even if its size query would otherwise win.
     let mut shared_count = 0;
-    assert!(!shared_available(shared, &mut shared_count, 3));
+    assert!(shared_available(shared, &mut shared_count, 3));
+    assert_eq!(shared_count, 6);
     NATIVE_PACKETS
         .lock()
         .unwrap()
-        .push_back((SHARED_REMOTE, SHARED_CHANNEL, SHARED_PAYLOAD.to_vec()));
-    assert!(shared_available(shared, &mut shared_count, SHARED_CHANNEL));
+        .push_back((SHARED_REMOTE, SHARED_CHANNEL, b"native".to_vec()));
+    assert!(!shared_available(shared, &mut shared_count, SHARED_CHANNEL));
+    let mut shared_packet = incoming.clone();
+    shared_packet.from = SHARED_REMOTE;
+    shared_packet.source_epoch = 99;
+    shared_packet.channel = SHARED_CHANNEL;
+    shared_packet.payload = SHARED_PAYLOAD.to_vec();
+    write_message(&mut socket, &Message::Data(shared_packet)).unwrap();
+    eventually(|| shared_available(shared, &mut shared_count, SHARED_CHANNEL));
     assert_eq!(shared_count, SHARED_PAYLOAD.len() as u32);
     let mut shared_bytes = [0u8; SHARED_PAYLOAD.len()];
     let mut shared_remote = 0;
@@ -540,7 +604,10 @@ unsafe fn run() {
         SHARED_CHANNEL,
     ));
     assert_eq!(shared_bytes.as_slice(), SHARED_PAYLOAD);
-    assert_eq!((shared_count, shared_remote), (SHARED_PAYLOAD.len() as u32, SHARED_REMOTE));
+    assert_eq!(
+        (shared_count, shared_remote),
+        (SHARED_PAYLOAD.len() as u32, SHARED_REMOTE)
+    );
     assert!(shared_send(
         shared,
         SHARED_REMOTE,
@@ -549,6 +616,15 @@ unsafe fn run() {
         2,
         SHARED_CHANNEL,
     ));
+    let sent = read_data(&mut socket);
+    assert_eq!(
+        (sent.from, sent.to, sent.source_epoch, sent.target_epoch),
+        (101, SHARED_REMOTE, 11, 99)
+    );
+    assert_eq!(
+        (sent.payload.as_slice(), sent.channel, sent.send_type),
+        (SHARED_PAYLOAD, SHARED_CHANNEL, 2)
+    );
     assert!(shared_accept(shared, SHARED_REMOTE));
     assert!(shared_close(shared, SHARED_REMOTE));
     assert!(shared_close_channel(shared, SHARED_REMOTE, SHARED_CHANNEL));
@@ -561,21 +637,24 @@ unsafe fn run() {
     assert_eq!(&session_with_canaries[..4], &[0xa5; 4]);
     assert_eq!(&session_with_canaries[4..24], &SHARED_SESSION);
     assert_eq!(&session_with_canaries[24..], &[0xa5; 4]);
+    // The other object's original function returns false and leaves its output
+    // untouched. Hook must preserve both details instead of fabricating state.
+    let session: unsafe extern "thiscall" fn(*mut c_void, u64, *mut c_void) -> bool =
+        transmute(*patched.add(6));
+    let mut untouched = [0xa5u8; 20];
+    assert!(!session(object, 202, untouched.as_mut_ptr().cast()));
+    assert_eq!(untouched, [0xa5; 20]);
     assert_eq!(
         (
-            SHARED_SENDS.load(Ordering::SeqCst),
-            SHARED_AVAILABLE.load(Ordering::SeqCst),
-            SHARED_READS.load(Ordering::SeqCst),
             SHARED_PEERS.load(Ordering::SeqCst),
             SHARED_CHANNELS.load(Ordering::SeqCst),
             SHARED_SESSIONS.load(Ordering::SeqCst),
             SHARED_ABI_FAILURES.load(Ordering::SeqCst),
         ),
-        (1, 2, 1, 2, 1, 1, 0),
-        "shared object must forward all seven slots to native Steam without ABI damage"
+        (2, 1, 1, 0),
+        "native session calls must preserve the shared object's x86 thiscall/u64 ABI"
     );
     assert!(!available(object, &mut count, 4));
-    assert_eq!(count, 6);
     SteamAPI_RunCallbacks();
     assert_eq!(
         REQUESTS.load(Ordering::SeqCst),
@@ -594,138 +673,197 @@ unsafe fn run() {
     ));
     assert_eq!((small, count, remote), (*b"ab", 2, 202));
     assert!(!available(object, &mut count, 3));
-    // A cleared Hook reservation must fail without falling through to Steam.
+    // Native close/accept state must not gate or discard replacement traffic.
     write_message(&mut socket, &Message::Data(incoming.clone())).unwrap();
+    let mut second = incoming.clone();
+    second.payload = b"second".to_vec();
+    write_message(&mut socket, &Message::Data(second)).unwrap();
     eventually(|| available(object, &mut count, 3));
-    assert_eq!(count, 6);
-    eventually(|| close(object, 202));
-    let native_reads = NATIVE_READS.load(Ordering::SeqCst);
-    assert!(!read(object, small.as_mut_ptr().cast(), 2, &mut count, &mut remote, 3));
-    assert_eq!(NATIVE_READS.load(Ordering::SeqCst), native_reads);
-    assert!(!read(object, small.as_mut_ptr().cast(), 2, &mut count, &mut remote, 3));
-    assert_eq!(NATIVE_READS.load(Ordering::SeqCst), native_reads);
-    assert!(!available(object, &mut count, 3));
-    assert!(!read(object, small.as_mut_ptr().cast(), 2, &mut count, &mut remote, 3));
-    assert_eq!(NATIVE_READS.load(Ordering::SeqCst), native_reads + 1);
-    println!("PASS: invalidated Hook query blocks native fallback until a fresh query");
-    // Keep the source of a native size query when Hook data arrives in between.
-    NATIVE_PACKETS.lock().unwrap().push_back((303, 12, vec![7; 16]));
-    assert!(available(object, &mut count, 12));
-    assert_eq!(count, 16);
-    let mut hook_packet = incoming.clone();
-    hook_packet.channel = 12;
-    hook_packet.payload = vec![8; 40];
-    write_message(&mut socket, &Message::Data(hook_packet)).unwrap();
-    let mut barrier = incoming.clone();
-    barrier.channel = 13;
-    barrier.payload = vec![0];
-    write_message(&mut socket, &Message::Data(barrier)).unwrap();
-    eventually(|| available(object, &mut count, 13));
-    let mut buffer = [0u8; 40];
-    assert!(read(object, buffer.as_mut_ptr().cast(), 40, &mut count, &mut remote, 13));
-    assert!(read(object, buffer.as_mut_ptr().cast(), 16, &mut count, &mut remote, 12));
-    let native_source_kept = remote == 303 && count == 16 && buffer[..16] == [7; 16];
-    // Drain the remaining packet so both regressions can report before failing.
-    while available(object, &mut count, 12) {
-        assert!(read(object, buffer.as_mut_ptr().cast(), 40, &mut count, &mut remote, 12));
+    assert!(close(object, 202));
+    let mut buffer = [0u8; 6];
+    assert!(read(
+        object,
+        buffer.as_mut_ptr().cast(),
+        6,
+        &mut count,
+        &mut remote,
+        3
+    ));
+    assert_eq!((buffer, count, remote), (*b"abcdef", 6, 202));
+    eventually(|| {
+        read(
+            object,
+            buffer.as_mut_ptr().cast(),
+            6,
+            &mut count,
+            &mut remote,
+            3,
+        )
+    });
+    assert_eq!((buffer, count, remote), (*b"second", 6, 202));
+    assert!(!available(object, &mut count, SHARED_CHANNEL));
+    assert!(!read(
+        object,
+        buffer.as_mut_ptr().cast(),
+        6,
+        &mut count,
+        &mut remote,
+        SHARED_CHANNEL
+    ));
+    assert!(!send(object, 404, b"unknown".as_ptr().cast(), 7, 2, 0));
+    assert_eq!(
+        (
+            NATIVE_SENDS.load(Ordering::SeqCst),
+            NATIVE_AVAILABLE.load(Ordering::SeqCst),
+            NATIVE_READS.load(Ordering::SeqCst)
+        ),
+        (0, 0, 0),
+        "replacement transport must never fall through to native send, available or read"
+    );
+    assert_eq!(NATIVE_PACKETS.lock().unwrap().len(), 1);
+    println!(
+        "PASS: shared-table replacement, native session ABI, receive-first FIFO and no native data fallback"
+    );
+    assert!(send(object, 202, b"out".as_ptr().cast(), 3, 1, 9));
+    let sent = read_data(&mut socket);
+    assert_eq!(
+        (
+            sent.from,
+            sent.to,
+            sent.source_epoch,
+            sent.target_epoch,
+            sent.channel,
+            sent.send_type,
+            sent.payload
+        ),
+        (101, 202, 11, 22, 9, 1, b"out".to_vec())
+    );
+    // The queue test covers immediate dequeue without wall-clock assumptions.
+    // Here a lone mode-3 packet reaches IPC without a second send to flush it.
+    assert!(send(object, 202, b"a".as_ptr().cast(), 1, 3, 4));
+    let first = read_data(&mut socket);
+    assert_eq!(
+        (first.payload, first.send_type, first.channel),
+        (b"a".to_vec(), 3, 4)
+    );
+    for (payload, kind, channel) in [(b"b", 3, 5), (b"c", 2, 4)] {
+        assert!(send(object, 202, payload.as_ptr().cast(), 1, kind, channel));
     }
-    // Discarding an owned peer's stale native packet must not consume the next one.
-    NATIVE_PACKETS.lock().unwrap().extend([(202, 14, vec![1; 8]), (303, 14, vec![9; 40])]);
-    assert!(available(object, &mut count, 14));
-    assert_eq!(count, 8);
-    let discarded_without_replacement =
-        !read(object, buffer.as_mut_ptr().cast(), 8, &mut count, &mut remote, 14);
-    let native_reads = NATIVE_READS.load(Ordering::SeqCst);
-    assert!(!read(object, buffer.as_mut_ptr().cast(), 8, &mut count, &mut remote, 14));
-    assert_eq!(NATIVE_READS.load(Ordering::SeqCst), native_reads);
-    let next_available = available(object, &mut count, 14);
-    let larger_packet_retained = next_available && count == 40;
-    if next_available {
-        assert!(read(object, buffer.as_mut_ptr().cast(), 40, &mut count, &mut remote, 14));
-        assert_eq!((remote, count, buffer), (303, 40, [9; 40]));
+    for (expected, kind, channel) in [(b"b", 3, 5), (b"c", 2, 4)] {
+        let packet = read_data(&mut socket);
+        assert_eq!(packet.payload, expected);
+        assert_eq!((packet.send_type, packet.channel), (kind, channel));
     }
-    assert!(native_source_kept && discarded_without_replacement && larger_packet_retained,
-        "native source kept={native_source_kept}, stale read rejected={discarded_without_replacement}, next packet retained={larger_packet_retained}");
-    println!("PASS: native size queries keep their source and stale packets cannot substitute a larger packet");
-    // Close the local session, then start solely with Isaac's no-delay send mode.
-    eventually(|| close(object, 202));
-    eventually(|| send(object, 202, b"out".as_ptr().cast(), 3, 1, 9));
+    println!("PASS: no-delay first send and immediate reliable FIFO through x86 Hook/IPC");
+    // Real-time consumption pause: Hook stays live while the game does not call ReadP2PPacket.
+    let mut retained = incoming.clone();
+    retained.channel = 7;
+    retained.payload = b"r".to_vec();
+    write_message(&mut socket, &Message::Data(retained)).unwrap();
+    let duplicate = SESSION
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .pending()
+        .last()
+        .unwrap()
+        .clone();
+    eventually(|| available(object, &mut count, 7));
+    socket.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(socket);
+    let mut replacement = None;
+    eventually(|| {
+        replacement = listener.accept().ok().map(|p| p.0);
+        replacement.is_some()
+    });
+    let mut socket = replacement.unwrap();
+    socket.set_nonblocking(false).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    match netburrow_protocol::read_message(&mut socket).unwrap() {
+        Message::IpcResume {
+            nonce,
+            pid,
+            steam_id,
+            epoch,
+            received,
+        } => {
+            assert_eq!(
+                (nonce, pid, steam_id, epoch),
+                ([7; 16], std::process::id(), 101, 11)
+            );
+            SESSION
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .acknowledge(received)
+                .unwrap();
+        }
+        other => panic!("expected original IPC session resume, got {other:?}"),
+    }
+    let through = SESSION.lock().unwrap().as_ref().unwrap().received_through();
+    netburrow_protocol::write_message(&mut socket, &Message::SessionAck(through)).unwrap();
+    for (sequence, body) in SESSION.lock().unwrap().as_ref().unwrap().pending() {
+        netburrow_protocol::write_message(&mut socket, &Message::SessionFrame { sequence, body })
+            .unwrap();
+    }
+    netburrow_protocol::write_message(
+        &mut socket,
+        &Message::SessionFrame {
+            sequence: duplicate.0,
+            body: duplicate.1,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        read_message(&mut socket).unwrap(),
+        Message::Diagnostic(_)
+    ));
+    assert_eq!(read_message(&mut socket).unwrap(), Message::IpcReady);
+    let mut data = [0u8; 1];
+    assert!(read(
+        object,
+        data.as_mut_ptr().cast(),
+        1,
+        &mut count,
+        &mut remote,
+        7
+    ));
+    assert_eq!(data, *b"r");
+    // Wait for a ping after replay processing before asserting duplicate suppression.
     loop {
         match read_message(&mut socket).unwrap() {
-            Message::Ping(n) => write_message(&mut socket, &Message::Pong(n)).unwrap(),
-            Message::IpcHealth(_) => {}
-            Message::Data(packet) => {
-                assert_eq!(
-                    (
-                        packet.from,
-                        packet.to,
-                        packet.source_epoch,
-                        packet.target_epoch,
-                        packet.channel,
-                        packet.send_type,
-                        packet.payload
-                    ),
-                    (101, 202, 11, 22, 9, 1, b"out".to_vec())
-                );
+            Message::Ping(n) => {
+                write_message(&mut socket, &Message::Pong(n)).unwrap();
                 break;
             }
+            Message::IpcHealth(_) => {}
+            other => panic!("unexpected recovery message {other:?}"),
+        }
+    }
+    assert!(!available(object, &mut count, 7));
+    eventually(|| {
+        workers = hook_workers();
+        workers.len() == 2
+    });
+    assert!(send(object, 202, b"resume".as_ptr().cast(), 6, 2, 8));
+    loop {
+        match read_message(&mut socket).unwrap() {
+            Message::Data(p) => {
+                assert_eq!(p.payload, b"resume");
+                break;
+            }
+            Message::Ping(n) => write_message(&mut socket, &Message::Pong(n)).unwrap(),
+            Message::IpcHealth(_) => {}
             other => panic!("unexpected {other:?}"),
         }
     }
-    assert!(send(object, 303, b"native".as_ptr().cast(), 6, 2, 0));
-    assert_eq!(NATIVE_SENDS.load(Ordering::SeqCst), 2);
-    // Validate the actual x86 ABI and IPC path, including buffering across channels.
-    for (payload, kind, channel) in [(b"a", 3, 4), (b"b", 3, 5), (b"c", 2, 4)] {
-        assert!(send(object, 202, payload.as_ptr().cast(), 1, kind, channel));
-    }
-    for (expected, kind, channel) in [(b"a", 3, 4), (b"b", 3, 5), (b"c", 2, 4)] {
-        loop {
-            match read_message(&mut socket).unwrap() {
-                Message::Ping(n) => write_message(&mut socket, &Message::Pong(n)).unwrap(),
-                Message::IpcHealth(_) => {}
-                Message::Data(packet) => {
-                    assert_eq!(packet.payload, expected);
-                    assert_eq!((packet.send_type, packet.channel), (kind, channel));
-                    break;
-                }
-                other => panic!("unexpected {other:?}"),
-            }
-        }
-    }
     println!(
-        "PASS: mixed buffered reliable packets preserve order across channels through x86 Hook/IPC"
+        "PASS: original x86 Hook survives IPC reconnect, preserves queued reliable data and suppresses replay duplicates"
     );
-    // Real-time consumption pause: Hook stays live while the game does not call ReadP2PPacket.
-    let mut retained=incoming.clone();retained.channel=7;retained.payload=b"r".to_vec();
-    write_message(&mut socket,&Message::Data(retained)).unwrap();
-    let duplicate=SESSION.lock().unwrap().as_ref().unwrap().pending().last().unwrap().clone();
-    eventually(||available(object,&mut count,7));
-    socket.shutdown(std::net::Shutdown::Both).unwrap();drop(socket);
-    let mut replacement=None;
-    eventually(||{replacement=listener.accept().ok().map(|p|p.0);replacement.is_some()});
-    let mut socket=replacement.unwrap();socket.set_nonblocking(false).unwrap();socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    match netburrow_protocol::read_message(&mut socket).unwrap() {
-        Message::IpcResume{nonce,pid,steam_id,epoch,received}=>{
-            assert_eq!((nonce,pid,steam_id,epoch),([7;16],std::process::id(),101,11));
-            SESSION.lock().unwrap().as_mut().unwrap().acknowledge(received).unwrap();
-        }
-        other=>panic!("expected original IPC session resume, got {other:?}"),
-    }
-    let through=SESSION.lock().unwrap().as_ref().unwrap().received_through();
-    netburrow_protocol::write_message(&mut socket,&Message::SessionAck(through)).unwrap();
-    for (sequence,body) in SESSION.lock().unwrap().as_ref().unwrap().pending(){netburrow_protocol::write_message(&mut socket,&Message::SessionFrame{sequence,body}).unwrap();}
-    netburrow_protocol::write_message(&mut socket,&Message::SessionFrame{sequence:duplicate.0,body:duplicate.1}).unwrap();
-    assert!(matches!(read_message(&mut socket).unwrap(),Message::Diagnostic(_)));
-    assert_eq!(read_message(&mut socket).unwrap(),Message::IpcReady);
-    let mut data=[0u8;1];
-    assert!(read(object,data.as_mut_ptr().cast(),1,&mut count,&mut remote,7));assert_eq!(data,*b"r");
-    // Wait for a ping after replay processing before asserting duplicate suppression.
-    loop {match read_message(&mut socket).unwrap(){Message::Ping(n)=>{write_message(&mut socket,&Message::Pong(n)).unwrap();break;},Message::IpcHealth(_)=>{},other=>panic!("unexpected recovery message {other:?}")}}
-    assert!(!available(object,&mut count,7));
-    eventually(||{workers=hook_workers();workers.len()==2});
-    assert!(send(object,202,b"resume".as_ptr().cast(),6,2,8));
-    loop {match read_message(&mut socket).unwrap(){Message::Data(p)=>{assert_eq!(p.payload,b"resume");break;},Message::Ping(n)=>write_message(&mut socket,&Message::Pong(n)).unwrap(),Message::IpcHealth(_)=>{},other=>panic!("unexpected {other:?}")}}
-    println!("PASS: original x86 Hook survives IPC reconnect, preserves queued reliable data and suppresses replay duplicates");
     println!("Starting 20s no-read backlog test (three peers, 90% dominant traffic)");
     write_message(
         &mut socket,
@@ -748,14 +886,6 @@ unsafe fn run() {
         ]),
     )
     .unwrap();
-    let accept: unsafe extern "thiscall" fn(*mut c_void, u64) -> bool = transmute(*patched.add(3));
-    let session: unsafe extern "thiscall" fn(*mut c_void, u64, *mut c_void) -> bool =
-        transmute(*patched.add(6));
-    for peer in [202, 302, 303] {
-        let mut state = [0u64; 4];
-        eventually(|| session(object, peer, state.as_mut_ptr().cast()));
-        eventually(|| accept(object, peer));
-    }
     let worker = std::thread::spawn(move || {
         let started = std::time::Instant::now();
         for index in 0u32..3000 {
@@ -814,69 +944,141 @@ unsafe fn run() {
         assert!(!available(object, &mut count, channel));
     }
     println!("PASS: 20s real-time 3000-packet reliable backlog consumed without gaps/duplicates");
-    write_message(&mut socket, &Message::Stop).unwrap();
-    let session: unsafe extern "thiscall" fn(*mut c_void, u64, *mut u8) -> bool =
-        transmute(*patched.add(6));
-    let mut guarded_state = [0xa5a5_a5a5u32; 7];
-    let state = &mut guarded_state[1..6];
-    eventually(|| {
-        SteamAPI_RunCallbacks();
-        session(object, 202, state.as_mut_ptr().cast()) && state[0].to_le_bytes()[2] == 4
-    });
-    assert_eq!(state[0].to_le_bytes()[0], 0);
-    assert_eq!(guarded_state[0], 0xa5a5_a5a5);
-    assert_eq!(guarded_state[6], 0xa5a5_a5a5);
+    // The imported factory can expose another table after initialization. Its
+    // originals must be saved independently and looked up using this's current table.
+    let mut replacement_table = Box::new(original_slots);
+    replacement_table[6] = replacement_session as *const () as usize;
+    let replacement_originals = *replacement_table;
+    let replacement_address = replacement_table.as_ptr() as usize;
+    let mut replacement_object = Box::new(replacement_address);
+    let replacement = (&mut *replacement_object as *mut usize).cast();
+    FixtureSetObject(replacement as usize);
     assert_eq!(
-        FAILURES.load(Ordering::SeqCst),
-        0,
-        "Hook must not synthesize failure callbacks"
+        SteamInternal_FindOrCreateUserInterface(1, c"SteamNetworking006".as_ptr()),
+        replacement
     );
-    assert!(!send(object, 202, b"stopped".as_ptr().cast(), 7, 2, 0));
-    assert_eq!(
-        NATIVE_SENDS.load(Ordering::SeqCst),
+    assert_eq!(*replacement_object, replacement_address);
+    for slot in [0, 1, 2, 6] {
+        assert_ne!(replacement_table[slot], replacement_originals[slot]);
+    }
+    assert_eq!(&replacement_table[3..6], &replacement_originals[3..6]);
+    assert_eq!(&replacement_table[7..], &replacement_originals[7..]);
+    let mut second_state = [0xa5u8; 28];
+    assert!(!session(
+        replacement,
+        SHARED_REMOTE,
+        second_state[4..24].as_mut_ptr().cast()
+    ));
+    assert_eq!(&second_state[..4], &[0xa5; 4]);
+    assert_eq!(&second_state[4..24], &[0x3c; 20]);
+    assert_eq!(&second_state[24..], &[0xa5; 4]);
+    *replacement_object = original_table;
+    second_state.fill(0xa5);
+    assert!(!session(
+        replacement,
+        SHARED_REMOTE,
+        second_state[4..24].as_mut_ptr().cast()
+    ));
+    assert_eq!(second_state, [0xa5; 28]);
+    *replacement_object = replacement_address;
+    assert!(!session(
+        replacement,
+        SHARED_REMOTE,
+        second_state[4..24].as_mut_ptr().cast()
+    ));
+    assert_eq!(&second_state[4..24], &[0x3c; 20]);
+    assert!(shared_session(
+        shared,
+        SHARED_REMOTE,
+        session_with_canaries[4..24].as_mut_ptr().cast()
+    ));
+    assert_eq!(&session_with_canaries[4..24], &SHARED_SESSION);
+    let replacement_send: unsafe extern "thiscall" fn(
+        *mut c_void,
+        u64,
+        *const c_void,
+        u32,
+        i32,
+        i32,
+    ) -> bool = transmute(replacement_table[0]);
+    assert!(replacement_send(
+        replacement,
+        202,
+        b"new-table".as_ptr().cast(),
+        9,
         2,
-        "owned peer must not fall back after stop"
-    );
-    // Callback observation must stop a changed interface without ever restoring
-    // an old object or writing over another tool's controlled slot.
-    table[0] = third_party_send as *const () as usize;
+        8
+    ));
+    assert_eq!(read_data(&mut socket).payload, b"new-table");
+    let lookups = FixtureNetworkingCalls();
+    replacement_table[0] = replacement_originals[0];
     for _ in 0..60 {
         SteamAPI_RunCallbacks();
     }
-    assert!(!session(object, 202, guarded_state[1..6].as_mut_ptr().cast()),
-        "a controlled slot change must make the target Hook terminal");
-    let mut third_table = Box::new([unused as *const () as usize; 22]);
-    third_table[0] = third_party_send as *const () as usize;
-    let third_table_address = third_table.as_ptr() as usize;
-    let mut third_object = Box::new(third_table_address);
-    FixtureSetObject((&mut *third_object) as *mut usize as usize);
-    for _ in 0..60 {
-        SteamAPI_RunCallbacks();
-    }
-    assert_eq!(
-        table[0],
-        third_party_send as *const () as usize,
-        "callback detection must not write the saved hook back over a third-party slot"
+    assert_eq!(replacement_table[0], hooked_slots[0]);
+    assert_eq!(FixtureNetworkingCalls(), lookups);
+    println!(
+        "PASS: imported interface factory installs new tables and preserves each table's native session implementation"
     );
-    assert_eq!(
-        *third_object, third_table_address,
-        "callback detection must not restore the original game object pointer"
-    );
-    assert_eq!(
-        third_table[0],
-        third_party_send as *const () as usize,
-        "callback detection must leave the replacement object's table alone"
-    );
-    SteamAPI_UnregisterCallback((&mut request as *mut Callback).cast());
-    SteamAPI_UnregisterCallback((&mut failure as *mut Callback).cast());
-    for worker in workers {
+    write_message(&mut socket, &Message::Stop).unwrap();
+    for worker in &workers {
         assert_eq!(
             WaitForSingleObject(worker.as_raw_handle(), 4_000),
             0,
             "Hook thread did not terminate after Stop"
         );
     }
+    assert!(!send(object, 202, b"stopped".as_ptr().cast(), 7, 2, 0));
+    assert!(!send(object, 404, b"unknown".as_ptr().cast(), 7, 2, 0));
+    assert!(!available(object, &mut count, SHARED_CHANNEL));
+    assert!(!read(
+        object,
+        buffer.as_mut_ptr().cast(),
+        256,
+        &mut count,
+        &mut remote,
+        SHARED_CHANNEL
+    ));
+    assert_eq!(
+        (
+            NATIVE_SENDS.load(Ordering::SeqCst),
+            NATIVE_AVAILABLE.load(Ordering::SeqCst),
+            NATIVE_READS.load(Ordering::SeqCst)
+        ),
+        (0, 0, 0),
+        "stopped replacement transport must not fall back to native data functions"
+    );
+    assert!(shared_accept(shared, SHARED_REMOTE));
+    assert!(shared_close(shared, SHARED_REMOTE));
+    assert!(shared_close_channel(shared, SHARED_REMOTE, SHARED_CHANNEL));
+    session_with_canaries.fill(0xa5);
+    assert!(shared_session(
+        shared,
+        SHARED_REMOTE,
+        session_with_canaries[4..24].as_mut_ptr().cast()
+    ));
+    assert_eq!(&session_with_canaries[4..24], &SHARED_SESSION);
+    assert_eq!(&session_with_canaries[..4], &[0xa5; 4]);
+    assert_eq!(&session_with_canaries[24..], &[0xa5; 4]);
+    second_state.fill(0xa5);
+    assert!(!session(
+        replacement,
+        SHARED_REMOTE,
+        second_state[4..24].as_mut_ptr().cast()
+    ));
+    assert_eq!(&second_state[4..24], &[0x3c; 20]);
+    SteamAPI_RunCallbacks();
+    assert_eq!(
+        (
+            REQUESTS.load(Ordering::SeqCst),
+            FAILURES.load(Ordering::SeqCst)
+        ),
+        (0, 0)
+    );
+    assert_eq!(SHARED_ABI_FAILURES.load(Ordering::SeqCst), 0);
+    SteamAPI_UnregisterCallback((&mut request as *mut Callback).cast());
+    SteamAPI_UnregisterCallback((&mut failure as *mut Callback).cast());
     println!(
-        "PASS: x86 helper identity rejection, DLL load, IPC identity, receive-first acceptance without synthetic callbacks, channel/truncated read, no-delay first-packet routing and stop without fallback"
+        "PASS: x86 helper identity rejection, DLL load, IPC identity, native callbacks and sessions, channel/truncated read, replacement transport and stop without native data fallback"
     );
 }

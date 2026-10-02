@@ -1,6 +1,8 @@
 // ABI source: Valve's public SteamNetworking006 / CCallbackBase headers:
 // https://github.com/ValveSoftware/source-sdk-2013/tree/master/src/public/steam
-// The interface/ABI definitions are used here; the adapter and lifecycle are our own.
+// Hook strategy follows TractorBeam ea0393f: Find/RunCallbacks IAT hooks,
+// shared vtable slots 0/1/2/6, replacement data path and native session APIs.
+// NetBurrow retains its authenticated IPC startup, peer epochs and recovery wire protocol.
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::queue::Bridge;
@@ -10,7 +12,7 @@ use netburrow_protocol::{
     read_message, write_message,
 };
 use std::{
-    ffi::c_void,
+    ffi::{c_char, c_void},
     io,
     mem::{size_of, transmute, zeroed},
     net::{Shutdown, SocketAddr, TcpStream},
@@ -43,11 +45,17 @@ struct Shared {
 }
 static BRIDGE: OnceLock<Arc<Shared>> = OnceLock::new();
 static STARTED: AtomicBool = AtomicBool::new(false);
-static STEAM: OnceLock<Steam> = OnceLock::new();
+// Retain each observed table for process lifetime. A newly returned interface
+// must not change the native session function used by an older table.
+static STEAM: Mutex<Vec<Arc<Steam>>> = Mutex::new(Vec::new());
+// Installation never calls Steam or takes Bridge locks. Serialize it rather
+// than skipping a second interface returned during another table's install.
+static INSTALL_LOCK: Mutex<()> = Mutex::new(());
 static LOCK_BUSY: AtomicUsize = AtomicUsize::new(0);
 static SEND_LOCK_BUSY: AtomicUsize = AtomicUsize::new(0);
 static SEND_INVALID: AtomicUsize = AtomicUsize::new(0);
 static INTERFACE_CHANGED: AtomicBool = AtomicBool::new(false);
+static INTERFACE_REPAIRS: AtomicUsize = AtomicUsize::new(0);
 static CALLBACK_TICKS: AtomicUsize = AtomicUsize::new(0);
 // Indices follow the SteamNetworking006 vtable: send, available, read, accept,
 // close session, close channel, session state. Atomic updates only on game threads.
@@ -55,15 +63,17 @@ static API_CALLS: [AtomicUsize; 7] = [const { AtomicUsize::new(0) }; 7];
 static API_BUSY: [AtomicUsize; 7] = [const { AtomicUsize::new(0) }; 7];
 static API_INVALID: [AtomicUsize; 7] = [const { AtomicUsize::new(0) }; 7];
 static API_NATIVE: [AtomicUsize; 7] = [const { AtomicUsize::new(0) }; 7];
-static NATIVE_DISCARDED: AtomicUsize = AtomicUsize::new(0);
 static READ_TRUNCATED: AtomicUsize = AtomicUsize::new(0);
 // First failure wins. The game-thread failure path never locks or touches queues.
 static HOOK_FAILURE: AtomicUsize = AtomicUsize::new(0);
 const RUST_PANIC: usize = 1;
 const POISONED: usize = 2;
-const CHANGED: usize = 3;
+const INSTALL_FAILED: usize = 3;
 
 fn fail_hook(reason: usize) {
+    if reason == INSTALL_FAILED {
+        INTERFACE_CHANGED.store(true, Ordering::Relaxed);
+    }
     let _ = HOOK_FAILURE.compare_exchange(0, reason, Ordering::AcqRel, Ordering::Acquire);
     if let Some(shared) = BRIDGE.get() {
         shared.stopped.store(true, Ordering::Release);
@@ -102,16 +112,18 @@ fn bridge_lock(shared: &Shared, wait: bool) -> Option<MutexGuard<'_, Bridge>> {
     }
 }
 
-// None means native forwarding. Steam calls must remain outside this boundary.
-fn hook_call(this: *mut c_void, work: impl FnOnce(&Shared) -> Option<bool>) -> Option<bool> {
-    let steam = STEAM.get()?;
-    if this as usize != steam.object || !steam.installed.load(Ordering::Acquire) {
-        return None;
-    }
+// All objects using a patched table use the replacement data path. Steam
+// session calls remain outside this Rust boundary and outside Bridge locks.
+fn hook_call(work: impl FnOnce(&Shared) -> bool) -> bool {
     if HOOK_FAILURE.load(Ordering::Acquire) != 0 {
-        return Some(false);
+        return false;
     }
-    rust_boundary(|| BRIDGE.get().map_or(Some(false), |shared| work(shared))).unwrap_or(Some(false))
+    rust_boundary(|| {
+        BRIDGE
+            .get()
+            .is_some_and(|shared| !shared.stopped.load(Ordering::Acquire) && work(shared))
+    })
+    .unwrap_or(false)
 }
 
 fn stop_bridge(shared: &Shared) {
@@ -138,18 +150,7 @@ fn record_telemetry(shared: &Shared) {
         .into_iter()
         .map(|line| ("game diagnostics", line))
         .collect();
-    for (index, name) in [
-        "send",
-        "available",
-        "read",
-        "accept",
-        "close",
-        "close_channel",
-        "session",
-    ]
-    .iter()
-    .enumerate()
-    {
+    for (index, name) in [(0, "send"), (1, "available"), (2, "read"), (6, "session")] {
         records.push((
             "game api",
             format!(
@@ -164,9 +165,9 @@ fn record_telemetry(shared: &Shared) {
     records.push((
         "game api",
         format!(
-            "callback_ticks={} native_discarded={} read_truncated={}",
+            "callback_ticks={} interface_repairs={} read_truncated={}",
             CALLBACK_TICKS.load(Ordering::Relaxed),
-            NATIVE_DISCARDED.load(Ordering::Relaxed),
+            INTERFACE_REPAIRS.load(Ordering::Relaxed),
             READ_TRUNCATED.load(Ordering::Relaxed)
         ),
     ));
@@ -176,11 +177,11 @@ fn record_telemetry(shared: &Shared) {
     );
 }
 struct Steam {
-    original: [usize; 7],
-    object: usize,
+    original: [AtomicUsize; 4],
     table: usize,
     installed: AtomicBool,
 }
+const SLOTS: [usize; 4] = [0, 1, 2, 6];
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
@@ -252,20 +253,15 @@ fn initialize(init: HookInit) -> io::Result<()> {
         "waiting for SteamNetworking006 (20s timeout)",
     );
     let limit = Instant::now() + Duration::from_secs(20);
-    let mut callback_installed = false;
+    let mut callbacks_installed = false;
     let (interface, steam_id) = loop {
         let module = unsafe { GetModuleHandleW(wide("steam_api.dll").as_ptr()) };
         if !module.is_null() {
-            if !callback_installed {
+            if !callbacks_installed {
                 unsafe {
                     install_callback_imports()?;
                 }
-                callback_installed = true;
-                crate::diagnostics::record(
-                    "INFO",
-                    "callbacks",
-                    "SteamAPI_RunCallbacks observed; Steam retains callback registration and dispatch",
-                );
+                callbacks_installed = true;
             }
             if let Some(info) = unsafe { steam_interface(module) } {
                 break info;
@@ -274,7 +270,7 @@ fn initialize(init: HookInit) -> io::Result<()> {
         if Instant::now() >= limit {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "SteamNetworking006 unavailable",
+                "Steam user or SteamNetworking006 unavailable",
             ));
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -294,7 +290,7 @@ fn initialize(init: HookInit) -> io::Result<()> {
     crate::diagnostics::record(
         "INFO",
         "interface",
-        "Steam identity acquired and networking vtable installed",
+        "TractorBeam strategy: Find/RunCallbacks, shared slots 0/1/2/6; replacement data, native sessions",
     );
     let endpoint = SocketAddr::from(([127, 0, 0, 1], init.port as u16));
     let window = Arc::new(Mutex::new(netburrow_protocol::resume::Window::default()));
@@ -669,8 +665,8 @@ fn ipc_connection(
 
 fn notify_failure(socket: &mut TcpStream, pending: Option<PendingWrite>) -> io::Result<()> {
     let reason = match HOOK_FAILURE.load(Ordering::Acquire) {
-        CHANGED => {
-            "游戏 SteamNetworking006 对象或受控入口已变化，当前游戏接入已停止，请退出游戏后重开"
+        INSTALL_FAILED => {
+            "游戏 SteamNetworking006 接入安装或恢复失败，当前游戏接入已停止，请退出游戏后重开"
         }
         POISONED => "Hook 内部锁状态异常，当前游戏接入已停止，请退出游戏后重开",
         _ => "Hook 内部 Rust 异常，当前游戏接入已停止，请退出游戏后重开",
@@ -702,6 +698,8 @@ unsafe fn steam_interface(module: HMODULE) -> Option<(usize, u64)> {
         module,
         c"SteamAPI_GetHSteamUser".as_ptr().cast(),
     )?);
+    // Restore the original startup gate: do not request interfaces before Steam
+    // has initialized its user handle in the game process.
     if user_handle() == 0 {
         return None;
     }
@@ -726,9 +724,35 @@ unsafe fn steam_interface(module: HMODULE) -> Option<(usize, u64)> {
     (id != 0 && !interface.is_null()).then_some((interface as usize, id))
 }
 
+type FindInterface = unsafe extern "C" fn(i32, *const c_char) -> *mut c_void;
+static FIND_INTERFACE: AtomicUsize = AtomicUsize::new(0);
+static RUN_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe fn probe_interface(module: HMODULE) -> io::Result<()> {
+    let find = GetProcAddress(
+        module,
+        c"SteamInternal_FindOrCreateUserInterface".as_ptr().cast(),
+    )
+    .map(|f| f as usize)
+    .unwrap_or_else(|| FIND_INTERFACE.load(Ordering::Acquire));
+    if find == 0 {
+        return Err(io::Error::other("Steam interface factory unavailable"));
+    }
+    let user = GetProcAddress(module, c"SteamAPI_GetHSteamUser".as_ptr().cast())
+        .map(|f| transmute::<_, unsafe extern "C" fn() -> i32>(f)())
+        .unwrap_or(0);
+    let find: FindInterface = transmute(find);
+    let object = find(user, c"SteamNetworking006".as_ptr());
+    if !object.is_null() {
+        install_interface(object as usize)?;
+    }
+    Ok(())
+}
+
 unsafe fn install_interface(object: usize) -> io::Result<()> {
-    // The object comes only from the explicitly versioned v006 export. Pointer
-    // and PE checks reject malformed layouts; they cannot prove a foreign ABI.
+    let _installing = INSTALL_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("poisoned interface installation"))?;
     if object % size_of::<usize>() != 0 || !readable(object, size_of::<usize>()) {
         return Err(io::Error::other("invalid networking object"));
     }
@@ -736,91 +760,88 @@ unsafe fn install_interface(object: usize) -> io::Result<()> {
     if table % size_of::<usize>() != 0 || !readable(table, 7 * size_of::<usize>()) {
         return Err(io::Error::other("invalid SteamNetworking006 vtable"));
     }
-    let original =
-        std::array::from_fn(|i| (*(table as *const AtomicUsize).add(i)).load(Ordering::Acquire));
-    if original.iter().any(|&address| !x86_method(address)) {
-        return Err(io::Error::other("unsupported networking methods"));
-    }
-    let protections = slot_protections(table)?;
-    STEAM
-        .set(Steam {
-            original,
-            object,
-            table,
-            installed: AtomicBool::new(false),
-        })
-        .map_err(|_| io::Error::other("networking already patched"))?;
-    let saved = STEAM.get().unwrap();
-    // All originals are visible before any game thread can enter a patched slot.
-    // During installation (including rollback), every entry only forwards.
-    patch_slots(saved, &protections)?;
-    saved.installed.store(true, Ordering::Release);
-    Ok(())
+    let saved = {
+        let mut registered = STEAM.lock().expect("poisoned interface registry");
+        if let Some(saved) = registered.iter().find(|s| s.table == table) {
+            saved.clone()
+        } else {
+            let pointers: [usize; 4] = std::array::from_fn(|i| {
+                (*(table as *const AtomicUsize).add(SLOTS[i])).load(Ordering::Acquire)
+            });
+            if pointers
+                .iter()
+                .any(|&p| !x86_method(p) || replacements().contains(&p))
+            {
+                return Err(io::Error::other("unsupported networking methods"));
+            }
+            let saved = Arc::new(Steam {
+                original: pointers.map(AtomicUsize::new),
+                table,
+                installed: AtomicBool::new(false),
+            });
+            // Publish originals before any patched entry can execute.
+            registered.push(saved.clone());
+            saved
+        }
+    };
+    patch_slots(&saved)
 }
 
-fn replacements() -> [usize; 7] {
+fn replacements() -> [usize; 4] {
     [
         send as *const () as usize,
         available as *const () as usize,
         read as *const () as usize,
-        accept as *const () as usize,
-        close as *const () as usize,
-        close_channel as *const () as usize,
         session as *const () as usize,
     ]
 }
 
-unsafe fn patch_slots(saved: &Steam, protections: &[u32; 7]) -> io::Result<()> {
+unsafe fn patch_slots(saved: &Steam) -> io::Result<()> {
+    let protections = slot_protections(saved.table)?;
     let replacement = replacements();
-    for i in 0..7 {
-        let address = saved.table + i * size_of::<usize>();
-        if let Err(error) =
-            compare_pointer(address, saved.original[i], replacement[i], protections[i])
-        {
-            // Include the failed slot: CAS may have succeeded but protection
-            // restoration failed. Never overwrite a third party's new pointer.
-            let mut incomplete = false;
-            for j in (0..=i).rev() {
-                incomplete |= compare_pointer(
-                    saved.table + j * size_of::<usize>(),
-                    replacement[j],
-                    saved.original[j],
-                    protections[j],
-                )
-                .is_err();
-            }
-            return Err(io::Error::other(format!(
-                "networking installation failed: {error}; rollback {}; saved originals and DLL retained",
-                if incomplete {
-                    "incomplete or conflicting"
-                } else {
-                    "complete"
-                }
-            )));
+    let mut changed = Vec::new();
+    for i in 0..SLOTS.len() {
+        let address = saved.table + SLOTS[i] * size_of::<usize>();
+        let previous = (*(address as *const AtomicUsize)).load(Ordering::Acquire);
+        if previous == replacement[i] {
+            continue;
+        }
+        if !x86_method(previous) || replacement.contains(&previous) {
+            rollback_slots(saved, &changed, &protections);
+            return Err(io::Error::other("invalid restored networking method"));
+        }
+        // Refresh the native function before reinstalling, as in TractorBeam.
+        saved.original[i].store(previous, Ordering::Release);
+        changed.push((i, previous));
+        if let Err(error) = compare_pointer(address, previous, replacement[i], protections[i]) {
+            rollback_slots(saved, &changed, &protections);
+            return Err(error);
         }
     }
-    if !interface_intact(saved, saved.object) {
-        let mut incomplete = false;
-        for j in (0..7).rev() {
-            incomplete |= compare_pointer(
-                saved.table + j * size_of::<usize>(),
-                replacement[j],
-                saved.original[j],
-                protections[j],
-            )
-            .is_err();
-        }
-        return Err(io::Error::other(format!(
-            "networking changed during installation; rollback incomplete={incomplete}; DLL retained"
-        )));
+    if !changed.is_empty() && saved.installed.load(Ordering::Acquire) {
+        INTERFACE_REPAIRS.fetch_add(1, Ordering::Relaxed);
+        // No file I/O on the game's callback thread; the worker's telemetry
+        // records the repair count without marking a repaired entry as failed.
     }
+    saved.installed.store(true, Ordering::Release);
     Ok(())
 }
 
-fn slot_protections(table: usize) -> io::Result<[u32; 7]> {
-    let mut protections = [0; 7];
+unsafe fn rollback_slots(saved: &Steam, changed: &[(usize, usize)], protections: &[u32; 4]) {
+    for &(i, previous) in changed.iter().rev() {
+        let _ = compare_pointer(
+            saved.table + SLOTS[i] * size_of::<usize>(),
+            replacements()[i],
+            previous,
+            protections[i],
+        );
+    }
+}
+
+fn slot_protections(table: usize) -> io::Result<[u32; 4]> {
+    let mut protections = [0; 4];
     for (i, protection) in protections.iter_mut().enumerate() {
-        let address = table + i * size_of::<usize>();
+        let address = table + SLOTS[i] * size_of::<usize>();
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { zeroed() };
         if !readable(address, size_of::<usize>())
             || unsafe {
@@ -833,7 +854,6 @@ fn slot_protections(table: usize) -> io::Result<[u32; 7]> {
         {
             return Err(io::Error::other("unreadable networking slot"));
         }
-        // A vtable is data. Do not remove execute permission from a code page.
         if info.Protect
             & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
             != 0
@@ -922,16 +942,6 @@ fn x86_method(address: usize) -> bool {
     }
 }
 
-unsafe fn interface_intact(saved: &Steam, object: usize) -> bool {
-    object == saved.object
-        && readable(object, size_of::<usize>())
-        && (object as *const usize).read() == saved.table
-        && readable(saved.table, 7 * size_of::<usize>())
-        && replacements().iter().enumerate().all(|(i, &address)| {
-            (*(saved.table as *const AtomicUsize).add(i)).load(Ordering::Acquire) == address
-        })
-}
-
 fn readable(address: usize, bytes: usize) -> bool {
     if address == 0 || bytes == 0 {
         return false;
@@ -951,8 +961,14 @@ fn readable(address: usize, bytes: usize) -> bool {
         } == 0
             || info.State != MEM_COMMIT
             || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0
-            || info.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY
-                | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY) == 0
+            || info.Protect
+                & (PAGE_READONLY
+                    | PAGE_READWRITE
+                    | PAGE_WRITECOPY
+                    | PAGE_EXECUTE_READ
+                    | PAGE_EXECUTE_READWRITE
+                    | PAGE_EXECUTE_WRITECOPY)
+                == 0
         {
             return false;
         }
@@ -981,46 +997,16 @@ fn executable(address: usize) -> bool {
             & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
             != 0
 }
-unsafe fn swap_pointer(address: usize, value: usize) -> io::Result<usize> {
-    if address % size_of::<usize>() != 0 || !readable(address, size_of::<usize>()) {
-        return Err(io::Error::other("invalid patch address"));
-    }
-    let mut old = 0;
-    if VirtualProtect(
-        address as *const c_void,
-        size_of::<usize>(),
-        PAGE_READWRITE,
-        &mut old,
-    ) == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    let previous = (*(address as *const AtomicUsize)).swap(value, Ordering::AcqRel);
-    let mut ignored = 0;
-    if VirtualProtect(
-        address as *const c_void,
-        size_of::<usize>(),
-        old,
-        &mut ignored,
-    ) == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(previous)
-}
-fn original(index: usize) -> usize {
-    STEAM.get().map(|s| s.original[index]).unwrap_or(0)
-}
 
 unsafe extern "thiscall" fn send(
-    this: *mut c_void,
+    _this: *mut c_void,
     remote: u64,
     data: *const c_void,
     length: u32,
     kind: i32,
     channel: i32,
 ) -> bool {
-    if let Some(result) = hook_call(this, |shared| {
+    hook_call(|shared| {
         API_CALLS[0].fetch_add(1, Ordering::Relaxed);
         if length as usize > MAX_PAYLOAD
             || !(0..=3).contains(&kind)
@@ -1028,212 +1014,81 @@ unsafe extern "thiscall" fn send(
         {
             API_INVALID[0].fetch_add(1, Ordering::Relaxed);
             SEND_INVALID.fetch_add(1, Ordering::Relaxed);
-            return Some(false);
+            return false;
         }
-        // Lock order is Bridge -> Outbox. No network I/O or Steam calls under either lock.
         let Some(mut bridge) = bridge_lock(shared, true) else {
-            return Some(false);
+            return false;
         };
         let bytes = if length == 0 {
             &[]
         } else {
             std::slice::from_raw_parts(data.cast::<u8>(), length as usize)
         };
-        if let Some(result) = bridge.send(remote, bytes, kind as u8, channel) {
-            drop(bridge);
+        let sent = bridge
+            .send(remote, bytes, kind as u8, channel)
+            .unwrap_or(false);
+        drop(bridge);
+        if sent {
             shared.wake.unpark();
-            return Some(result);
         }
-        None
-    }) {
-        return result;
-    }
-    let address = original(0);
-    if address == 0 {
-        return false;
-    }
-    let f: unsafe extern "thiscall" fn(*mut c_void, u64, *const c_void, u32, i32, i32) -> bool =
-        transmute(address);
-    API_NATIVE[0].fetch_add(1, Ordering::Relaxed);
-    f(this, remote, data, length, kind, channel)
+        sent
+    })
 }
-unsafe extern "thiscall" fn available(this: *mut c_void, size: *mut u32, channel: i32) -> bool {
-    let mut managed = false;
-    if let Some(result) = hook_call(this, |shared| {
-        managed = true;
+
+unsafe extern "thiscall" fn available(_this: *mut c_void, size: *mut u32, channel: i32) -> bool {
+    hook_call(|shared| {
         API_CALLS[1].fetch_add(1, Ordering::Relaxed);
-        if size.is_null() {
-            API_INVALID[1].fetch_add(1, Ordering::Relaxed);
-            return Some(false);
-        }
-        let Some(mut bridge) = bridge_lock(shared, false) else {
-            API_BUSY[1].fetch_add(1, Ordering::Relaxed);
-            LOCK_BUSY.fetch_add(1, Ordering::Relaxed);
-            return Some(false);
+        let Some(mut bridge) = bridge_lock(shared, true) else {
+            return false;
         };
-        match bridge.available(channel) {
-            Ok(Some(length)) => {
-                size.write(length as u32);
-                return Some(true);
+        if let Ok(Some(length)) = bridge.available(channel) {
+            if !size.is_null() {
+                size.write_unaligned(length as u32);
             }
-            Ok(None) => {
-                // Reserve the source before releasing the lock: Hook data may
-                // arrive while Steam reports the native packet's size.
-                if bridge.native_query(channel).is_err() {
-                    return Some(false);
-                }
-            }
-            Err(_) => return Some(false),
+            return true;
         }
-        None
-    }) {
-        return result;
-    }
-    let address = original(1);
-    let found = if address == 0 {
         false
-    } else {
-        let f: unsafe extern "thiscall" fn(*mut c_void, *mut u32, i32) -> bool = transmute(address);
-        API_NATIVE[1].fetch_add(1, Ordering::Relaxed);
-        f(this, size, channel)
-    };
-    if !found && managed {
-        hook_call(this, |shared| {
-            if let Some(mut bridge) = bridge_lock(shared, false) {
-                bridge.clear_native_query(channel);
-            }
-            Some(false)
-        });
-    }
-    found
+    })
 }
+
 unsafe extern "thiscall" fn read(
-    this: *mut c_void,
+    _this: *mut c_void,
     destination: *mut c_void,
     capacity: u32,
     size: *mut u32,
     remote: *mut u64,
     channel: i32,
 ) -> bool {
-    let mut managed = false;
-    if let Some(result) = hook_call(this, |shared| {
-        managed = true;
+    hook_call(|shared| {
         API_CALLS[2].fetch_add(1, Ordering::Relaxed);
-        if size.is_null() || remote.is_null() || (capacity > 0 && destination.is_null()) {
+        if destination.is_null() {
             API_INVALID[2].fetch_add(1, Ordering::Relaxed);
-            return Some(false);
+            return false;
         }
-        let Some(mut bridge) = bridge_lock(shared, false) else {
-            API_BUSY[2].fetch_add(1, Ordering::Relaxed);
-            LOCK_BUSY.fetch_add(1, Ordering::Relaxed);
-            return Some(false);
+        let Some(mut bridge) = bridge_lock(shared, true) else {
+            return false;
         };
-        let packet = match bridge.read(channel) {
-            Ok(packet) => packet,
-            // The game still has the old Hook packet's buffer size. Do not
-            // replace an invalidated query with a packet from native Steam.
-            Err(_) => return Some(false),
+        let Ok(Some(packet)) = bridge.read(channel) else {
+            return false;
         };
-        if let Some(packet) = packet {
-            drop(bridge);
-            // Steam's documented ABI consumes/truncates a packet when the caller's buffer is small.
-            let count = packet.payload.len().min(capacity as usize);
-            if count < packet.payload.len() {
-                READ_TRUNCATED.fetch_add(1, Ordering::Relaxed);
-            }
-            if count > 0 {
-                ptr::copy_nonoverlapping(packet.payload.as_ptr(), destination.cast::<u8>(), count);
-            }
-            size.write(count as u32);
+        drop(bridge);
+        let count = packet.payload.len().min(capacity as usize);
+        if count < packet.payload.len() {
+            READ_TRUNCATED.fetch_add(1, Ordering::Relaxed);
+        }
+        if count > 0 {
+            ptr::copy_nonoverlapping(packet.payload.as_ptr(), destination.cast::<u8>(), count);
+        }
+        if !size.is_null() {
+            size.write_unaligned(count as u32);
+        }
+        if !remote.is_null() {
             remote.write_unaligned(packet.from);
-            return Some(true);
         }
-        None
-    }) {
-        return result;
-    }
-    let address = original(2);
-    if address == 0 {
-        return false;
-    }
-    let f: unsafe extern "thiscall" fn(
-        *mut c_void,
-        *mut c_void,
-        u32,
-        *mut u32,
-        *mut u64,
-        i32,
-    ) -> bool = transmute(address);
-    API_NATIVE[2].fetch_add(1, Ordering::Relaxed);
-    if !f(this, destination, capacity, size, remote, channel) {
-        return false;
-    }
-    if !managed { return true; }
-    hook_call(this, |shared| {
-        let ours = bridge_lock(shared, false)
-            .map(|mut b| {
-                let ours = b.known(remote.read_unaligned());
-                if !ours {
-                    b.clear_native_query(channel);
-                }
-                ours
-            })
-            .unwrap_or(true);
-        if ours {
-            // The next native packet can be larger than the queried one. Require a
-            // fresh size query instead of consuming it with the old buffer.
-            NATIVE_DISCARDED.fetch_add(1, Ordering::Relaxed);
-            return Some(false);
-        }
-        Some(true)
+        true
     })
-    .unwrap_or(true)
 }
-unsafe extern "thiscall" fn accept(this: *mut c_void, remote: u64) -> bool {
-    if let Some(result) = hook_call(this, |shared| {
-        API_CALLS[3].fetch_add(1, Ordering::Relaxed);
-        let Some(mut bridge) = bridge_lock(shared, false) else {
-            API_BUSY[3].fetch_add(1, Ordering::Relaxed);
-            return Some(false);
-        };
-        bridge.accept(remote)
-    }) {
-        return result;
-    }
-    let f: unsafe extern "thiscall" fn(*mut c_void, u64) -> bool = transmute(original(3));
-    API_NATIVE[3].fetch_add(1, Ordering::Relaxed);
-    f(this, remote)
-}
-unsafe extern "thiscall" fn close(this: *mut c_void, remote: u64) -> bool {
-    if let Some(result) = hook_call(this, |shared| {
-        API_CALLS[4].fetch_add(1, Ordering::Relaxed);
-        let Some(mut bridge) = bridge_lock(shared, false) else {
-            API_BUSY[4].fetch_add(1, Ordering::Relaxed);
-            return Some(false);
-        };
-        bridge.close(remote, None)
-    }) {
-        return result;
-    }
-    let f: unsafe extern "thiscall" fn(*mut c_void, u64) -> bool = transmute(original(4));
-    API_NATIVE[4].fetch_add(1, Ordering::Relaxed);
-    f(this, remote)
-}
-unsafe extern "thiscall" fn close_channel(this: *mut c_void, remote: u64, channel: i32) -> bool {
-    if let Some(result) = hook_call(this, |shared| {
-        API_CALLS[5].fetch_add(1, Ordering::Relaxed);
-        let Some(mut bridge) = bridge_lock(shared, false) else {
-            API_BUSY[5].fetch_add(1, Ordering::Relaxed);
-            return Some(false);
-        };
-        bridge.close(remote, Some(channel))
-    }) {
-        return result;
-    }
-    let f: unsafe extern "thiscall" fn(*mut c_void, u64, i32) -> bool = transmute(original(5));
-    API_NATIVE[5].fetch_add(1, Ordering::Relaxed);
-    f(this, remote, channel)
-}
+
 #[repr(C)]
 struct SessionState {
     active: u8,
@@ -1253,62 +1108,47 @@ const _: () = assert!(
         && std::mem::offset_of!(SessionState, ip) == 12
         && std::mem::offset_of!(SessionState, port) == 16
 );
+
 unsafe extern "thiscall" fn session(
     this: *mut c_void,
     remote: u64,
     result: *mut SessionState,
 ) -> bool {
-    if let Some(value) = hook_call(this, |shared| {
-        API_CALLS[6].fetch_add(1, Ordering::Relaxed);
-        if result.is_null() {
-            API_INVALID[6].fetch_add(1, Ordering::Relaxed);
-            return Some(false);
+    // Native session state is never synthesized, including after Stop/failure.
+    let address = rust_boundary(|| {
+        if !readable(this as usize, size_of::<usize>()) {
+            return None;
         }
-        let Some(mut bridge) = bridge_lock(shared, true) else {
-            return Some(false);
-        };
-        if let Some((active, bytes, packets)) = bridge.session(remote) {
-            let error = if bridge.stopped || bridge.peer_failed(remote) {
-                4
-            } else {
-                0
-            };
-            bridge.observe_session(remote, active, error);
-            result.write(SessionState {
-                active: u8::from(active),
-                connecting: 0,
-                error,
-                relay: 1,
-                bytes: bytes as i32,
-                packets: packets as i32,
-                ip: 0,
-                port: 0,
-            });
-            return Some(true);
-        }
-        None
-    }) {
-        return value;
-    }
+        let table = (this as *const usize).read_unaligned();
+        STEAM
+            .lock()
+            .expect("poisoned interface registry")
+            .iter()
+            .find(|s| s.table == table)
+            .map(|s| s.original[3].load(Ordering::Acquire))
+    })
+    .flatten();
+    let Some(address) = address else {
+        return false;
+    };
     let f: unsafe extern "thiscall" fn(*mut c_void, u64, *mut SessionState) -> bool =
-        transmute(original(6));
+        transmute(address);
+    API_CALLS[6].fetch_add(1, Ordering::Relaxed);
     API_NATIVE[6].fetch_add(1, Ordering::Relaxed);
     f(this, remote, result)
 }
 
-static RUN_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
-
 unsafe fn install_callback_imports() -> io::Result<()> {
     let image = GetModuleHandleW(ptr::null()) as usize;
-    if !readable(image, 64) {
+    if !readable(image, 64) || (image as *const u16).read_unaligned() != 0x5a4d {
         return Err(io::Error::other("main image unavailable"));
     }
-    let header = (image as *const u8).add(60).cast::<u32>().read_unaligned() as usize;
-    if header > 16 * 1024 * 1024 || !readable(image + header, 256) {
+    let header = ((image + 60) as *const u32).read_unaligned() as usize;
+    if header > 16 * 1024 * 1024
+        || !readable(image + header, 256)
+        || ((image + header) as *const u32).read_unaligned() != 0x4550
+    {
         return Err(io::Error::other("invalid main PE header"));
-    }
-    if ((image + header) as *const u32).read_unaligned() != 0x4550 {
-        return Err(io::Error::other("PE signature mismatch"));
     }
     let optional = image + header + 24;
     if (optional as *const u16).read_unaligned() != 0x10b {
@@ -1316,16 +1156,18 @@ unsafe fn install_callback_imports() -> io::Result<()> {
     }
     let image_size = ((optional + 56) as *const u32).read_unaligned() as usize;
     let import_rva = ((optional + 104) as *const u32).read_unaligned() as usize;
+    let import_size = ((optional + 108) as *const u32).read_unaligned() as usize;
     let in_image = |rva: usize, size: usize| {
         rva.checked_add(size).is_some_and(|end| end <= image_size) && readable(image + rva, size)
     };
+    if import_rva == 0 || !in_image(import_rva, import_size) {
+        return Err(io::Error::other("Steam imports unavailable"));
+    }
+    let mut patches = Vec::new();
     let mut descriptor = import_rva;
-    let mut patched = 0;
-    while in_image(descriptor, 20) {
+    while descriptor + 20 <= import_rva + import_size && in_image(descriptor, 20) {
         let fields = std::slice::from_raw_parts((image + descriptor) as *const u32, 5);
-        let lookup = fields[0] as usize;
-        let names = fields[3] as usize;
-        let slots = fields[4] as usize;
+        let (lookup, names, slots) = (fields[0] as usize, fields[3] as usize, fields[4] as usize);
         if names == 0 {
             break;
         }
@@ -1340,7 +1182,7 @@ unsafe fn install_callback_imports() -> io::Result<()> {
                 if !in_image(lookup + index * 4, 4) || !in_image(slots + index * 4, 4) {
                     break;
                 }
-                let name = ((image + lookup + index * 4) as *const u32).read() as usize;
+                let name = ((image + lookup + index * 4) as *const u32).read_unaligned() as usize;
                 if name == 0 {
                     break;
                 }
@@ -1354,149 +1196,245 @@ unsafe fn install_callback_imports() -> io::Result<()> {
                     b"SteamAPI_RunCallbacks" => {
                         (run_callbacks as *const () as usize, &RUN_CALLBACKS)
                     }
+                    b"SteamInternal_FindOrCreateUserInterface" => {
+                        (find_interface as *const () as usize, &FIND_INTERFACE)
+                    }
                     _ => continue,
                 };
                 let address = image + slots + index * 4;
-                let previous = (address as *const usize).read();
+                let previous = (address as *const usize).read_unaligned();
                 if !executable(previous) {
-                    return Err(io::Error::other("invalid Steam callback import"));
+                    return Err(io::Error::other("invalid Steam import"));
                 }
-                original.store(previous, Ordering::Release);
-                swap_pointer(address, replacement)?;
-                patched += 1;
+                let mut info: MEMORY_BASIC_INFORMATION = zeroed();
+                if VirtualQuery(
+                    address as *const c_void,
+                    &mut info,
+                    size_of::<MEMORY_BASIC_INFORMATION>(),
+                ) == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                patches.push((address, previous, replacement, original, info.Protect));
             }
         }
         descriptor += 20;
     }
-    if patched != 1 {
-        return Err(io::Error::other("required Steam callback imports missing"));
+    if patches.len() != 2
+        || !patches.iter().any(|p| ptr::eq(p.3, &RUN_CALLBACKS))
+        || !patches.iter().any(|p| ptr::eq(p.3, &FIND_INTERFACE))
+    {
+        return Err(io::Error::other(
+            "required Steam Find/RunCallbacks imports missing",
+        ));
+    }
+    // Save both originals before publishing either hook; rollback only our slots.
+    for &(_, previous, _, original, _) in &patches {
+        original.store(previous, Ordering::Release);
+    }
+    for (i, &(address, previous, replacement, _, protection)) in patches.iter().enumerate() {
+        if let Err(error) = compare_pointer(address, previous, replacement, protection) {
+            for &(address, previous, replacement, _, protection) in patches[..=i].iter().rev() {
+                let _ = compare_pointer(address, replacement, previous, protection);
+            }
+            return Err(error);
+        }
     }
     Ok(())
 }
+
 unsafe fn bounded_name<'a>(address: usize, max: usize) -> Option<&'a [u8]> {
-    let mut size = 0;
-    while size < max.min(128) {
+    for size in 0..max.min(128) {
         if !readable(address + size, 1) {
             return None;
         }
         if ((address + size) as *const u8).read() == 0 {
             return Some(std::slice::from_raw_parts(address as *const u8, size));
         }
-        size += 1;
     }
     None
 }
 
-unsafe extern "C" fn run_callbacks() {
-    let f: unsafe extern "C" fn() = transmute(RUN_CALLBACKS.load(Ordering::Acquire));
-    f();
-    if CALLBACK_TICKS.fetch_add(1, Ordering::Relaxed) % 60 == 0 {
-        let Some(saved) = STEAM.get().filter(|s| s.installed.load(Ordering::Acquire)) else {
-            return;
-        };
-        if HOOK_FAILURE.load(Ordering::Acquire) != 0 {
-            return;
-        }
-        // Query a current interface on the game callback thread, never write a stale saved object.
-        let Some(module) = rust_boundary(|| GetModuleHandleW(wide("steam_api.dll").as_ptr()))
-        else {
-            return;
-        };
-        // Original Steam exports, like the original vtable calls, are outside
-        // catch_unwind. We only contain our own Rust processing.
-        let current = steam_interface(module);
+unsafe extern "C" fn find_interface(user: i32, version: *const c_char) -> *mut c_void {
+    let address = FIND_INTERFACE.load(Ordering::Acquire);
+    if address == 0 {
+        return ptr::null_mut();
+    }
+    let f: FindInterface = transmute(address);
+    let object = f(user, version);
+    // Imports are observed before startup completes; keep native behavior until
+    // the worker has acquired both the Steam identity and initial interface.
+    if !object.is_null() && BRIDGE.get().is_some() && HOOK_FAILURE.load(Ordering::Acquire) == 0 {
         rust_boundary(|| {
-            if !current.is_some_and(|(object, _)| interface_intact(saved, object)) {
-                INTERFACE_CHANGED.store(true, Ordering::Relaxed);
-                fail_hook(CHANGED);
+            if bounded_name(version as usize, 128) == Some(b"SteamNetworking006")
+                && install_interface(object as usize).is_err()
+            {
+                fail_hook(INSTALL_FAILED);
             }
         });
     }
-    // Steam owns callback registration, object lifetimes, and dispatch.
+    object
+}
+
+unsafe extern "C" fn run_callbacks() {
+    let address = RUN_CALLBACKS.load(Ordering::Acquire);
+    if address == 0 {
+        return;
+    }
+    let f: unsafe extern "C" fn() = transmute(address);
+    f();
+    if BRIDGE.get().is_none() {
+        return;
+    }
+    let count = CALLBACK_TICKS
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    if count != 1 && count % 60 != 0 || HOOK_FAILURE.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    let tables = rust_boundary(|| STEAM.lock().expect("poisoned interface registry").clone());
+    let Some(tables) = tables else {
+        return;
+    };
+    if tables.is_empty() {
+        // Only probe when no interface has been registered. Once installed,
+        // callbacks repair the cached tables without calling the factory again.
+        let module = GetModuleHandleW(wide("steam_api.dll").as_ptr());
+        if !module.is_null() {
+            rust_boundary(|| {
+                if probe_interface(module).is_err() {
+                    fail_hook(INSTALL_FAILED);
+                }
+            });
+        }
+    } else {
+        rust_boundary(|| {
+            let _installing = INSTALL_LOCK
+                .lock()
+                .expect("poisoned interface installation");
+            for saved in &tables {
+                if patch_slots(saved).is_err() {
+                    fail_hook(INSTALL_FAILED);
+                    break;
+                }
+            }
+        });
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::System::Memory::{
-        MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, VirtualAlloc, VirtualFree,
-    };
+    use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, VirtualAlloc, VirtualFree};
+
+    unsafe extern "thiscall" fn native() -> bool {
+        true
+    }
+    unsafe extern "thiscall" fn restored() -> bool {
+        false
+    }
 
     #[test]
-    fn installation_conflict_restores_owned_slots_and_page_protection() {
+    fn four_slot_installation_repairs_restores_and_preserves_page_protection() {
         unsafe {
             let page = VirtualAlloc(ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             assert!(!page.is_null());
             let table = page as *mut AtomicUsize;
-            let originals = [native_send as *const () as usize; 7];
-            for (i, &value) in originals.iter().enumerate() {
-                table.add(i).write(AtomicUsize::new(value));
+            for i in 0..7 {
+                table
+                    .add(i)
+                    .write(AtomicUsize::new(native as *const () as usize));
             }
-            let object = Box::new(page as usize);
             let saved = Steam {
-                original: originals,
-                object: (&*object) as *const usize as usize,
+                original: std::array::from_fn(|_| AtomicUsize::new(native as *const () as usize)),
                 table: page as usize,
                 installed: AtomicBool::new(false),
             };
-            // A third party changes a later slot after we snapshot originals.
-            (*table.add(3)).store(0x1234, Ordering::Release);
-            let mut ignored = 0;
-            assert_ne!(VirtualProtect(page, 4096, PAGE_READONLY, &mut ignored), 0);
-            let protections = slot_protections(page as usize).unwrap();
-            assert!(patch_slots(&saved, &protections).is_err());
-            for (i, &value) in originals.iter().enumerate() {
+            let mut old = 0;
+            assert_ne!(VirtualProtect(page, 4096, PAGE_READONLY, &mut old), 0);
+            patch_slots(&saved).unwrap();
+            for i in 3..6 {
                 assert_eq!(
                     (*table.add(i)).load(Ordering::Acquire),
-                    if i == 3 { 0x1234 } else { value }
+                    native as *const () as usize
                 );
             }
-            assert_eq!(slot_protections(page as usize).unwrap(), [PAGE_READONLY; 7]);
-            assert_eq!(*object, page as usize);
-            assert!(!saved.installed.load(Ordering::Acquire));
             compare_pointer(
-                page as usize + 3 * size_of::<usize>(),
-                0x1234,
-                originals[3],
+                page as usize + 6 * size_of::<usize>(),
+                replacements()[3],
+                restored as *const () as usize,
                 PAGE_READONLY,
             )
             .unwrap();
-            patch_slots(&saved, &protections).unwrap();
-            assert!(interface_intact(&saved, saved.object));
-            assert_eq!(slot_protections(page as usize).unwrap(), [PAGE_READONLY; 7]);
-            // A rollback may never undo a subsequent third-party replacement.
-            compare_pointer(page as usize, replacements()[0], 0x5678, PAGE_READONLY).unwrap();
-            assert!(
-                compare_pointer(
-                    page as usize,
-                    replacements()[0],
-                    originals[0],
-                    PAGE_READONLY
-                )
-                .is_err()
+            patch_slots(&saved).unwrap();
+            assert_eq!(
+                saved.original[3].load(Ordering::Acquire),
+                restored as *const () as usize
             );
-            assert_eq!((*table).load(Ordering::Acquire), 0x5678);
-            assert!(!interface_intact(&saved, saved.object));
-            assert_eq!(slot_protections(page as usize).unwrap(), [PAGE_READONLY; 7]);
+            for (i, slot) in SLOTS.iter().enumerate() {
+                assert_eq!(
+                    (*table.add(*slot)).load(Ordering::Acquire),
+                    replacements()[i]
+                );
+            }
+            assert_eq!(slot_protections(page as usize).unwrap(), [PAGE_READONLY; 4]);
+            // A later invalid slot rolls back earlier writes without replacing
+            // the conflicting writer's value.
+            compare_pointer(
+                page as usize,
+                replacements()[0],
+                native as *const () as usize,
+                PAGE_READONLY,
+            )
+            .unwrap();
+            compare_pointer(page as usize + 4, replacements()[1], 0x1234, PAGE_READONLY).unwrap();
+            assert!(patch_slots(&saved).is_err());
+            assert_eq!(
+                (*table).load(Ordering::Acquire),
+                native as *const () as usize
+            );
+            assert_eq!((*table.add(1)).load(Ordering::Acquire), 0x1234);
+            assert_eq!(slot_protections(page as usize).unwrap(), [PAGE_READONLY; 4]);
             assert_ne!(VirtualFree(page, 0, MEM_RELEASE), 0);
+        }
+
+        // A factory result arriving during another installation must wait,
+        // not return an unregistered table that callbacks can never discover.
+        let blocked = INSTALL_LOCK.lock().unwrap();
+        let (ready, completed) = std::sync::mpsc::channel();
+        let mut workers = Vec::new();
+        let mut objects = Vec::new();
+        let started = Arc::new(std::sync::Barrier::new(3));
+        for _ in 0..2 {
+            let table = Box::leak(Box::new([native as *const () as usize; 7]));
+            let object = Box::leak(Box::new(table.as_ptr() as usize)) as *mut usize as usize;
+            objects.push(object);
+            let ready = ready.clone();
+            let started = started.clone();
+            workers.push(std::thread::spawn(move || {
+                started.wait();
+                let result = unsafe { install_interface(object) };
+                ready.send(result.is_ok()).unwrap();
+                result.unwrap();
+            }));
+        }
+        started.wait();
+        assert!(completed.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(blocked);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(completed.recv().unwrap() && completed.recv().unwrap());
+        for object in objects {
+            let table = unsafe { *(object as *const usize) as *const usize };
+            for (i, slot) in SLOTS.iter().enumerate() {
+                assert_eq!(unsafe { *table.add(*slot) }, replacements()[i]);
+            }
         }
     }
 
-    unsafe extern "thiscall" fn native_send(
-        _: *mut c_void,
-        remote: u64,
-        _: *const c_void,
-        length: u32,
-        kind: i32,
-        channel: i32,
-    ) -> bool {
-        remote == 0x1234_5678_abcdef01 && length == 0 && kind == 17 && channel == -9
-    }
-
-    // One process-global test owns STEAM/BRIDGE; other tests use local state.
     #[test]
-    fn installing_forwards_and_rust_failure_stops_ipc_without_reusing_poison() {
-        let object = Box::leak(Box::new(0usize)) as *mut usize as usize;
+    fn rust_failure_stops_ipc_without_reusing_poison_or_native_data_fallback() {
         let shared = Arc::new(Shared {
             bridge: Mutex::new(Bridge::new(101, 11)),
             wake: std::thread::current(),
@@ -1504,42 +1442,6 @@ mod tests {
             faults: AtomicBool::new(false),
         });
         assert!(BRIDGE.set(shared.clone()).is_ok());
-        assert!(
-            STEAM
-                .set(Steam {
-                    original: [native_send as *const () as usize; 7],
-                    object,
-                    table: 0,
-                    installed: AtomicBool::new(false),
-                })
-                .is_ok()
-        );
-        let forward = |object| unsafe {
-            send(
-                object as *mut c_void,
-                0x1234_5678_abcdef01,
-                ptr::null(),
-                0,
-                17,
-                -9,
-            )
-        };
-        let guard = shared.bridge.lock().unwrap();
-        assert!(
-            forward(object),
-            "installing must forward even while Bridge is locked"
-        );
-        STEAM
-            .get()
-            .unwrap()
-            .installed
-            .store(true, Ordering::Release);
-        assert!(
-            forward(object + 4),
-            "a shared non-target object must bypass Bridge and validation"
-        );
-        drop(guard);
-
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         client
@@ -1555,13 +1457,10 @@ mod tests {
             Message::Diagnostic(_)
         ));
         assert_eq!(read_message(&mut client).unwrap(), Message::IpcReady);
-        assert_eq!(
-            hook_call(object as *mut c_void, |shared| {
-                let _guard = shared.bridge.lock().unwrap();
-                panic!("test game-thread panic while holding Bridge");
-            }),
-            Some(false)
-        );
+        assert!(!hook_call(|shared| {
+            let _guard = shared.bridge.lock().unwrap();
+            panic!("test panic");
+        }));
         let mut explained = false;
         loop {
             match read_message(&mut client).unwrap() {
@@ -1573,17 +1472,9 @@ mod tests {
         worker.join().unwrap().unwrap();
         assert!(explained && shared.stopped.load(Ordering::Acquire));
         assert!(shared.bridge.is_poisoned());
-        assert!(!forward(object));
-        assert!(forward(object + 4));
-        // Simulate first discovery of an already-poisoned lock; it must fail
-        // without consuming PoisonError::into_inner or calling native Steam.
+        assert!(!unsafe { send(ptr::null_mut(), 202, b"test".as_ptr().cast(), 4, 2, 0) });
         HOOK_FAILURE.store(0, Ordering::Release);
-        assert_eq!(
-            hook_call(object as *mut c_void, |shared| Some(
-                bridge_lock(shared, false).is_some()
-            )),
-            Some(false)
-        );
+        assert!(bridge_lock(&shared, true).is_none());
         assert_eq!(HOOK_FAILURE.load(Ordering::Acquire), POISONED);
         stop_bridge(&shared);
         assert!(shared.bridge.is_poisoned());

@@ -1,33 +1,31 @@
 use netburrow_protocol::{
     HookHealth, HookPeerHealth, MAX_HEALTH_PEERS, MAX_PAYLOAD, Packet, Peer,
-    local::{Admission, DATA_BYTES, DATA_PACKETS, PEER_BYTES, PEER_PACKETS, fair_index},
+    local::{Admission, DATA_BYTES, DATA_PACKETS, PEER_BYTES, PEER_PACKETS},
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 const BYTE_LIMIT: usize = 4 * 1024 * 1024;
 const PACKET_LIMIT: usize = 1024;
-// Channels stay open after packets are read; bound that metadata separately.
+// Bound observed channel metadata independently from queued packets.
 const PEER_CHANNEL_LIMIT: usize = DATA_PACKETS;
 
 struct Remote {
     member: u64,
     epoch: u64,
     online: bool,
-    accepted: bool,
     channels: HashSet<i32>,
     failed: bool,
     health: HookPeerHealth,
-    last_session: Option<(bool, u8)>,
 }
 struct Incoming {
     packet: Packet,
     queued: Instant,
     // Keep IsP2PPacketAvailable and ReadP2PPacket on the same packet even if
-    // another peer becomes eligible between the two game calls.
+    // the queue changes between the two game calls.
     advertised: bool,
 }
 impl std::ops::Deref for Incoming {
@@ -36,10 +34,6 @@ impl std::ops::Deref for Incoming {
         &self.packet
     }
 }
-struct Outgoing {
-    packet: Packet,
-    queued: Instant,
-}
 #[derive(Default)]
 pub struct Outbox {
     queue: Mutex<OutgoingQueue>,
@@ -47,10 +41,9 @@ pub struct Outbox {
 impl Outbox {
     pub fn pop(&self) -> Option<Packet> {
         let mut queue = self.queue.lock().expect("poisoned Outbox");
-        let packet = queue.pop();
-        packet
+        queue.pop()
     }
-    fn retain(&self, keep: impl FnMut(&Outgoing) -> bool) {
+    fn retain(&self, keep: impl FnMut(&Packet) -> bool) {
         let mut queue = self.queue.lock().expect("poisoned Outbox");
         queue.packets.retain(keep);
         queue.recount();
@@ -62,44 +55,21 @@ impl Outbox {
 }
 #[derive(Default)]
 struct OutgoingQueue {
-    packets: VecDeque<Outgoing>,
+    packets: VecDeque<Packet>,
     bytes: usize,
-    last_peer: Option<(u64, u64)>,
 }
 impl OutgoingQueue {
-    fn push(&mut self, item: Outgoing) {
-        self.bytes += item.packet.payload.len();
+    fn push(&mut self, item: Packet) {
+        self.bytes += item.payload.len();
         self.packets.push_back(item);
     }
     fn recount(&mut self) {
-        self.bytes = self.packets.iter().map(|p| p.packet.payload.len()).sum();
+        self.bytes = self.packets.iter().map(|p| p.payload.len()).sum();
     }
     fn pop(&mut self) -> Option<Packet> {
-        let mut seen = HashSet::new();
-        let candidates = self.packets.iter().enumerate().filter_map(|(i, item)| {
-            if !seen.insert(item.packet.to) {
-                return None;
-            }
-            let eligible = item.packet.send_type != 3
-                || item.queued.elapsed() >= Duration::from_millis(200)
-                || self
-                    .packets
-                    .iter()
-                    .any(|p| p.packet.to == item.packet.to && p.packet.send_type == 2)
-                || self
-                    .packets
-                    .iter()
-                    .filter(|p| p.packet.to == item.packet.to)
-                    .map(|p| p.packet.payload.len())
-                    .sum::<usize>()
-                    >= 1200;
-            eligible.then_some((i, (item.packet.to, item.packet.target_epoch)))
-        });
-        let index = fair_index(candidates, self.last_peer)?;
-        let item = self.packets.remove(index)?;
-        self.last_peer = Some((item.packet.to, item.packet.target_epoch));
-        self.bytes -= item.packet.payload.len();
-        Some(item.packet)
+        let packet = self.packets.pop_front()?;
+        self.bytes -= packet.payload.len();
+        Some(packet)
     }
 }
 
@@ -118,14 +88,6 @@ pub enum ReadError {
     TooManyQueries,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum QuerySource {
-    Hook,
-    Native,
-    // Keep failed or discarded native reads from switching to a new packet.
-    NativeRead,
-}
-
 pub struct Bridge {
     pub steam_id: u64,
     pub epoch: u64,
@@ -139,11 +101,10 @@ pub struct Bridge {
     pub send_rejections: SendRejections,
     pub telemetry: crate::telemetry::Telemetry,
     faults: VecDeque<(u64, u64)>,
-    read_cursors: BTreeMap<i32, (u64, u64)>,
     // Outlive packet cleanup so a stale size query cannot select another packet.
     // A fresh query renews or clears it; a successful read clears it.
     // Bounded by DATA_PACKETS, including queries whose packets were removed.
-    pending_queries: BTreeMap<i32, QuerySource>,
+    pending_queries: HashSet<i32>,
 }
 
 impl Bridge {
@@ -161,12 +122,8 @@ impl Bridge {
             send_rejections: SendRejections::default(),
             telemetry: crate::telemetry::Telemetry::default(),
             faults: VecDeque::new(),
-            read_cursors: BTreeMap::new(),
-            pending_queries: BTreeMap::new(),
+            pending_queries: HashSet::new(),
         }
-    }
-    pub fn known(&self, id: u64) -> bool {
-        self.remotes.contains_key(&id)
     }
     pub fn members(&mut self, peers: &[Peer]) {
         let mut changed = Vec::new();
@@ -180,12 +137,11 @@ impl Bridge {
                     changed.push(id);
                 }
                 peer.online = false;
-                peer.accepted = false;
                 peer.channels.clear();
             }
         }
         for id in changed {
-            self.drop_peer_packets(id, None, "member_unbound_or_rebound");
+            self.drop_peer_packets(id, "member_unbound_or_rebound");
         }
         for peer in peers
             .iter()
@@ -199,11 +155,9 @@ impl Bridge {
                 member: peer.client_id,
                 epoch: peer.epoch,
                 online: true,
-                accepted: false,
                 channels: HashSet::new(),
                 failed: false,
                 health: HookPeerHealth::default(),
-                last_session: None,
             });
             if remote.epoch != peer.epoch || !remote.online {
                 self.telemetry
@@ -211,16 +165,14 @@ impl Bridge {
             }
             if remote.epoch != peer.epoch {
                 remote.health = HookPeerHealth::default();
-                remote.last_session = None;
                 remote.failed = false;
-                remote.accepted = false;
                 remote.channels.clear();
             }
             remote.epoch = peer.epoch;
             remote.member = peer.client_id;
             remote.online = true;
         }
-        // Keep only packets from the current remote incarnation, including unaccepted queues.
+        // Keep only packets from the current remote incarnation.
         self.inbound.retain(|p| {
             self.remotes
                 .get(&p.from)
@@ -228,8 +180,8 @@ impl Bridge {
         });
         self.outbound.retain(|p| {
             self.remotes
-                .get(&p.packet.to)
-                .is_some_and(|r| r.online && r.epoch == p.packet.target_epoch)
+                .get(&p.to)
+                .is_some_and(|r| r.online && r.epoch == p.target_epoch)
         });
         self.recount();
     }
@@ -241,18 +193,17 @@ impl Bridge {
         self.stopped = true;
         let peers: Vec<_> = self.remotes.keys().copied().collect();
         for id in peers {
-            self.drop_peer_packets(id, None, "hook_stopped");
+            self.drop_peer_packets(id, "hook_stopped");
         }
         for remote in self.remotes.values_mut() {
             remote.online = false;
-            remote.accepted = false;
             remote.channels.clear();
         }
         self.inbound.clear();
         self.outbound.clear();
         self.in_bytes = 0;
     }
-    /// `None` means this peer is not ours, so the original Steam method handles it.
+    /// Replacement mode rejects destinations without a current Relay binding.
     pub fn send(&mut self, to: u64, bytes: &[u8], send_type: u8, channel: i32) -> Option<bool> {
         self.health.send_calls += 1;
         let result = self.send_inner(to, bytes, send_type, channel);
@@ -275,7 +226,10 @@ impl Bridge {
         result
     }
     fn send_inner(&mut self, to: u64, bytes: &[u8], send_type: u8, channel: i32) -> Option<bool> {
-        let peer = self.remotes.get_mut(&to)?;
+        let Some(peer) = self.remotes.get_mut(&to) else {
+            self.send_rejections.unavailable += 1;
+            return Some(false);
+        };
         if !self.active || !peer.online || peer.failed {
             self.send_rejections.unavailable += 1;
             return Some(false);
@@ -294,11 +248,7 @@ impl Bridge {
         }
         // Copy caller-owned bytes before taking the shared writer queue lock.
         let payload = bytes.to_vec();
-        let mut outbound = self
-            .outbound
-            .queue
-            .lock()
-            .expect("poisoned Outbox");
+        let mut outbound = self.outbound.queue.lock().expect("poisoned Outbox");
         if outbound.packets.len() >= PACKET_LIMIT || outbound.bytes + bytes.len() > BYTE_LIMIT {
             self.send_rejections.global_full += 1;
             return Some(false);
@@ -306,35 +256,27 @@ impl Bridge {
         let (count, size) = outbound
             .packets
             .iter()
-            .filter(|p| p.packet.to == to)
-            .fold((0, 0), |(n, bytes), p| {
-                (n + 1, bytes + p.packet.payload.len())
-            });
+            .filter(|p| p.to == to)
+            .fold((0, 0), |(n, bytes), p| (n + 1, bytes + p.payload.len()));
         if count >= 512 || size + bytes.len() > 2 * 1024 * 1024 {
             self.send_rejections.peer_full += 1;
             return Some(false);
         }
-        // Relay binding already supplies the route. Sending also accepts the peer,
-        // including no-delay first packets: Isaac uses these to start communication.
-        // Dropping them until acceptance would leave both sides waiting forever.
-        outbound.push(Outgoing {
-            packet: Packet {
-                delivery: None,
-                from: self.steam_id,
-                to,
-                source_epoch: self.epoch,
-                target_epoch: peer.epoch,
-                channel,
-                send_type,
-                payload,
-            },
-            queued: Instant::now(),
+        outbound.push(Packet {
+            delivery: None,
+            from: self.steam_id,
+            to,
+            source_epoch: self.epoch,
+            target_epoch: peer.epoch,
+            channel,
+            send_type,
+            payload,
         });
         drop(outbound);
-        peer.accepted = true;
         peer.channels.insert(channel);
         Some(true)
     }
+    #[cfg(test)]
     pub fn pop_outgoing(&mut self) -> Option<Packet> {
         self.outbound.pop()
     }
@@ -458,9 +400,6 @@ impl Bridge {
             return Admission::PeerFailed(peer_id, peer_epoch);
         }
         let peer = self.remotes.get_mut(&peer_id).unwrap();
-        // The route and both epochs were validated above. Receive-first peers do not
-        // need a synthetic callback into game-owned objects to become readable.
-        peer.accepted = true;
         peer.channels.insert(packet.channel);
         self.in_bytes += packet.payload.len();
         self.inbound.push_back(Incoming {
@@ -473,13 +412,13 @@ impl Bridge {
     pub fn available(&mut self, channel: i32) -> Result<Option<usize>, ReadError> {
         let result = match self.read_index(channel) {
             Some(_)
-                if !self.pending_queries.contains_key(&channel)
+                if !self.pending_queries.contains(&channel)
                     && self.pending_queries.len() >= DATA_PACKETS =>
             {
                 Err(ReadError::TooManyQueries)
             }
             Some(i) => {
-                self.pending_queries.insert(channel, QuerySource::Hook);
+                self.pending_queries.insert(channel);
                 let packet = &mut self.inbound[i];
                 packet.advertised = true;
                 Ok(Some(packet.payload.len()))
@@ -493,46 +432,14 @@ impl Bridge {
             .poll(channel, false, matches!(result, Ok(Some(_))));
         result
     }
-    pub fn native_query(&mut self, channel: i32) -> Result<(), ReadError> {
-        if !self.pending_queries.contains_key(&channel) && self.pending_queries.len() >= DATA_PACKETS {
-            return Err(ReadError::TooManyQueries);
-        }
-        self.pending_queries.insert(channel, QuerySource::Native);
-        Ok(())
-    }
-    pub fn clear_native_query(&mut self, channel: i32) {
-        if self.pending_queries.get(&channel).is_some_and(|source| *source != QuerySource::Hook) {
-            self.pending_queries.remove(&channel);
-        }
-    }
     fn read_index(&self, channel: i32) -> Option<usize> {
-        if let Some(index) = self.inbound.iter().position(|p| {
-            p.channel == channel
-                && p.advertised
-                && self.remotes.get(&p.from).is_some_and(|r| r.accepted)
-        }) {
-            return Some(index);
-        }
-        fair_index(
-            self.inbound.iter().enumerate().filter_map(|(i, p)| {
-                (p.channel == channel && self.remotes.get(&p.from).is_some_and(|r| r.accepted))
-                    .then_some((i, (p.from, p.source_epoch)))
-            }),
-            self.read_cursors.get(&channel).copied(),
-        )
+        self.inbound.iter().position(|p| p.channel == channel)
     }
     pub fn read(&mut self, channel: i32) -> Result<Option<Packet>, ReadError> {
         self.health.read_calls += 1;
-        let source = self.pending_queries.get(&channel).copied();
-        if source == Some(QuerySource::Native) {
-            self.pending_queries.insert(channel, QuerySource::NativeRead);
-            self.telemetry.poll(channel, true, false);
-            return Ok(None);
-        }
         let index = self.read_index(channel);
-        if source == Some(QuerySource::NativeRead)
-            || (source == Some(QuerySource::Hook)
-                && !index.is_some_and(|i| self.inbound[i].advertised))
+        if self.pending_queries.contains(&channel)
+            && !index.is_some_and(|i| self.inbound[i].advertised)
         {
             self.telemetry.poll(channel, true, false);
             return Err(ReadError::QueryInvalidated);
@@ -543,11 +450,6 @@ impl Bridge {
         };
         let packet = self.inbound.remove(index).unwrap();
         self.pending_queries.remove(&channel);
-        self.read_cursors
-            .insert(channel, (packet.from, packet.source_epoch));
-        if !self.inbound.iter().any(|p| p.channel == channel) {
-            self.read_cursors.remove(&channel);
-        }
         self.in_bytes -= packet.payload.len();
         self.health.consumed += 1;
         if let Some(peer) = self.remotes.get_mut(&packet.from) {
@@ -563,76 +465,6 @@ impl Bridge {
         }
         Ok(Some(packet.packet))
     }
-    pub fn accept(&mut self, id: u64) -> Option<bool> {
-        let peer = self.remotes.get_mut(&id)?;
-        if !self.active || !peer.online || peer.failed {
-            self.telemetry
-                .event(peer.member, "accept_rejected", None, 0, 0);
-            return Some(false);
-        }
-        self.telemetry.event(peer.member, "accept", None, 0, 0);
-        peer.accepted = true;
-        Some(true)
-    }
-    pub fn close(&mut self, id: u64, channel: Option<i32>) -> Option<bool> {
-        let peer = self.remotes.get_mut(&id)?;
-        if let Some(channel) = channel {
-            peer.channels.remove(&channel);
-        } else {
-            peer.channels.clear();
-        }
-        if peer.channels.is_empty() {
-            peer.accepted = false;
-        }
-        self.drop_peer_packets(id, channel, "game_close");
-        Some(true)
-    }
-    pub fn session(&self, id: u64) -> Option<(bool, usize, usize)> {
-        let peer = self.remotes.get(&id)?;
-        let outbound = self
-            .outbound
-            .queue
-            .lock()
-            .expect("poisoned Outbox");
-        let (packets, bytes) = outbound
-            .packets
-            .iter()
-            .filter(|p| p.packet.to == id)
-            .fold((0, 0), |(n, bytes), p| {
-                (n + 1, bytes + p.packet.payload.len())
-            });
-        Some((
-            self.active && peer.online && peer.accepted && !peer.failed,
-            bytes,
-            packets,
-        ))
-    }
-    pub fn peer_failed(&self, id: u64) -> bool {
-        self.remotes.get(&id).is_some_and(|p| p.failed)
-    }
-    pub fn observe_session(&mut self, id: u64, active: bool, error: u8) {
-        self.telemetry.session_calls += 1;
-        self.telemetry.session_inactive += u64::from(!active);
-        self.telemetry.session_failed += u64::from(error != 0);
-        if let Some(peer) = self.remotes.get_mut(&id) {
-            if peer.last_session != Some((active, error)) {
-                self.telemetry.event(
-                    peer.member,
-                    if error != 0 {
-                        "session_failed"
-                    } else if active {
-                        "session_active"
-                    } else {
-                        "session_inactive"
-                    },
-                    None,
-                    0,
-                    0,
-                );
-                peer.last_session = Some((active, error));
-            }
-        }
-    }
     pub fn fail_peer(&mut self, id: u64, epoch: u64) {
         let Some(peer) = self.remotes.get_mut(&id) else {
             return;
@@ -641,9 +473,8 @@ impl Bridge {
             return;
         }
         peer.failed = true;
-        peer.accepted = false;
         peer.channels.clear();
-        self.drop_peer_packets(id, None, "peer_failed");
+        self.drop_peer_packets(id, "peer_failed");
         self.faults.push_back((id, epoch));
     }
     pub fn pop_fault(&mut self) -> Option<(u64, u64)> {
@@ -663,7 +494,7 @@ impl Bridge {
             .expect("poisoned Outbox")
             .packets
             .iter()
-            .map(|p| p.packet.to)
+            .map(|p| p.to)
             .collect();
         let online = self.remotes.values().filter(|r| r.online).count();
         health.peers_omitted = online.saturating_sub(MAX_HEALTH_PEERS) as u32;
@@ -690,23 +521,13 @@ impl Bridge {
         health
     }
     fn recount(&mut self) {
-        self.read_cursors
-            .retain(|channel, _| self.inbound.iter().any(|p| p.channel == *channel));
         self.in_bytes = self.inbound.iter().map(|p| p.payload.len()).sum();
     }
-    fn drop_peer_packets(&mut self, id: u64, channel: Option<i32>, reason: &'static str) {
-        let discarded = self
-            .inbound
-            .iter()
-            .filter(|p| p.from == id && channel.is_none_or(|c| p.channel == c))
-            .count();
+    fn drop_peer_packets(&mut self, id: u64, reason: &'static str) {
+        let discarded = self.inbound.iter().filter(|p| p.from == id).count();
         if let Some(peer) = self.remotes.get_mut(&id) {
             peer.health.discarded += discarded as u64;
-            for packet in self
-                .inbound
-                .iter()
-                .filter(|p| p.from == id && channel.is_none_or(|c| p.channel == c))
-            {
+            for packet in self.inbound.iter().filter(|p| p.from == id) {
                 if let Some(flow) =
                     self.telemetry
                         .flow(peer.member, packet.channel, packet.send_type)
@@ -714,34 +535,23 @@ impl Bridge {
                     flow.cleared_in += 1;
                 }
             }
-            let mut outgoing = self
-                .outbound
-                .queue
-                .lock()
-                .expect("poisoned Outbox");
+            let mut outgoing = self.outbound.queue.lock().expect("poisoned Outbox");
             let mut cleared_out = 0;
-            for item in outgoing
-                .packets
-                .iter()
-                .filter(|p| p.packet.to == id && channel.is_none_or(|c| p.packet.channel == c))
-            {
+            for item in outgoing.packets.iter().filter(|p| p.to == id) {
                 cleared_out += 1;
-                if let Some(flow) =
-                    self.telemetry
-                        .flow(peer.member, item.packet.channel, item.packet.send_type)
+                if let Some(flow) = self
+                    .telemetry
+                    .flow(peer.member, item.channel, item.send_type)
                 {
                     flow.cleared_out += 1;
                 }
             }
             self.telemetry
-                .event(peer.member, reason, channel, discarded, cleared_out);
-            outgoing
-                .packets
-                .retain(|p| p.packet.to != id || channel.is_some_and(|c| p.packet.channel != c));
+                .event(peer.member, reason, None, discarded, cleared_out);
+            outgoing.packets.retain(|p| p.to != id);
             outgoing.recount();
         }
-        self.inbound
-            .retain(|p| p.from != id || channel.is_some_and(|c| p.channel != c));
+        self.inbound.retain(|p| p.from != id);
         self.recount();
     }
 }
@@ -758,7 +568,10 @@ mod tests {
             let _guard = outbox.queue.lock().unwrap();
             panic!("test outbox failure");
         });
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| b.send(20, b"data", 2, 0))).is_err());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| b.send(20, b"data", 2, 0)))
+                .is_err()
+        );
         assert!(std::panic::catch_unwind(|| outbox.pop()).is_err());
         assert!(outbox.queue.is_poisoned());
     }
@@ -768,8 +581,16 @@ mod tests {
     fn advertised_packet_survives_arrivals_and_reads_on_other_channels() {
         let mut b = bridge();
         b.members(&[
-            Peer { client_id: 2, steam_id: 20, epoch: 200 },
-            Peer { client_id: 3, steam_id: 30, epoch: 300 },
+            Peer {
+                client_id: 2,
+                steam_id: 20,
+                epoch: 200,
+            },
+            Peer {
+                client_id: 3,
+                steam_id: 30,
+                epoch: 300,
+            },
         ]);
         let other_channel = incoming(1);
         assert_eq!(b.receive(other_channel.clone()), Admission::Queued);
@@ -815,15 +636,23 @@ mod tests {
         assert_eq!(b.receive(incoming(0)), Admission::Queued);
         assert_eq!(b.read(0).unwrap(), Some(selected));
         assert_eq!(b.health().dropped, 1);
-        assert!(!b.peer_failed(20));
+        assert_eq!(b.pop_fault(), None);
     }
 
     #[test]
     fn removed_advertised_packet_requires_a_fresh_query() {
         let mut b = bridge();
-        let remaining = Peer { client_id: 3, steam_id: 30, epoch: 300 };
+        let remaining = Peer {
+            client_id: 3,
+            steam_id: 30,
+            epoch: 300,
+        };
         b.members(&[
-            Peer { client_id: 2, steam_id: 20, epoch: 200 },
+            Peer {
+                client_id: 2,
+                steam_id: 20,
+                epoch: 200,
+            },
             remaining.clone(),
         ]);
         let mut small = incoming(0);
@@ -845,11 +674,18 @@ mod tests {
     #[test]
     fn abandoned_queries_are_bounded_and_can_be_requeried() {
         let mut b = bridge();
+        let peer = Peer {
+            client_id: 2,
+            steam_id: 20,
+            epoch: 200,
+        };
         for channel in 0..DATA_PACKETS as i32 {
+            b.members(std::slice::from_ref(&peer));
             assert_eq!(b.receive(incoming(channel)), Admission::Queued);
             assert_eq!(b.available(channel).unwrap(), Some(3));
-            assert_eq!(b.close(20, Some(channel)), Some(true));
+            b.members(&[]);
         }
+        b.members(&[peer]);
         let next = DATA_PACKETS as i32;
         let packet = incoming(next);
         assert_eq!(b.receive(packet.clone()), Admission::Queued);
@@ -863,8 +699,16 @@ mod tests {
     fn channel_metadata_is_bounded_when_unread_lossy_packets_are_evicted() {
         let mut b = bridge();
         let mut peers = vec![
-            Peer { client_id: 2, steam_id: 20, epoch: 200 },
-            Peer { client_id: 3, steam_id: 30, epoch: 300 },
+            Peer {
+                client_id: 2,
+                steam_id: 20,
+                epoch: 200,
+            },
+            Peer {
+                client_id: 3,
+                steam_id: 30,
+                epoch: 300,
+            },
         ];
         b.members(&peers);
         let mut healthy = incoming(77);
@@ -888,36 +732,39 @@ mod tests {
             assert_eq!(b.receive(incoming(0)), Admission::Queued);
             assert!(b.read(0).unwrap().is_some());
             assert_eq!(b.receive(lossy(channel)), Admission::Queued);
-            assert_eq!(b.inbound.iter().filter(|p| p.from == 20).count(), PEER_PACKETS);
+            assert_eq!(
+                b.inbound.iter().filter(|p| p.from == 20).count(),
+                PEER_PACKETS
+            );
         }
         assert_eq!(b.remotes[&20].channels.len(), PEER_CHANNEL_LIMIT);
-        assert!(!b.peer_failed(20));
+        assert_eq!(b.pop_fault(), None);
         assert_eq!(b.receive(incoming(0)), Admission::Queued);
         assert!(b.read(0).unwrap().is_some());
-        assert_eq!(b.receive(lossy(PEER_CHANNEL_LIMIT as i32)), Admission::PeerFailed(20, 200));
+        assert_eq!(
+            b.receive(lossy(PEER_CHANNEL_LIMIT as i32)),
+            Admission::PeerFailed(20, 200)
+        );
         assert!(b.remotes[&20].channels.is_empty());
         assert_eq!(b.pop_fault(), Some((20, 200)));
         assert_eq!(b.receive(incoming(0)), Admission::Dropped);
         assert_eq!(b.pop_fault(), None);
-        assert!(b.known(20));
-        assert_eq!(b.accept(20), Some(false));
         assert_eq!(b.send(20, b"failed", 2, 0), Some(false));
-        assert_eq!(b.session(20), Some((false, 0, 0)));
         assert_eq!(b.read(77).unwrap(), Some(healthy));
         assert_eq!(b.pop_outgoing().unwrap().to, 30);
         assert!(b.pop_outgoing().is_none());
-        assert!(!b.peer_failed(30) && !b.stopped);
+        assert!(!b.stopped);
 
         peers[0].epoch = 201;
         b.members(&peers);
         let mut renewed = incoming(1);
         renewed.source_epoch = 201;
         assert_eq!(b.receive(renewed), Admission::Queued);
-        assert!(!b.peer_failed(20));
+        assert_eq!(b.pop_fault(), None);
     }
 
     #[test]
-    fn mixed_buffered_reliable_packets_flush_in_order_across_channels_and_peers() {
+    fn sends_are_immediate_fifo_across_channels_and_peers() {
         let mut b = bridge();
         b.members(&[
             Peer {
@@ -931,6 +778,9 @@ mod tests {
                 epoch: 300,
             },
         ]);
+        assert_eq!(b.send(99, b"unknown", 2, 0), Some(false));
+        assert_eq!(b.send(20, b"buffered", 3, 0), Some(true));
+        assert_eq!(b.pop_outgoing().unwrap().payload, b"buffered");
         for peer in [20, 30] {
             for seq in 0..12u8 {
                 assert_eq!(
@@ -944,17 +794,16 @@ mod tests {
                 );
             }
         }
-        let mut sequences = BTreeMap::<u64, Vec<u8>>::new();
-        while let Some(packet) = b.pop_outgoing() {
-            sequences
-                .entry(packet.to)
-                .or_default()
-                .push(packet.payload[0]);
+        for peer in [20, 30] {
+            for seq in 0..12u8 {
+                let packet = b.pop_outgoing().unwrap();
+                assert_eq!(
+                    (packet.to, packet.payload[0], packet.channel),
+                    (peer, seq, i32::from(seq % 2))
+                );
+            }
         }
-        assert_eq!(sequences.len(), 2);
-        for sequence in sequences.values() {
-            assert_eq!(*sequence, (0..12u8).collect::<Vec<_>>());
-        }
+        assert!(b.pop_outgoing().is_none());
         assert_eq!(b.health().dropped, 0);
         b.members(&[Peer {
             client_id: 2,
@@ -964,7 +813,6 @@ mod tests {
         b.fail_peer(20, 200);
         assert_eq!(b.send(20, b"new epoch", 2, 0), Some(true));
         assert_eq!(b.pop_outgoing().unwrap().target_epoch, 201);
-        assert_eq!(b.session(20).unwrap().0, true);
     }
 
     #[test]
@@ -1021,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn four_players_exchange_fairly_and_restart_only_one_epoch() {
+    fn four_players_exchange_in_fifo_order_and_restart_only_one_epoch() {
         let mut games: Vec<_> = (1..=4).map(|id| Bridge::new(id, id * 10)).collect();
         let mut peers: Vec<_> = (1..=4)
             .map(|id| Peer {
@@ -1034,7 +882,7 @@ mod tests {
             game.active = true;
             game.members(&peers);
         }
-        // Queue by destination (not alternately): the scheduler must do the interleaving.
+        // The writer and each receive channel preserve the order of accepted packets.
         for game in &mut games {
             for target in 1..=4 {
                 if target == game.steam_id {
@@ -1046,11 +894,11 @@ mod tests {
             }
         }
         for source in 0..4 {
-            for n in 0..6u8 {
-                for target in 1..=4 {
-                    if target == games[source].steam_id {
-                        continue;
-                    }
+            for target in 1..=4 {
+                if target == games[source].steam_id {
+                    continue;
+                }
+                for n in 0..6u8 {
                     let packet = games[source].pop_outgoing().unwrap();
                     assert_eq!((packet.to, packet.payload[0]), (target, n));
                     assert_eq!(
@@ -1062,18 +910,17 @@ mod tests {
         }
         for game in &mut games {
             for channel in 0..2 {
-                for n in (channel..6).step_by(2) {
-                    for source in 1..=4 {
-                        if source == game.steam_id {
-                            continue;
-                        }
+                for source in 1..=4 {
+                    if source == game.steam_id {
+                        continue;
+                    }
+                    for n in (channel..6).step_by(2) {
                         assert_eq!(game.available(channel).unwrap(), Some(4));
                         let p = game.read(channel).unwrap().unwrap();
                         assert_eq!((p.from, p.payload[0]), (source, n as u8));
                     }
                 }
             }
-            assert!(game.read_cursors.is_empty());
             for h in game.health().peers {
                 assert_eq!(
                     (h.send_calls, h.received, h.consumed, h.queued_packets),
@@ -1144,8 +991,6 @@ mod tests {
             },
         ];
         b.members(&peers);
-        b.accept(20);
-        b.accept(30);
         for _ in 0..PEER_PACKETS {
             assert_eq!(b.receive(incoming(0)), Admission::Queued);
         }
@@ -1153,10 +998,7 @@ mod tests {
         assert_eq!(b.receive(incoming(0)), Admission::PeerFailed(20, 200));
         assert!(!b.stopped);
         b.members(&peers);
-        b.close(20, None);
-        assert_eq!(b.accept(20), Some(false));
         assert_eq!(b.send(20, b"no", 2, 0), Some(false));
-        assert!(b.known(20));
         let mut other = incoming(0);
         other.from = 30;
         other.source_epoch = 300;
@@ -1167,6 +1009,6 @@ mod tests {
         let mut renewed = peers;
         renewed[0].epoch = 201;
         b.members(&renewed);
-        assert_eq!(b.accept(20), Some(true));
+        assert_eq!(b.send(20, b"new epoch", 2, 0), Some(true));
     }
 }

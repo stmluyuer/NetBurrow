@@ -52,9 +52,6 @@ pub struct Telemetry {
     events: VecDeque<Event>,
     omitted_updates: u64,
     omitted_events: u64,
-    pub session_calls: u64,
-    pub session_inactive: u64,
-    pub session_failed: u64,
 }
 
 impl Telemetry {
@@ -119,12 +116,8 @@ impl Telemetry {
             )
         };
         let mut lines = vec![format!(
-            "summary session_calls={} session_inactive={} session_failed={} omitted_updates={} omitted_events={} counters=cumulative",
-            self.session_calls,
-            self.session_inactive,
-            self.session_failed,
-            self.omitted_updates,
-            self.omitted_events
+            "summary omitted_updates={} omitted_events={} counters=cumulative",
+            self.omitted_updates, self.omitted_events
         )];
         for (&(member, channel, kind), f) in &self.flows {
             lines.push(format!("flow member={member} channel={channel} kind={kind} sent={} sent_bytes={} rejected={} received={} received_bytes={} consumed={} consumed_bytes={} dropped={} stale_received={} cleared_in={} cleared_out={} send_age_ms={} receive_age_ms={} read_age_ms={}", f.sent, f.sent_bytes, f.rejected, f.received, f.received_bytes, f.consumed, f.consumed_bytes, f.dropped, f.stale_received, f.cleared_in, f.cleared_out, age(f.last_send), age(f.last_receive), age(f.last_read)));
