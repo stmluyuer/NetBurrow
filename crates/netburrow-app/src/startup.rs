@@ -2,13 +2,13 @@
 use std::path::Path;
 
 fn command_line(exe: &Path) -> Result<String, String> {
-    let path = exe.to_str().ok_or("程序路径无法编码")?;
+    let path = exe.to_str().ok_or(netburrow_core::text!("无法读取程序路径", "Cannot read application path"))?;
     if path.contains(['"', '\0']) {
-        return Err("程序路径无效".into());
+        return Err(netburrow_core::text!("程序路径无效", "Invalid application path").into());
     }
     let command = format!("\"{path}\"");
     if command.encode_utf16().count() + 1 > 260 {
-        return Err("程序路径过长，请将工具放到较短的路径后设置开机启动。".into());
+        return Err(netburrow_core::text!("程序路径过长，请移至较短路径后重试", "Application path is too long. Move the app to a shorter path and try again.").into());
     }
     Ok(command)
 }
@@ -26,8 +26,7 @@ mod native {
         value.encode_utf16().chain(Some(0)).collect()
     }
     fn error(code: u32) -> String {
-        format!(
-            "无法读写开机启动项：{}",
+        netburrow_core::text_format!("无法更新启动项：{}", "Cannot access startup settings: {}",
             std::io::Error::from_raw_os_error(code as i32)
         )
     }
@@ -126,5 +125,5 @@ pub fn is_enabled() -> Result<bool, String> {
 }
 #[cfg(not(windows))]
 pub fn set_enabled(_: bool) -> Result<(), String> {
-    Err("开机启动需要 Windows".into())
+    Err(netburrow_core::text!("仅 Windows 支持登录时启动", "Launch at login requires Windows").into())
 }

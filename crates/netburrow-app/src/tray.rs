@@ -69,12 +69,12 @@ pub fn install(
     };
     ACTIONS
         .set(actions)
-        .map_err(|_| "托盘已经初始化".to_owned())?;
+        .map_err(|_| netburrow_core::text!("托盘已初始化", "Tray is already initialized").to_owned())?;
 
     std::thread::Builder::new()
         .name("netburrow-tray".to_owned())
         .spawn(run)
-        .map_err(|error| format!("无法启动托盘线程：{error}"))?;
+        .map_err(|error| netburrow_core::text_format!("无法启动托盘：{error}", "Could not start system tray: {error}"))?;
     Ok(())
 }
 
@@ -172,9 +172,9 @@ fn run() {
             if menu.is_null() {
                 return;
             }
-            let show = wide("显示 NetBurrow");
-            let stop = wide("停止联机");
-            let exit = wide("退出");
+            let show = wide(netburrow_core::text!("显示 NetBurrow", "Show NetBurrow"));
+            let stop = wide(netburrow_core::text!("断开", "Disconnect"));
+            let exit = wide(netburrow_core::text!("退出", "Quit"));
             let _ = AppendMenuW(menu, MF_STRING, SHOW_WINDOW, show.as_ptr());
             let _ = AppendMenuW(menu, MF_STRING, STOP_NETWORKING, stop.as_ptr());
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
@@ -230,7 +230,7 @@ fn run() {
         icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         icon.uCallbackMessage = TRAY_MESSAGE;
         icon.hIcon = LoadIconW(instance, 1usize as *const u16);
-        let tip = wide("NetBurrow 正在后台运行");
+        let tip = wide(netburrow_core::text!("NetBurrow 正在后台运行", "NetBurrow is running in the background"));
         for (destination, source) in icon.szTip.iter_mut().zip(tip.iter()) {
             *destination = *source;
         }

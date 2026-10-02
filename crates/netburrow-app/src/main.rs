@@ -14,6 +14,7 @@ mod recent_ui;
 mod file_picker;
 mod preview;
 mod diagnostics_bundle;
+mod crash_capture;
 mod update_check;
 use pages::{Page, SettingsTab, DiagnosticTab, ViewState};
 
@@ -35,6 +36,11 @@ const ACCENT: Color32 = Color32::from_rgb(92, 114, 90);
 
 fn main() {
     let smoke_test = std::env::args().any(|argument| argument == "--smoke-test");
+    if !smoke_test {
+        if let Ok(settings) = netburrow_core::load_settings() {
+            netburrow_core::i18n::set_language(settings.language);
+        }
+    }
     let instance = match if smoke_test {
         Ok(None)
     } else {
@@ -43,7 +49,7 @@ fn main() {
         Ok(None) if !smoke_test => return,
         Ok(instance) => instance,
         Err(error) => {
-            show_error(&format!("无法启动 NetBurrow。\n\n{error}"));
+            show_error(&netburrow_core::text_format!("无法启动 NetBurrow\n\n{error}", "Could not start NetBurrow\n\n{error}"));
             return;
         }
     };
@@ -72,7 +78,7 @@ fn main() {
             )))
         }),
     ) {
-        show_error(&format!("无法启动 NetBurrow 窗口。\n\n{error}"));
+        show_error(&netburrow_core::text_format!("无法打开 NetBurrow\n\n{error}", "Could not open NetBurrow\n\n{error}"));
     }
 }
 
@@ -96,6 +102,11 @@ struct NetBurrowApp {
     edit_name: bool,
     diagnostic_export: Option<std::path::PathBuf>,
     diagnostic_bundle: Option<std::sync::mpsc::Receiver<Result<diagnostics_bundle::Bundle, String>>>,
+    diagnostic_bundle_automatic: bool,
+    crash_capture: crash_capture::Capture,
+    crash_capture_confirm: bool,
+    pending_crash_bundle: bool,
+    crash_bundle_export: Option<std::path::PathBuf>,
     notifications: notifications::Notifications,
     restore_window_pending: bool,
     stop_requested: Arc<AtomicBool>,
@@ -111,7 +122,7 @@ struct PendingPreflight {
 
 impl NetBurrowApp {
     fn new(context: egui::Context, smoke_test: bool, instance: Option<SingleInstance>) -> Self {
-        let (settings, config_error, requires_explicit_save) = match if smoke_test {
+        let (mut settings, config_error, requires_explicit_save) = match if smoke_test {
             Ok(Settings::default())
         } else {
             netburrow_core::load_settings()
@@ -119,12 +130,15 @@ impl NetBurrowApp {
             Ok(settings) => (settings, None, false),
             Err(error) => (
                 Settings::default(),
-                Some(format!(
-                    "本机配置无法读取：{error}。请核对后重新填写并保存；不会自动更换联机组。"
+                Some(netburrow_core::text_format!("无法读取设置：{error}。请核对并重新保存，联机组不会自动更换。", "Could not read settings: {error}. Review and save them again. Your group will not change automatically."
                 )),
                 true,
             ),
         };
+        if smoke_test && std::env::args().any(|arg| arg == "--preview-language=en") {
+            settings.language = netburrow_core::i18n::Language::En;
+        }
+        netburrow_core::i18n::set_language(settings.language);
         let stop_requested = Arc::new(AtomicBool::new(false));
         let quit_requested = Arc::new(AtomicBool::new(false));
         let update_check_at = (!smoke_test && !cfg!(test) && settings.auto_check_updates)
@@ -149,6 +163,11 @@ impl NetBurrowApp {
             edit_name: false,
             diagnostic_export: None,
             diagnostic_bundle: None,
+            diagnostic_bundle_automatic: false,
+            crash_capture: crash_capture::Capture::default(),
+            crash_capture_confirm: false,
+            pending_crash_bundle: false,
+            crash_bundle_export: None,
             notifications: notifications::Notifications::default(),
             restore_window_pending: !smoke_test,
             stop_requested,
@@ -165,16 +184,16 @@ impl NetBurrowApp {
                 Arc::clone(&app.stop_requested),
                 Arc::clone(&app.quit_requested),
             ) {
-                app.notice = Some(format!("托盘不可用：{error}"));
+                app.notice = Some(netburrow_core::text_format!("托盘不可用：{error}", "System tray unavailable: {error}"));
             }
         }
         // Explicit, network-free fixture for inspecting member rows in renderer screenshots.
         if smoke_test && std::env::args().any(|arg| arg == "--preview-members") {
-            app.notice = Some("界面预览：以下成员及数值均为模拟数据".into());
+            app.notice = Some(netburrow_core::text!("预览 · 模拟数据", "Preview · Sample data").into());
             app.last_snapshot.peers = [
-                ("本机示例", 3, 27, 0),
-                ("好友示例", 1, 52, 0),
-                ("过期示例", 3, 88, 15),
+                (netburrow_core::text!("玩家一", "Player one"), 3, 27, 0),
+                (netburrow_core::text!("好友", "Friend"), 1, 52, 0),
+                (netburrow_core::text!("玩家三", "Player three"), 3, 88, 15),
             ]
             .into_iter()
             .enumerate()
@@ -211,11 +230,11 @@ impl NetBurrowApp {
         }
         if let Err(error) = self.settings.validate() {
             netburrow_core::diagnostics::record("WARN", "settings validation", &error);
-            self.notice = Some(format!("请先修正设置：{error}"));
+            self.notice = Some(netburrow_core::text_format!("请检查设置：{error}", "Check your settings: {error}"));
             return;
         }
         if let Err(error) = netburrow_core::save_settings(&self.settings) {
-            self.notice = Some(format!("无法保存设置，未启用联机：{error}"));
+            self.notice = Some(netburrow_core::text_format!("设置保存失败，未连接：{error}", "Settings could not be saved. Not connected: {error}"));
             return;
         }
         self.config_error = None;
@@ -232,19 +251,20 @@ impl NetBurrowApp {
                     Ok(()) => None,
                     Err(error) => {
                         self.settings.recent_connections = previous;
-                        Some(format!("联机已启用，但最近连接保存失败：{error}"))
+                        Some(netburrow_core::text_format!("正在连接，最近记录保存失败：{error}", "Connecting, but recent group could not be saved: {error}"))
                     }
                 };
             }
             Err(error) => {
                 netburrow_core::diagnostics::record("ERROR", "enable failed", &error);
-                self.notice = Some(format!("无法启用联机：{error}"));
+                self.notice = Some(netburrow_core::text_format!("无法连接：{error}", "Could not connect: {error}"));
             }
         }
     }
 
     fn stop(&mut self) {
-        if self.preflight.take().is_some() { self.notice = Some("已取消自检。".into()); }
+        self.crash_capture.stop();
+        if self.preflight.take().is_some() { self.notice = Some(netburrow_core::text!("检查已取消", "Check canceled").into()); }
         self.active_settings = None;
         self.notifications.update(Phase::Stopped, false, Instant::now());
         if let Some(mut client) = self.client.take() {
@@ -254,7 +274,7 @@ impl NetBurrowApp {
                 "user stopped networking / application exiting",
             );
             client.stop();
-            self.notice = Some("联机已停止。若游戏已在运行，请重开游戏后再启用。".to_owned());
+            self.notice = Some(netburrow_core::text!("已断开。再次连接前，请重开正在运行的游戏。", "Disconnected. Restart any running game before reconnecting.").to_owned());
         }
     }
 
@@ -283,7 +303,7 @@ impl NetBurrowApp {
         );
         if self.client.is_none() {
             snapshot.phase = Phase::Stopped;
-            snapshot.detail = "联机当前未启用；下方可能包含上次运行记录。".into();
+            snapshot.detail = netburrow_core::text!("未连接；以下可能包含上次记录", "Disconnected. Data below may be from the previous session.").into();
         }
         snapshot
     }
@@ -298,9 +318,9 @@ impl NetBurrowApp {
         match report {
             Ok(path) => {
                 self.notice = Some(if freeze {
-                    "卡住现场已记录，可将诊断文件交给排查人员"
+                    netburrow_core::text!("现场已记录，可分享诊断文件以便排查", "Freeze recorded. Share the diagnostics file with support.")
                 } else {
-                    "诊断已导出"
+                    netburrow_core::text!("诊断已导出", "Diagnostics exported")
                 }.into());
                 self.diagnostic_export = Some(path);
             }
@@ -316,13 +336,13 @@ impl NetBurrowApp {
 
     fn status_label(&self) -> (&'static str, Color32) {
         match self.current_phase() {
-            Phase::Stopped => ("未启用", Color32::GRAY),
-            Phase::Connecting => ("正在连接服务端", Color32::from_rgb(151, 103, 37)),
-            Phase::WaitingForGame => ("等待游戏启动", Color32::from_rgb(59, 108, 139)),
-            Phase::Attaching => ("正在接入游戏", Color32::from_rgb(151, 103, 37)),
-            Phase::Ready => ("联机已就绪", Color32::from_rgb(92, 114, 90)),
-            Phase::RestartRequired => ("需要重开游戏", Color32::from_rgb(158, 97, 39)),
-            Phase::Failed => ("连接失败", Color32::from_rgb(174, 65, 60)),
+            Phase::Stopped => (netburrow_core::text!("未连接", "Disconnected"), Color32::GRAY),
+            Phase::Connecting => (netburrow_core::text!("连接中", "Connecting"), Color32::from_rgb(151, 103, 37)),
+            Phase::WaitingForGame => (netburrow_core::text!("等待游戏", "Waiting for game"), Color32::from_rgb(59, 108, 139)),
+            Phase::Attaching => (netburrow_core::text!("接入中", "Attaching"), Color32::from_rgb(151, 103, 37)),
+            Phase::Ready => (netburrow_core::text!("已就绪", "Ready"), Color32::from_rgb(92, 114, 90)),
+            Phase::RestartRequired => (netburrow_core::text!("需重开游戏", "Restart game"), Color32::from_rgb(158, 97, 39)),
+            Phase::Failed => (netburrow_core::text!("连接失败", "Connection failed"), Color32::from_rgb(174, 65, 60)),
         }
     }
 
@@ -330,8 +350,8 @@ impl NetBurrowApp {
         let show_members = self.client.is_some()
             || (self.smoke_test.is_some() && !self.last_snapshot.peers.is_empty());
         ui.horizontal(|ui| {
-            ui.label(RichText::new("同组成员").font(bold(20.0)));
-            ui.label(RichText::new(format!("{} 人", if show_members { self.last_snapshot.peers.len() } else { 0 })).color(MUTED));
+            ui.label(RichText::new(netburrow_core::text!("成员", "Members")).font(bold(20.0)));
+            ui.label(RichText::new((if show_members { self.last_snapshot.peers.len() } else { 0 }).to_string()).color(MUTED));
         });
         if !show_members || self.last_snapshot.peers.is_empty() {
             ui.add_space(14.0);
@@ -339,9 +359,9 @@ impl NetBurrowApp {
                 icons::members_empty(ui);
                 ui.add_space(6.0);
                 ui.label(RichText::new(if self.client.is_some() {
-                    "等待成员加入"
+                    netburrow_core::text!("等待成员加入", "Waiting for members")
                 } else {
-                    "暂无成员"
+                    netburrow_core::text!("暂无成员", "No members")
                 }).color(MUTED).size(12.0));
             });
             ui.add_space(14.0);
@@ -354,7 +374,7 @@ impl NetBurrowApp {
                 .spacing(Vec2::new(8.0, 8.0))
                 .striped(true)
                 .show(ui, |ui| {
-                    for title in ["成员", "状态", "延迟", "传输"] {
+                    for title in [netburrow_core::text!("成员", "Member"), netburrow_core::text!("状态", "Status"), netburrow_core::text!("延迟", "Latency"), netburrow_core::text!("传输", "Transport")] {
                         ui.label(RichText::new(title).size(12.0).color(MUTED));
                     }
                     ui.end_row();
@@ -363,9 +383,9 @@ impl NetBurrowApp {
                         let name = report
                             .filter(|r| !r.name.is_empty())
                             .map(|r| r.name.clone())
-                            .unwrap_or_else(|| format!("成员 {}", peer.client_id));
+                            .unwrap_or_else(|| netburrow_core::text_format!("成员 {}", "Member {}", peer.client_id));
                         let display = if peer.is_self {
-                            format!("{name} · 本机")
+                            netburrow_core::text_format!("{name} · 本机", "{name} · You")
                         } else {
                             name.clone()
                         };
@@ -373,16 +393,16 @@ impl NetBurrowApp {
                             [134.0, 22.0],
                             egui::Label::new(RichText::new(display).size(13.0)).truncate(),
                         )
-                        .on_hover_text(format!("{name}\n连接编号 #{}", peer.client_id));
+                        .on_hover_text(netburrow_core::text_format!("{name}\n连接编号 #{}", "{name}\nConnection #{}", peer.client_id));
                         let stale = report.is_some() && peer.status_is_stale();
                         let (label, color) = if stale {
-                            ("数据过期", Color32::from_rgb(151, 103, 37))
+                            (netburrow_core::text!("已过期", "Stale"), Color32::from_rgb(151, 103, 37))
                         } else if let Some(report) = report {
                             member_phase(report.phase)
                         } else if peer.ready {
-                            ("待上报", MUTED)
+                            (netburrow_core::text!("等待数据", "Pending"), MUTED)
                         } else {
-                            ("等待游戏", MUTED)
+                            (netburrow_core::text!("等待游戏", "Waiting for game"), MUTED)
                         };
                         ui.label(RichText::new(label).size(12.0).color(color));
                         let ping = if stale {
@@ -393,19 +413,19 @@ impl NetBurrowApp {
                                 .map_or_else(|| "—".into(), |ms| format!("{ms} ms"))
                         };
                         ui.label(RichText::new(ping).size(13.0))
-                            .on_hover_text("该成员上报的到 Relay 往返延迟，不是玩家之间的延迟");
+                            .on_hover_text(netburrow_core::text!("成员到服务器的往返延迟，不代表玩家间延迟", "Round-trip latency from this member to the server, not between players"));
                         let transport = if stale {
                             "—"
                         } else {
                             match report.map(|r| r.transport) {
                                 Some(0) => "TCP",
-                                Some(1) => "UDP 待绑定",
+                                Some(1) => netburrow_core::text!("UDP 待连接", "UDP pending"),
                                 Some(2) => "UDP + TCP",
-                                _ => "待上报",
+                                _ => netburrow_core::text!("等待数据", "Pending"),
                             }
                         };
                         ui.label(RichText::new(transport).size(12.0))
-                            .on_hover_text("UDP + TCP：不可靠消息使用 UDP，可靠消息仍通过 TCP");
+                            .on_hover_text(netburrow_core::text!("不可靠消息使用 UDP，可靠消息使用 TCP", "UDP for unreliable messages; TCP for reliable messages"));
                         ui.end_row();
                     }
                 });
@@ -420,25 +440,18 @@ impl NetBurrowApp {
         if show_detail || finished || show_group_hint {
             ui.add_space(8.0);
             if show_detail {
-                let text = match detail {
-                    "正在连接 Relay…" => "正在连接服务器…",
-                    "Relay 已连接，请从 Steam 正常启动游戏" => "已连接，请从 Steam 启动游戏",
-                    "游戏已退出，等待下次从 Steam 启动" => "游戏已退出，请从 Steam 重新启动",
-                    "已发现游戏进程，正在加载自己的 Hook…" => "正在接入游戏…",
-                    "游戏已接入 NetBurrow，可在游戏中邀请同组朋友" => "已接入游戏，可以邀请同组朋友",
-                    _ => detail,
-                };
+                let text = detail;
                 ui.add(egui::Label::new(RichText::new(text).size(12.0).color(TEXT)).wrap());
             }
             if show_group_hint {
-                ui.add(egui::Label::new(RichText::new("未看到朋友？请核对双方服务器地址和完整组码。")
+                ui.add(egui::Label::new(RichText::new(netburrow_core::text!("未看到朋友？核对服务器和完整组码。", "Missing a friend? Check your server and full group code."))
                     .size(12.0).color(MUTED)).wrap());
             }
             if finished {
-                ui.label(RichText::new("请停止联机，处理问题后重新启用").size(12.0).color(Color32::from_rgb(151, 103, 37)));
+                ui.label(RichText::new(netburrow_core::text!("请断开，处理问题后重连", "Disconnect, resolve the issue, then reconnect")).size(12.0).color(Color32::from_rgb(151, 103, 37)));
             }
             if matches!(self.current_phase(), Phase::Connecting | Phase::RestartRequired | Phase::Failed) {
-                if icons::button(ui, icons::Action::Log, "查看排查日志").clicked() {
+                if icons::button(ui, icons::Action::Log, netburrow_core::text!("查看日志", "View logs")).clicked() {
                     self.view.page = Page::Diagnostics;
                 }
             }
@@ -483,6 +496,7 @@ impl eframe::App for NetBurrowApp {
         }
         self.poll_core();
         self.poll_diagnostic_bundle();
+        self.poll_crash_capture(context);
         if self.update_check_at.is_some_and(|at| Instant::now() >= at) {
             self.update_check_at = None;
             self.update_check.begin();
@@ -521,13 +535,13 @@ impl Drop for NetBurrowApp {
 
 fn member_phase(phase: u8) -> (&'static str, Color32) {
     match phase {
-        0 => ("连接中", MUTED),
-        1 => ("等待游戏", Color32::from_rgb(59, 108, 139)),
-        2 => ("接入中", Color32::from_rgb(151, 103, 37)),
-        3 => ("已就绪", ACCENT),
-        4 => ("需要重开", Color32::from_rgb(151, 103, 37)),
-        5 => ("连接失败", Color32::from_rgb(174, 65, 60)),
-        _ => ("已停止", MUTED),
+        0 => (netburrow_core::text!("连接中", "Connecting"), MUTED),
+        1 => (netburrow_core::text!("等待游戏", "Waiting for game"), Color32::from_rgb(59, 108, 139)),
+        2 => (netburrow_core::text!("接入中", "Attaching"), Color32::from_rgb(151, 103, 37)),
+        3 => (netburrow_core::text!("已就绪", "Ready"), ACCENT),
+        4 => (netburrow_core::text!("需重开", "Restart needed"), Color32::from_rgb(151, 103, 37)),
+        5 => (netburrow_core::text!("连接失败", "Connection failed"), Color32::from_rgb(174, 65, 60)),
+        _ => (netburrow_core::text!("未连接", "Disconnected"), MUTED),
     }
 }
 fn configure_style(context: &egui::Context) {

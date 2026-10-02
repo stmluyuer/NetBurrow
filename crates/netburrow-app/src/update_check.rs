@@ -42,29 +42,29 @@ fn version_parts(version: &str) -> Result<[u64; 3], String> {
     let mut parts = version.split('.');
     let mut parsed = [0; 3];
     for value in &mut parsed {
-        let part = parts.next().ok_or("版本号格式无效")?;
+        let part = parts.next().ok_or(netburrow_core::text!("版本号格式无效", "Invalid version format"))?;
         if part.is_empty()
             || !part.bytes().all(|b| b.is_ascii_digit())
             || (part.len() > 1 && part.starts_with('0'))
         {
-            return Err("版本号格式无效".into());
+            return Err(netburrow_core::text!("版本号格式无效", "Invalid version format").into());
         }
-        *value = part.parse().map_err(|_| "版本号数值超出范围")?;
+        *value = part.parse().map_err(|_| netburrow_core::text!("版本号超出范围", "Version number out of range"))?;
     }
     if parts.next().is_some() {
-        return Err("版本号格式无效".into());
+        return Err(netburrow_core::text!("版本号格式无效", "Invalid version format").into());
     }
     Ok(parsed)
 }
 
 fn parse_manifest(bytes: &[u8], current: &str) -> Result<CheckedRelease, String> {
     if bytes.len() > MAX_MANIFEST_BYTES {
-        return Err("更新清单超过大小限制".into());
+        return Err(netburrow_core::text!("更新清单过大", "Update manifest exceeds the size limit").into());
     }
-    let release: Release = serde_json::from_slice(bytes).map_err(|_| "更新清单格式无效")?;
+    let release: Release = serde_json::from_slice(bytes).map_err(|_| netburrow_core::text!("更新清单格式无效", "Invalid update manifest"))?;
     let comparison = version_parts(&release.version)?.cmp(&version_parts(current)?);
     if release.notes.trim().is_empty() || release.notes.chars().count() > MAX_NOTES_CHARS {
-        return Err("更新说明为空或超过长度限制".into());
+        return Err(netburrow_core::text!("更新说明为空或过长", "Release notes are empty or too long").into());
     }
     Ok(CheckedRelease {
         release,
@@ -113,7 +113,7 @@ impl UpdateCheck {
                 let _ = sender.send(work());
             }) {
             Ok(_) => self.pending = Some(receiver),
-            Err(_) => self.result = Some(Err("无法启动更新检查任务".into())),
+            Err(_) => self.result = Some(Err(netburrow_core::text!("无法检查更新，请重试", "Cannot start the update check. Try again").into())),
         }
     }
 
@@ -124,7 +124,7 @@ impl UpdateCheck {
         let result = match receiver.try_recv() {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => Err("更新检查任务未完成，请重试".into()),
+            Err(mpsc::TryRecvError::Disconnected) => Err(netburrow_core::text!("更新检查中断，请重试", "Update check interrupted. Try again").into()),
         };
         self.pending = None;
         self.result = Some(result);
@@ -134,14 +134,14 @@ impl UpdateCheck {
 fn require_success(status: u32) -> Result<(), String> {
     match status {
         200 => Ok(()),
-        404 => Err("尚未找到公开更新清单，请稍后重试或查看发布页".into()),
-        _ => Err(format!("更新服务器返回 HTTP {status}")),
+        404 => Err(netburrow_core::text!("尚未找到更新清单，请稍后重试或查看发布页", "No update manifest found. Try later or visit the releases page").into()),
+        _ => Err(netburrow_core::text_format!("更新服务器返回 HTTP {status}", "Update server returned HTTP {status}")),
     }
 }
 
 fn check_deadline(started: Instant) -> Result<(), String> {
     if started.elapsed() >= REQUEST_BUDGET {
-        Err("更新检查超时，请稍后重试".into())
+        Err(netburrow_core::text!("更新检查超时，请稍后重试", "Update check timed out. Try later").into())
     } else {
         Ok(())
     }
@@ -161,7 +161,7 @@ fn read_body(
             return Ok(bytes);
         }
         if count > chunk.len() || bytes.len() + count > MAX_MANIFEST_BYTES {
-            return Err("更新清单超过大小限制".into());
+            return Err(netburrow_core::text!("更新清单过大", "Update manifest exceeds the size limit").into());
         }
         bytes.extend_from_slice(&chunk[..count]);
     }
@@ -174,7 +174,7 @@ fn download_manifest() -> Result<Vec<u8>, String> {
 
 #[cfg(not(windows))]
 fn download_manifest() -> Result<Vec<u8>, String> {
-    Err("当前平台不支持更新检查，请查看发布页".into())
+    Err(netburrow_core::text!("此平台不支持检查更新，请查看发布页", "Update checks are unavailable on this platform. Visit the releases page").into())
 }
 
 #[cfg(windows)]
@@ -207,11 +207,11 @@ mod windows {
 
     fn error_message(code: u32) -> String {
         match code {
-            ERROR_WINHTTP_TIMEOUT => "更新检查超时，请稍后重试".into(),
+            ERROR_WINHTTP_TIMEOUT => netburrow_core::text!("更新检查超时，请稍后重试", "Update check timed out. Try later").into(),
             ERROR_WINHTTP_SECURE_FAILURE => {
-                "无法验证更新服务器的安全连接，请检查系统时间和网络".into()
+                netburrow_core::text!("无法验证安全连接，请检查系统时间和网络", "Cannot verify the secure connection. Check your system clock and network").into()
             }
-            _ => format!("无法读取更新信息（Windows 错误码 {code}），请检查网络后重试"),
+            _ => netburrow_core::text_format!("无法读取更新信息（错误 {code}），请检查网络后重试", "Cannot read update details (error {code}). Check your network and retry"),
         }
     }
     fn last_error() -> String {

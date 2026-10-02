@@ -40,7 +40,7 @@ fn toggle(ui: &mut egui::Ui, value: &mut bool, title: &str, description: &str) -
         ui.painter().text(
             response.rect.right_center(),
             egui::Align2::RIGHT_CENTER,
-            if *value { "开" } else { "关" },
+            if *value { netburrow_core::text!("开", "On") } else { netburrow_core::text!("关", "Off") },
             egui::FontId::proportional(12.0),
             MUTED,
         );
@@ -64,26 +64,26 @@ impl NetBurrowApp {
             .game_draft
             .get_or_insert_with(|| self.settings.clone());
         ui.add_enabled_ui(enabled, |ui| {
-            ui.label(RichText::new("游戏").font(bold(18.0)));
+            ui.label(RichText::new(netburrow_core::text!("游戏", "Game")).font(bold(18.0)));
             ui.add_space(8.0);
-            ui.label("游戏位置");
+            ui.label(netburrow_core::text!("游戏位置", "Game path"));
             ui.add_sized(
                 [ui.available_width(), 36.0],
-                egui::TextEdit::singleline(&mut draft.game_path).hint_text("选择 isaac-ng.exe"),
+                egui::TextEdit::singleline(&mut draft.game_path).hint_text(netburrow_core::text!("选择 isaac-ng.exe", "Select isaac-ng.exe")),
             );
             ui.horizontal(|ui| {
-                if ui.button("选择文件").clicked() {
+                if ui.button(netburrow_core::text!("浏览…", "Browse…")).clicked() {
                     match file_picker::choose_game() {
                         Ok(Some(path)) => draft.game_path = path,
                         Ok(None) => {}
                         Err(error) => self.notice = Some(error),
                     }
                 }
-                if icons::button(ui, icons::Action::Search, "自动检测").clicked() {
+                if icons::button(ui, icons::Action::Search, netburrow_core::text!("自动检测", "Auto-detect")).clicked() {
                     match netburrow_core::autodetect_game() {
                         Some(path) => draft.game_path = path.display().to_string(),
                         None => {
-                            self.notice = Some("未找到游戏，请选择实际的 isaac-ng.exe。".into())
+                            self.notice = Some(netburrow_core::text!("未找到游戏，请选择 isaac-ng.exe", "Game not found. Select isaac-ng.exe.").into())
                         }
                     }
                 }
@@ -95,11 +95,11 @@ impl NetBurrowApp {
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.eq_ignore_ascii_case("isaac-ng.exe"));
             let path_error = if draft.game_path.trim().is_empty() {
-                Some("请选择游戏文件")
+                Some(netburrow_core::text!("请选择游戏文件", "Select the game file"))
             } else if !valid_name {
-                Some("请选择 isaac-ng.exe")
+                Some(netburrow_core::text!("请选择 isaac-ng.exe", "Select isaac-ng.exe"))
             } else if !path.is_file() {
-                Some("文件不存在，请重新选择")
+                Some(netburrow_core::text!("文件不存在，请重新选择", "File not found. Select another file."))
             } else {
                 None
             };
@@ -108,26 +108,28 @@ impl NetBurrowApp {
             }
             ui.add_space(20.0);
             ui.separator();
-            ui.label(RichText::new("网络").font(bold(18.0)));
+            ui.label(RichText::new(netburrow_core::text!("网络", "Network")).font(bold(18.0)));
             ui.add_space(8.0);
-            ui.label("传输方式");
+            ui.label(netburrow_core::text!("传输方式", "Transport"));
             ui.horizontal(|ui| {
-                ui.radio_value(&mut draft.transport, Transport::Tcp, "TCP（推荐）");
-                ui.radio_value(&mut draft.transport, Transport::Udp, "UDP 优先")
-                    .on_hover_text("可靠消息仍通过 TCP 发送");
+                ui.radio_value(&mut draft.transport, Transport::Tcp, netburrow_core::text!("TCP（推荐）", "TCP (recommended)"));
+                ui.radio_value(&mut draft.transport, Transport::Udp, netburrow_core::text!("UDP 优先", "Prefer UDP"))
+                    .on_hover_text(netburrow_core::text!("可靠消息仍使用 TCP", "Reliable messages still use TCP"));
             });
             ui.add_space(20.0);
-            ui.collapsing("高级选项", |ui| {
+            egui::CollapsingHeader::new(netburrow_core::text!("高级", "Advanced"))
+                .default_open(self.smoke_test.is_some() && std::env::args().any(|arg| arg == "--preview-page=advanced"))
+                .show(ui, |ui| {
                 toggle(
                     ui,
                     &mut draft.allow_late_hook,
-                    "允许接入已运行的游戏（实验性）",
-                    "默认关闭，仅接入启用工具后启动的游戏",
+                    netburrow_core::text!("接入已运行的游戏（实验性）", "Attach to a running game (experimental)"),
+                    netburrow_core::text!("关闭时，仅接入连接后启动的游戏", "When off, only games started after connecting can be attached"),
                 );
                 if draft.allow_late_hook {
                     ui.label(
                         RichText::new(
-                            "仅在主菜单、尚未联机时使用；接入失败需重开游戏。",
+                            netburrow_core::text!("仅限未联机的主菜单；接入失败需重开游戏。", "Use only at the main menu before joining a game. Restart the game if attachment fails."),
                         )
                         .size(12.0)
                         .color(Color32::from_rgb(151, 103, 37)),
@@ -135,19 +137,48 @@ impl NetBurrowApp {
                 }
             });
         }).response.on_disabled_hover_text(if self.preflight.is_some() {
-            "检查期间无法编辑"
+            netburrow_core::text!("检查完成后可编辑", "Wait for the check to finish")
         } else {
-            "停止联机后可编辑"
+            netburrow_core::text!("断开后可编辑", "Disconnect to edit")
         });
     }
     pub(super) fn preferences_content(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("启动").font(bold(18.0)));
+        ui.label(RichText::new(netburrow_core::text!("语言", "Language")).font(bold(18.0)));
+        let previous_language = self.settings.language;
+        ui.horizontal_wrapped(|ui| {
+            ui.radio_value(&mut self.settings.language, netburrow_core::i18n::Language::ZhCn, "简体中文");
+            ui.radio_value(&mut self.settings.language, netburrow_core::i18n::Language::En, "English");
+        });
+        if self.settings.language != previous_language {
+            let result = if self.smoke_test.is_some() {
+                Ok(())
+            } else {
+                netburrow_core::save_language(self.settings.language)
+            };
+            match result {
+                Ok(()) => {
+                    self.saved_settings.language = self.settings.language;
+                    if let Some(draft) = &mut self.view.game_draft {
+                        draft.language = self.settings.language;
+                    }
+                    self.notice = None;
+                }
+                Err(error) => {
+                    self.settings.language = previous_language;
+                    self.notice = Some(error);
+                }
+            }
+        }
+        ui.small(netburrow_core::text!("重启后生效", "Applies after restart"));
+        ui.add_space(14.0);
+        ui.separator();
+        ui.label(RichText::new(netburrow_core::text!("启动", "Startup")).font(bold(18.0)));
         ui.add_space(10.0);
         if toggle(
             ui,
             &mut self.startup_enabled,
-            "登录 Windows 时启动",
-            "只打开工具，不自动启用联机",
+            netburrow_core::text!("登录 Windows 时启动", "Launch at Windows sign-in"),
+            netburrow_core::text!("启动后需手动连接", "Connection must be started manually"),
         ) && self.smoke_test.is_none()
         {
             match startup::set_enabled(self.startup_enabled) {
@@ -161,8 +192,8 @@ impl NetBurrowApp {
         if toggle(
             ui,
             &mut self.settings.start_minimized,
-            "启动后最小化",
-            "下次启动生效",
+            netburrow_core::text!("启动后最小化", "Start minimized"),
+            netburrow_core::text!("下次启动生效", "Applies next launch"),
         ) && self.smoke_test.is_none()
         {
             match netburrow_core::save_start_minimized(self.settings.start_minimized) {
@@ -175,12 +206,12 @@ impl NetBurrowApp {
         }
         ui.add_space(14.0);
         ui.separator();
-        ui.label(RichText::new("窗口").font(bold(18.0)));
-        ui.label("关闭窗口时");
+        ui.label(RichText::new(netburrow_core::text!("窗口", "Window")).font(bold(18.0)));
+        ui.label(netburrow_core::text!("关闭窗口时", "When closing the window"));
         let before = self.settings.minimize_on_close;
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut self.settings.minimize_on_close, false, "退出并停止联机");
-            ui.radio_value(&mut self.settings.minimize_on_close, true, "最小化并保持联机");
+        ui.horizontal_wrapped(|ui| {
+            ui.radio_value(&mut self.settings.minimize_on_close, false, netburrow_core::text!("退出并断开", "Quit and disconnect"));
+            ui.radio_value(&mut self.settings.minimize_on_close, true, netburrow_core::text!("最小化并保持连接", "Minimize and stay connected"));
         });
         if before != self.settings.minimize_on_close && self.smoke_test.is_none() {
             match netburrow_core::save_minimize_on_close(self.settings.minimize_on_close) {
@@ -193,12 +224,12 @@ impl NetBurrowApp {
         }
         ui.add_space(20.0);
         ui.separator();
-        ui.label(RichText::new("通知").font(bold(18.0)));
+        ui.label(RichText::new(netburrow_core::text!("通知", "Notifications")).font(bold(18.0)));
         if toggle(
             ui,
             &mut self.settings.notifications_enabled,
-            "重要状态通知",
-            "联机就绪、断线或接入失败时通知",
+            netburrow_core::text!("连接状态通知", "Connection notifications"),
+            netburrow_core::text!("就绪、断线或接入失败时通知", "Notify when ready, disconnected, or attachment fails"),
         ) && self.smoke_test.is_none()
         {
             match netburrow_core::save_notifications_enabled(self.settings.notifications_enabled) {

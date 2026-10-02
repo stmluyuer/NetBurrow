@@ -59,15 +59,14 @@ mod native {
 
     pub fn restore(saved: &WindowPlacement) -> Result<(), String> {
         if !valid(saved) {
-            return Err("保存的窗口尺寸无效，已使用默认窗口。".into());
+            return Err(netburrow_core::text!("窗口尺寸无效，已恢复默认值", "Invalid window size. Defaults restored.").into());
         }
-        let hwnd = window().ok_or("暂时无法读取窗口，已使用默认窗口位置。")?;
+        let hwnd = window().ok_or(netburrow_core::text!("无法读取窗口，已使用默认位置", "Cannot read window position. Using the default."))?;
         let placement = native_placement(saved);
         // Keep workspace coordinates end-to-end. Windows relocates a saved window
         // that is off-screen after a resolution or monitor configuration change.
         if unsafe { SetWindowPlacement(hwnd, &placement) } == 0 {
-            return Err(format!(
-                "无法恢复窗口位置：{}",
+            return Err(netburrow_core::text_format!("无法恢复窗口位置：{}", "Could not restore window position: {}",
                 std::io::Error::last_os_error()
             ));
         }

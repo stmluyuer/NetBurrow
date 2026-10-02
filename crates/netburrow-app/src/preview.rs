@@ -8,32 +8,58 @@ impl NetBurrowApp {
         };
         if !self.view.preview_requested && started.elapsed() >= Duration::from_millis(600) {
             self.view.preview_requested = true;
+            if std::env::args().any(|arg| arg == "--preview-compact") {
+                context.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(520.0, 620.0)));
+            }
             if let Some(page) = std::env::args()
                 .find_map(|arg| arg.strip_prefix("--preview-page=").map(str::to_owned))
             {
                 self.settings.server = "relay.example.com:24872".into();
-                self.settings.display_name = "玩家一".into();
+                self.settings.display_name = netburrow_core::text!("玩家一", "Player one").into();
                 self.settings.group = format!("NB1-{}", "1234abcd".repeat(8));
                 self.settings.recent_connections = vec![netburrow_core::RecentConnection {
                     server: self.settings.server.clone(),
                     group: self.settings.group.clone(),
                 }];
                 match page.as_str() {
-                    "game" | "general" | "about" => {
+                    "game" | "general" | "about" | "advanced" | "unsaved" => {
                         self.open_settings();
                         self.view.settings_tab = match page.as_str() {
                             "general" => SettingsTab::General,
                             "about" => SettingsTab::About,
                             _ => SettingsTab::Game,
                         };
+                        if page == "advanced" {
+                            self.view.game_draft.as_mut().unwrap().allow_late_hook = true;
+                        }
+                        if page == "unsaved" {
+                            self.view.game_draft.as_mut().unwrap().transport = Transport::Udp;
+                            self.view.leave_settings = Some(Page::Home);
+                        }
                     }
-                    "checks" | "logs" => {
+                    "checks" | "logs" | "capture" | "failed-checks" => {
                         self.view.page = Page::Diagnostics;
+                        self.crash_capture_confirm = page == "capture";
                         self.view.diagnostic_tab = if page == "logs" {
                             DiagnosticTab::Logs
                         } else {
                             DiagnosticTab::Checks
                         };
+                        if page == "failed-checks" {
+                            self.preflight_report = Some((self.settings.clone(), netburrow_core::PreflightReport {
+                                checks: vec![netburrow_core::Check {
+                                    name: netburrow_core::text!("连接与游戏", "Connection and game"),
+                                    level: netburrow_core::CheckLevel::Failed,
+                                    detail: netburrow_core::text!("请选择 isaac-ng.exe", "Select isaac-ng.exe").into(),
+                                }],
+                            }));
+                        }
+                        if page == "logs" {
+                            self.last_snapshot.logs = vec![
+                                netburrow_core::text!("预览数据：连接检查开始", "Preview data: connection check started").into(),
+                                netburrow_core::text!("预览数据：等待游戏启动", "Preview data: waiting for the game").into(),
+                            ];
+                        }
                     }
                     "recent" => {
                         self.view.history_open = true;

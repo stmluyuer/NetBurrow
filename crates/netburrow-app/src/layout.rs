@@ -17,11 +17,11 @@ impl NetBurrowApp {
                 let active = self.client.is_some();
                 let checking = self.preflight.is_some();
                 let label = if checking {
-                    "取消自检"
+                    netburrow_core::text!("取消检查", "Cancel check")
                 } else if active {
-                    "停止联机"
+                    netburrow_core::text!("断开", "Disconnect")
                 } else {
-                    "启用联机"
+                    netburrow_core::text!("连接", "Connect")
                 };
                 let fill = if active || checking { SURFACE } else { ACCENT };
                 let color = if active || checking {
@@ -64,13 +64,13 @@ impl NetBurrowApp {
                 ui.vertical_centered(|ui| {
                     ui.label(
                         RichText::new(if checking {
-                            "正在检查连接…"
+                            netburrow_core::text!("正在检查…", "Checking…")
                         } else if active {
-                            "停止后需重开游戏"
+                            netburrow_core::text!("断开后需重开游戏", "Restart the game after disconnecting")
                         } else if self.settings.allow_late_hook {
-                            "请停在游戏主菜单后启用"
+                            netburrow_core::text!("在游戏主菜单连接", "Connect from the game main menu")
                         } else {
-                            "启用后，从 Steam 启动游戏"
+                            netburrow_core::text!("连接后，从 Steam 启动游戏", "Connect, then launch the game from Steam")
                         })
                         .size(12.0)
                         .color(MUTED),
@@ -79,7 +79,7 @@ impl NetBurrowApp {
                 ui.add_space(4.0);
                 ui.separator();
                 if let Some(release) = self.update_check.newer_release() {
-                    if ui.link(format!("发现新版本 v{} · 查看更新", release.version)).clicked() {
+                    if ui.link(netburrow_core::text_format!("新版本 v{} · 查看", "Update v{} available · View", release.version)).clicked() {
                         self.open_settings();
                         self.view.settings_tab = SettingsTab::About;
                     }
@@ -87,7 +87,7 @@ impl NetBurrowApp {
                 ui.horizontal(|ui| {
                     if ui
                         .add(
-                            egui::Button::new(RichText::new("日志与诊断").color(MUTED))
+                            egui::Button::new(RichText::new(netburrow_core::text!("日志与诊断", "Diagnostics")).color(MUTED))
                                 .frame(false),
                         )
                         .clicked()
@@ -107,18 +107,18 @@ impl NetBurrowApp {
                             ui.add_space(4.0);
                             ui.vertical(|ui| {
                                 ui.label(RichText::new("NetBurrow").font(bold(27.0)));
-                                ui.label(RichText::new("以撒好友联机").size(13.0).color(MUTED));
+                                ui.label(RichText::new(netburrow_core::text!("以撒联机", "Isaac multiplayer")).size(13.0).color(MUTED));
                             });
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if icons::icon_button(ui, icons::Action::Settings, "偏好设置")
+                                    if icons::icon_button(ui, icons::Action::Settings, netburrow_core::text!("设置", "Settings"))
                                         .clicked()
                                     {
                                         self.open_settings();
                                     }
                                     let (status, color) = if self.preflight.is_some() {
-                                        ("正在自检", MUTED)
+                                        (netburrow_core::text!("检查中", "Checking"), MUTED)
                                     } else {
                                         self.status_label()
                                     };
@@ -146,14 +146,14 @@ impl NetBurrowApp {
                             .as_ref()
                             .is_some_and(|(_, report)| !report.can_start())
                         {
-                            if ui.button("查看检查结果").clicked() {
+                            if ui.button(netburrow_core::text!("查看结果", "View results")).clicked() {
                                 self.view.page = Page::Diagnostics;
                             }
                         }
                         if !Path::new(self.settings.game_path.trim()).is_file() {
                             ui.horizontal(|ui| {
-                                ui.small("请先设置游戏路径");
-                                if ui.button("前往设置").clicked() {
+                                ui.small(netburrow_core::text!("请设置游戏路径", "Set your game path"));
+                                if ui.button(netburrow_core::text!("打开设置", "Open settings")).clicked() {
                                     self.open_settings();
                                 }
                             });
@@ -187,7 +187,7 @@ impl NetBurrowApp {
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
                         ui.label(
-                            RichText::new(if is_server { "服务器" } else { "显示名" })
+                            RichText::new(if is_server { netburrow_core::text!("服务器", "Server") } else { netburrow_core::text!("名称", "Name") })
                                 .font(bold(15.0)),
                         );
                     },
@@ -253,9 +253,9 @@ impl NetBurrowApp {
                             };
                             let value = if value.trim().is_empty() {
                                 if is_server {
-                                    "未设置"
+                                    netburrow_core::text!("未设置", "Not set")
                                 } else {
-                                    "默认成员编号"
+                                    netburrow_core::text!("使用成员编号", "Use member ID")
                                 }
                             } else {
                                 value
@@ -269,16 +269,16 @@ impl NetBurrowApp {
                     .add_enabled(
                         enabled,
                         egui::Button::new(
-                            RichText::new(if editing { "完成" } else { "编辑" })
+                            RichText::new(if editing { netburrow_core::text!("完成", "Done") } else { netburrow_core::text!("编辑", "Edit") })
                                 .size(14.0)
                                 .color(ACCENT),
                         )
                         .frame(false),
                     )
                     .on_disabled_hover_text(if self.preflight.is_some() {
-                        "检查期间无法编辑"
+                        netburrow_core::text!("检查完成后可编辑", "Wait for the check to finish")
                     } else {
-                        "停止联机后可编辑"
+                        netburrow_core::text!("断开后可编辑", "Disconnect to edit")
                     })
                     .clicked()
                 {

@@ -22,14 +22,14 @@ impl Notifications {
         }
         let notice = if phase == Phase::Ready {
             Notification {
-                title: "NetBurrow 联机已就绪",
-                body: "游戏已接入，可以在游戏中邀请同组朋友。",
+                title: netburrow_core::text!("NetBurrow 已就绪", "NetBurrow is ready"),
+                body: netburrow_core::text!("可在游戏中邀请同组朋友。", "Invite friends in your group from the game."),
                 warning: false,
             }
         } else if phase == Phase::Failed {
             Notification {
-                title: "NetBurrow 联机失败",
-                body: "请打开工具查看具体原因和处理步骤。",
+                title: netburrow_core::text!("NetBurrow 连接失败", "NetBurrow connection failed"),
+                body: netburrow_core::text!("打开 NetBurrow 查看原因和处理步骤。", "Open NetBurrow for details and next steps."),
                 warning: true,
             }
         } else if phase == Phase::Connecting
@@ -39,16 +39,16 @@ impl Notifications {
             )
         {
             Notification {
-                title: "NetBurrow 连接中断",
-                body: "正在尝试恢复连接。请打开工具查看恢复结果，暂时保留游戏。",
+                title: netburrow_core::text!("NetBurrow 连接中断", "NetBurrow disconnected"),
+                body: netburrow_core::text!("正在重连。请保留游戏，打开 NetBurrow 查看进度。", "Reconnecting. Keep the game open and check NetBurrow for progress."),
                 warning: true,
             }
         } else if phase == Phase::RestartRequired
             && matches!(previous, Phase::Ready | Phase::Attaching)
         {
             Notification {
-                title: "NetBurrow 游戏接入异常",
-                body: "请打开工具查看原因，处理后退出游戏并从 Steam 重开。",
+                title: netburrow_core::text!("NetBurrow 游戏接入异常", "NetBurrow game attachment failed"),
+                body: netburrow_core::text!("打开 NetBurrow 查看原因，处理后从 Steam 重开游戏。", "Open NetBurrow for details, resolve the issue, then restart the game from Steam."),
                 warning: true,
             }
         } else {

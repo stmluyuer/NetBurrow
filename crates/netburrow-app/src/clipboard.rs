@@ -14,21 +14,21 @@ pub fn read_text() -> Result<String, String> {
     // error instead of blocking the UI thread when another program owns it.
     unsafe {
         if IsClipboardFormatAvailable(CF_UNICODETEXT) == 0 {
-            return Err("剪贴板中没有可粘贴的文字".to_owned());
+            return Err(netburrow_core::text!("剪贴板没有文字", "No text in clipboard").to_owned());
         }
         if OpenClipboard(std::ptr::null_mut()) == 0 {
-            return Err("无法读取剪贴板，请稍后重试".to_owned());
+            return Err(netburrow_core::text!("无法读取剪贴板，请稍后重试", "Cannot read clipboard. Try again.").to_owned());
         }
 
         let handle = GetClipboardData(CF_UNICODETEXT);
         if handle.is_null() {
             let _ = CloseClipboard();
-            return Err("剪贴板文字不可用".to_owned());
+            return Err(netburrow_core::text!("剪贴板文字不可用", "Clipboard text unavailable").to_owned());
         }
         let pointer = GlobalLock(handle);
         if pointer.is_null() {
             let _ = CloseClipboard();
-            return Err("无法读取剪贴板文字".to_owned());
+            return Err(netburrow_core::text!("无法读取剪贴板文字", "Cannot read clipboard text").to_owned());
         }
 
         let mut length = 0usize;
@@ -45,5 +45,5 @@ pub fn read_text() -> Result<String, String> {
 
 #[cfg(not(windows))]
 pub fn read_text() -> Result<String, String> {
-    Err("当前平台不支持系统剪贴板".to_owned())
+    Err(netburrow_core::text!("当前平台不支持剪贴板", "Clipboard is unavailable on this platform").to_owned())
 }

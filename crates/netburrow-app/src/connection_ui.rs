@@ -63,7 +63,7 @@ impl NetBurrowApp {
             return;
         }
         if self.smoke_test.is_some() {
-            self.notice = Some("界面预览不执行网络自检。".into());
+            self.notice = Some(netburrow_core::text!("预览模式不执行连接检查", "Connection checks are unavailable in preview mode").into());
             return;
         }
         let settings = self.settings.clone();
@@ -83,7 +83,7 @@ impl NetBurrowApp {
                 self.preflight_report = None;
                 self.notice = None;
             }
-            Err(error) => self.notice = Some(format!("无法开始自检：{error}")),
+            Err(error) => self.notice = Some(netburrow_core::text_format!("无法开始检查：{error}", "Could not start check: {error}")),
         }
     }
 
@@ -98,11 +98,11 @@ impl NetBurrowApp {
                 let start = pending.start_after && unchanged && report.can_start();
                 self.notice = Some(
                     if !unchanged {
-                        "设置已修改，请重新检查"
+                        netburrow_core::text!("设置已修改，请重新检查", "Settings changed. Run the check again.")
                     } else if !report.can_start() {
-                        "自检未通过，请查看检查结果"
+                        netburrow_core::text!("检查未通过，请查看结果", "Check failed. Review the results.")
                     } else {
-                        "自检完成"
+                        netburrow_core::text!("检查完成", "Check complete")
                     }
                     .into(),
                 );
@@ -113,7 +113,7 @@ impl NetBurrowApp {
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.preflight = None;
-                self.notice = Some("自检任务未完成，请重试。".into());
+                self.notice = Some(netburrow_core::text!("检查未完成，请重试", "Check interrupted. Try again.").into());
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
@@ -123,28 +123,28 @@ impl NetBurrowApp {
         if self.preflight.is_some() {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("正在检查连接…");
+                ui.label(netburrow_core::text!("正在检查…", "Checking…"));
             });
             ui.add_space(8.0);
         }
         if let Some((settings, report)) = &self.preflight_report {
             let stale = !settings.same_connection(&self.settings);
             egui::CollapsingHeader::new(if stale {
-                "自检结果（设置已修改，需重新检查）"
+                netburrow_core::text!("设置已修改，请重新检查", "Settings changed. Run the check again.")
             } else {
-                "启用前自检结果"
+                netburrow_core::text!("检查结果", "Check results")
             })
             .default_open(!report.can_start())
             .show(ui, |ui| {
                 for check in &report.checks {
                     let (label, color) = match check.level {
-                        CheckLevel::Passed => ("通过", ACCENT),
-                        CheckLevel::Info => ("说明", MUTED),
-                        CheckLevel::Warning => ("提示", Color32::from_rgb(151, 103, 37)),
-                        CheckLevel::Failed => ("未通过", Color32::from_rgb(174, 65, 60)),
+                        CheckLevel::Passed => (netburrow_core::text!("通过", "Passed"), ACCENT),
+                        CheckLevel::Info => (netburrow_core::text!("说明", "Info"), MUTED),
+                        CheckLevel::Warning => (netburrow_core::text!("提示", "Warning"), Color32::from_rgb(151, 103, 37)),
+                        CheckLevel::Failed => (netburrow_core::text!("未通过", "Failed"), Color32::from_rgb(174, 65, 60)),
                     };
                     ui.label(
-                        RichText::new(format!("{} · {label}：{}", check.name, check.detail))
+                        RichText::new(netburrow_core::text_format!("{} · {label}：{}", "{} · {label}: {}", check.name, check.detail))
                             .color(color),
                     );
                 }
