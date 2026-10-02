@@ -4,6 +4,8 @@ param(
     [switch]$SkipBuild,
     [switch]$ClientOnly,
     [switch]$KeepVersion,
+    [ValidatePattern('^[a-z0-9][a-z0-9-]{0,31}$')]
+    [string]$PackageLabel,
     [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$')]
     [string]$Version,
     [ValidateNotNullOrEmpty()]
@@ -60,9 +62,14 @@ if (-not $Version) {
     }
 }
 if ([version]$Version -lt [version]$currentVersion) { throw '指定版本不能低于当前版本。' }
-$appZip = Join-Path $distRoot "NetBurrow-$Version-win-x64.zip"
+$appName = "NetBurrow-$Version"
+if ($PackageLabel) {
+    if ($ReleaseNotesPath) { throw '带特别版标记的包不能生成正式更新清单。' }
+    $appName += "-$PackageLabel"
+}
+$appZip = Join-Path $distRoot "$appName-win-x64.zip"
 $relayZip = Join-Path $distRoot "NetBurrow-$Version-relay-source.zip"
-$appStage = Join-Path $distRoot "NetBurrow-$Version-win-x64"
+$appStage = Join-Path $distRoot "$appName-win-x64"
 $relayStage = Join-Path $distRoot "NetBurrow-$Version-relay-source"
 
 function New-ReleaseManifestJson {
@@ -198,10 +205,6 @@ New-Item -ItemType Directory -Force -Path $appStage | Out-Null
 Copy-Item -LiteralPath $appBinary -Destination (Join-Path $appStage 'NetBurrow.exe') -Force
 Copy-Item -LiteralPath $injectorBinary -Destination (Join-Path $appStage 'netburrow-injector.exe') -Force
 Copy-Item -LiteralPath $hookDll -Destination (Join-Path $appStage 'netburrow_hook.dll') -Force
-Copy-Item -LiteralPath (Join-Path $repoRoot 'README.md') -Destination (Join-Path $appStage 'README.md') -Force
-if (Test-Path -LiteralPath (Join-Path $repoRoot 'CHANGELOG.md') -PathType Leaf) {
-    Copy-Item -LiteralPath (Join-Path $repoRoot 'CHANGELOG.md') -Destination (Join-Path $appStage 'CHANGELOG.md') -Force
-}
 Get-ChildItem -LiteralPath $appStage -File -Recurse | Where-Object { $_.LastWriteTime.Year -lt 1980 -or $_.LastWriteTime.Year -gt 2107 } | ForEach-Object { $_.LastWriteTime = Get-Date }
 Write-PortableZip -Source $appStage -Destination $appZip
 Write-Output "已生成：$appZip"
