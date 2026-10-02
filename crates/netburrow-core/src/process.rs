@@ -99,6 +99,24 @@ mod windows {
                 _ => ProcessState::Unknown(io::Error::last_os_error().raw_os_error()),
             }
         }
+
+        /// Read the termination status from the pinned process, not a reused PID.
+        /// Check the handle first: 259 can also be a real process exit code.
+        pub fn exit_code(&self) -> io::Result<Option<u32>> {
+            use std::os::windows::io::AsRawHandle;
+            match self.state() {
+                ProcessState::Alive => Ok(None),
+                ProcessState::Exited => {
+                    let mut code = 0;
+                    if unsafe { GetExitCodeProcess(self.0.as_raw_handle(), &mut code) } == 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(Some(code))
+                }
+                ProcessState::Unknown(Some(code)) => Err(io::Error::from_raw_os_error(code)),
+                ProcessState::Unknown(None) => Err(io::Error::other("process state unavailable")),
+            }
+        }
     }
     #[cfg(test)]
     mod monitor_tests {
@@ -107,6 +125,7 @@ mod windows {
         fn child_fixture() {
             if std::env::var_os("NETBURROW_MONITOR_FIXTURE").is_some() {
                 std::thread::sleep(std::time::Duration::from_secs(1));
+                std::process::exit(37);
             }
         }
         #[test]
@@ -137,11 +156,13 @@ mod windows {
             };
             let monitor = ProcessMonitor::open(&game).unwrap();
             assert_eq!(monitor.state(), ProcessState::Alive);
+            assert_eq!(monitor.exit_code().unwrap(), None);
             let mut wrong = game;
             wrong.created += 1;
             assert!(ProcessMonitor::open(&wrong).is_err());
-            assert!(child.wait().unwrap().success());
+            assert_eq!(child.wait().unwrap().code(), Some(37));
             assert_eq!(monitor.state(), ProcessState::Exited);
+            assert_eq!(monitor.exit_code().unwrap(), Some(37));
         }
     }
     use windows_sys::Win32::{

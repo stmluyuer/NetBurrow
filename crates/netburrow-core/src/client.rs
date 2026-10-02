@@ -78,17 +78,17 @@ pub(crate) fn probe_relay(settings: &Settings) -> Result<(), String> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|error| format!("无法启动自检：{error}"))?;
+            .map_err(|error| crate::text_format!("无法启动自检：{error}", "Cannot start checks: {error}"))?;
         runtime.block_on(async {
             tokio::time::timeout(std::time::Duration::from_secs(8), runtime::probe(settings))
                 .await
-                .map_err(|_| "服务器自检超时，请检查网络、地址和端口后重试。".to_owned())?
+                .map_err(|_| crate::text!("服务器检查超时，请检查网络、地址和端口。", "Server check timed out. Check your network, address, and port.").to_owned())?
         })
     }
     #[cfg(not(windows))]
     {
         let _ = settings;
-        Err("客户端自检需要 Windows".into())
+        Err(crate::text!("自检仅支持 Windows", "Checks require Windows").into())
     }
 }
 fn change(shared: &Shared, update: impl FnOnce(&mut Snapshot)) {
@@ -127,18 +127,18 @@ impl Client {
         );
         settings.validate()?;
         #[cfg(not(windows))]
-        return Err("NetBurrow 客户端需要 Windows".into());
+        return Err(crate::text!("NetBurrow 客户端仅支持 Windows", "NetBurrow client requires Windows").into());
         #[cfg(windows)]
         {
             let directory = std::env::current_exe()
                 .map_err(|e| e.to_string())?
                 .parent()
-                .ok_or("程序目录不可用")?
+                .ok_or(crate::text!("程序目录不可用", "Application folder is unavailable"))?
                 .to_owned();
             if !directory.join("netburrow-injector.exe").is_file()
                 || !directory.join("netburrow_hook.dll").is_file()
             {
-                return Err("缺少自己的 helper 或 Hook DLL，请完整解压 NetBurrow 包。".into());
+                return Err(crate::text!("缺少注入器或 Hook DLL，请完整解压程序包。", "Injector or Hook DLL is missing. Extract the complete package.").into());
             }
             let (stop, stopped) = tokio::sync::watch::channel(false);
             let state = Arc::new(Mutex::new(Snapshot::default()));
@@ -157,7 +157,7 @@ impl Client {
                             stopped,
                             shared.clone(),
                         )),
-                        Err(_) => status(&shared, Phase::Failed, "无法创建客户端运行线程"),
+                        Err(_) => status(&shared, Phase::Failed, crate::text!("无法启动客户端运行环境", "Cannot start the client runtime")),
                     }
                 })
                 .map_err(|e| e.to_string())?;
@@ -224,8 +224,9 @@ mod runtime {
     };
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-    const GROUP_NOT_ALLOWED_HINT: &str =
-        "该组码未获服务器授权，请联系管理员添加，或更换已授权组码后重新启用联机。";
+    fn group_not_allowed_hint() -> &'static str {
+        crate::text!("组码未授权。请联系管理员，或更换已授权组码后重新连接。", "Group code is not authorized. Contact the administrator or use an authorized code, then reconnect.")
+    }
 
     #[derive(Debug)]
     struct GroupNotAllowed;
@@ -250,9 +251,9 @@ mod runtime {
             .await
             .map_err(|error| {
                 connection_hint(&error)
-                    .split('；')
+                    .split(['；', ';'])
                     .next()
-                    .unwrap_or("服务器连接失败")
+                    .unwrap_or(crate::text!("服务器连接失败", "Server connection failed"))
                     .to_owned()
             })?;
         network
@@ -265,22 +266,22 @@ mod runtime {
                 received: 0,
             }))
             .await
-            .map_err(|_| "服务器状态检查发送失败，请稍后重试。".to_owned())?;
+            .map_err(|_| crate::text!("无法发送服务器状态检查，请重试。", "Cannot send the server status check. Try again.").to_owned())?;
         let result = loop {
             match network.events.recv().await {
                 Some(NetworkEvent::Tcp(Message::Statuses(_))) => break Ok(()),
                 Some(NetworkEvent::Tcp(Message::Members(_))) => {}
                 Some(NetworkEvent::Tcp(Message::Ping(value))) => {
                     if network.send(&Message::Pong(value)).await.is_err() {
-                        break Err("服务器连接中断，请重试。".into());
+                        break Err(crate::text!("服务器连接中断，请重试。", "Server disconnected. Try again.").into());
                     }
                 }
                 Some(NetworkEvent::Tcp(Message::Error(_))) => {
                     break Err(
-                        "服务器拒绝状态检查，请确认连接的是支持成员状态的 NetBurrow Relay。".into(),
+                        crate::text!("服务器拒绝检查，请使用支持成员状态的 NetBurrow Relay。", "Server rejected the check. Use a NetBurrow Relay that supports member status.").into(),
                     );
                 }
-                _ => break Err("服务器握手或协议检查失败，请检查地址和服务状态。".into()),
+                _ => break Err(crate::text!("握手或协议检查失败，请检查地址和服务器状态。", "Handshake or protocol check failed. Check the address and server status.").into()),
             }
         };
         let _ = network.send(&Message::Leave).await;
@@ -290,19 +291,19 @@ mod runtime {
 
     fn connection_hint(error: &io::Error) -> &'static str {
         if group_not_allowed(error) {
-            return GROUP_NOT_ALLOWED_HINT;
+            return group_not_allowed_hint();
         }
         match error.kind() {
-            io::ErrorKind::TimedOut => "连接服务器超时，请检查地址、网络和防火墙；3 秒后重试。",
+            io::ErrorKind::TimedOut => crate::text!("连接超时，请检查地址、网络和防火墙；3 秒后重试。", "Connection timed out. Check the address, network, and firewall; retrying in 3 seconds."),
             io::ErrorKind::ConnectionRefused => {
-                "服务器拒绝连接，请检查服务是否启动、端口是否开放；3 秒后重试。"
+                crate::text!("连接被拒绝，请检查服务和端口；3 秒后重试。", "Connection refused. Check the server and port; retrying in 3 seconds.")
             }
-            io::ErrorKind::WouldBlock => "服务器已满，请稍后再试；3 秒后重试。",
+            io::ErrorKind::WouldBlock => crate::text!("服务器已满；3 秒后重试。", "Server is full; retrying in 3 seconds."),
             io::ErrorKind::PermissionDenied => {
-                "服务器拒绝加入，请核对服务器地址和版本；3 秒后重试。"
+                crate::text!("服务器拒绝加入，请核对地址和版本；3 秒后重试。", "Server denied access. Check the address and version; retrying in 3 seconds.")
             }
-            io::ErrorKind::InvalidData => "服务器协议不匹配，请核对端口和版本；3 秒后重试。",
-            _ => "无法连接服务器，请检查地址、网络和服务状态；3 秒后重试。",
+            io::ErrorKind::InvalidData => crate::text!("协议不匹配，请核对端口和版本；3 秒后重试。", "Protocol mismatch. Check the port and version; retrying in 3 seconds."),
+            _ => crate::text!("无法连接，请检查地址、网络和服务器；3 秒后重试。", "Cannot connect. Check the address, network, and server; retrying in 3 seconds."),
         }
     }
 
@@ -614,10 +615,17 @@ mod runtime {
         helper: Option<Child>,
         monitor: watch::Receiver<ProcessState>,
         monitor_task: Task<()>,
+        process_monitor: Arc<ProcessMonitor>,
     }
     impl Drop for Launch {
         fn drop(&mut self) {
             self.monitor_task.abort();
+            // Read the pinned handle even if cleanup beat the next monitor tick.
+            match self.process_monitor.exit_code() {
+                Ok(Some(code)) => log("INFO", "game process exited", &format!("pid={} exit_code=0x{code:08X}", self.game.pid)),
+                Ok(None) => {},
+                Err(error) => log("WARN", "game process exit status", &format!("pid={} unavailable: {error}", self.game.pid)),
+            }
             if let Some(mut child) = self.helper.take() {
                 if child.try_wait().ok().flatten().is_none() {
                     let _ = child.kill();
@@ -782,11 +790,13 @@ mod runtime {
             let _ = child.wait();
             return Err(e);
         }
+        let process_monitor = Arc::new(process_monitor);
         let (observed, monitor) = watch::channel(process_monitor.state());
+        let watched_process = process_monitor.clone();
         let monitor_task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                let state = process_monitor.state();
+                let state = watched_process.state();
                 if observed.send(state).is_err() || state == ProcessState::Exited {
                     break;
                 }
@@ -800,6 +810,7 @@ mod runtime {
             helper: Some(child),
             monitor,
             monitor_task,
+            process_monitor,
         })
     }
 
@@ -827,6 +838,7 @@ mod runtime {
         mut stop: watch::Receiver<bool>,
         state: Shared,
     ) {
+        let _network_history = crate::network_history::Monitor::start(state.clone());
         let group = match parse_group(&settings.group) {
             Ok(g) => g,
             Err(e) => {
@@ -838,7 +850,7 @@ mod runtime {
         let listener = match TcpListener::bind("127.0.0.1:0").await {
             Ok(l) => l,
             Err(_) => {
-                status(&state, Phase::Failed, "无法创建本地 IPC 端口");
+                status(&state, Phase::Failed, crate::text!("无法创建本地通信端口", "Cannot create a local IPC port"));
                 return;
             }
         };
@@ -852,7 +864,7 @@ mod runtime {
                 .map(|g| (g.pid, g.created))
                 .collect(),
             Err(_) => {
-                status(&state, Phase::Failed, "无法枚举当前用户的游戏进程");
+                status(&state, Phase::Failed, crate::text!("无法读取当前用户的游戏进程", "Cannot list the current user's game processes"));
                 return;
             }
         };
@@ -865,7 +877,7 @@ mod runtime {
                 settings.allow_late_hook
             ),
         );
-        status(&state, Phase::Connecting, "正在连接 Relay…");
+        status(&state, Phase::Connecting, crate::text!("正在连接服务器…", "Connecting to server…"));
         while !*stop.borrow() {
             let result = tokio::select! { biased; _ = stop.changed() => break, result = Network::connect(settings.server.trim(), group, settings.transport) => result };
             let mut network = match result {
@@ -880,9 +892,9 @@ mod runtime {
                             s.last_pong_at = None;
                         });
                         let detail = if seen.is_empty() {
-                            GROUP_NOT_ALLOWED_HINT.to_owned()
+                            group_not_allowed_hint().to_owned()
                         } else {
-                            format!("{GROUP_NOT_ALLOWED_HINT} 已运行的游戏请退出后重开。")
+                            crate::text_format!("{} 请重开已运行的游戏。", "{} Restart any running game.", group_not_allowed_hint())
                         };
                         status(&state, Phase::Failed, detail);
                         return;
@@ -912,9 +924,9 @@ mod runtime {
                     Phase::RestartRequired
                 },
                 if seen.is_empty() {
-                    "Relay 已连接，请从 Steam 正常启动游戏"
+                    crate::text!("已连接，请从 Steam 启动游戏", "Connected. Start the game from Steam")
                 } else {
-                    "发现已运行的游戏，请退出游戏后从 Steam 重开"
+                    crate::text!("游戏已在运行，请退出后从 Steam 重开", "Game is already running. Exit and restart it from Steam")
                 },
             );
             let result = connected(
@@ -959,7 +971,7 @@ mod runtime {
                     status(
                         &state,
                         Phase::Failed,
-                        "服务器版本不兼容：Relay 尚不支持成员状态，请更新服务器后重新启用联机。",
+                        crate::text!("服务器不支持成员状态，请更新后重新连接。", "Server does not support member status. Update it, then reconnect."),
                     );
                 }
                 return;
@@ -968,7 +980,7 @@ mod runtime {
                 status(
                     &state,
                     Phase::Connecting,
-                    "连接中断，正在重连；已接入的游戏需要重开",
+                    crate::text!("连接中断，正在重连；请重开已接入的游戏", "Disconnected. Reconnecting… Restart any connected game"),
                 );
             }
             tokio::select! { _ = stop.changed() => break, _ = tokio::time::sleep(Duration::from_secs(2)) => {} }
@@ -980,7 +992,7 @@ mod runtime {
         status(
             &state,
             Phase::Stopped,
-            "已停止；已接入的游戏需要重开后恢复普通网络",
+            crate::text!("已停止。已接入的游戏需重开以恢复普通网络", "Stopped. Restart any connected game to restore normal networking"),
         );
     }
 
@@ -1033,10 +1045,10 @@ mod runtime {
                             change(state,|s|{s.peers.clear();s.path_diagnostics=Default::default();});
                             last_report=Instant::now()-Duration::from_secs(3);
                             log("WARN","relay recovery","Relay allowed fresh join; keeping Hook and rebinding current game; old Relay replay data discarded");
-                            status(state,if hook.is_some(){Phase::Attaching}else{Phase::WaitingForGame},"已重新加入 Relay，正在恢复游戏接入；请确认游戏是否继续推进");
+                            status(state,if hook.is_some(){Phase::Attaching}else{Phase::WaitingForGame},crate::text!("已重新连接，正在恢复游戏接入；请确认游戏是否继续推进", "Reconnected. Restoring game connection; check whether gameplay resumes"));
                         } else {
                             log("INFO","relay recovery","original session resumed; pending reliable frames replayed with duplicate suppression");
-                            status(state,if hook.as_ref().is_some_and(|h|h.acknowledged){Phase::Ready}else{Phase::WaitingForGame},"原 Relay 会话已恢复；请确认游戏是否继续推进");
+                            status(state,if hook.as_ref().is_some_and(|h|h.acknowledged){Phase::Ready}else{Phase::WaitingForGame},crate::text!("原会话已恢复，请确认游戏是否继续推进", "Previous session restored. Check whether gameplay resumes"));
                         }
                     }
                     event = network.events.recv(), if relay_recovery.is_none() => {
@@ -1058,7 +1070,7 @@ mod runtime {
                                     h.bound = peers.iter().any(|p| p.client_id == network.client_id && p.steam_id == h.steam_id && p.epoch == h.epoch);
                                     if h.bound && !was_bound { network.udp_bound = false; network.bind_udp().await?; }
                                     h.send(&Message::Members(peers.clone())).await?;
-                                    if h.ready && h.bound && !h.acknowledged { h.send(&Message::IpcReady).await?; h.acknowledged = true; status(state, Phase::Ready, "游戏已接入 NetBurrow，可在游戏中邀请同组朋友"); }
+                                    if h.ready && h.bound && !h.acknowledged { h.send(&Message::IpcReady).await?; h.acknowledged = true; status(state, Phase::Ready, crate::text!("游戏已接入，可邀请同组好友", "Game connected. Invite friends in your group")); }
                                     if !h.bound && h.acknowledged { return Err(io::Error::other("Relay unbound current game")); }
                                 }
                             }
@@ -1082,8 +1094,12 @@ mod runtime {
                             Some(NetworkEvent::Tcp(Message::Pong(netburrow_protocol::DIAGNOSTICS_PING))) => {},
                             Some(NetworkEvent::Tcp(Message::Pong(netburrow_protocol::RECOVERY_PING))) => {},
                             Some(NetworkEvent::Tcp(Message::Pong(sequence))) => {
+                                let ping = (since.elapsed().as_millis() as u64).saturating_sub(sequence);
+                                let gap = state.lock().unwrap_or_else(|p| p.into_inner()).last_pong_at.map(|t| t.elapsed().as_millis());
+                                if ping >= 500 || gap.is_some_and(|ms| ms >= 2500) {
+                                    crate::diagnostics::network_history(&[format!("relay pong delayed rtt_ms={ping} previous_pong_gap_ms={gap:?}")]);
+                                }
                                 change(state, |s| {
-                                    let ping = (since.elapsed().as_millis() as u64).saturating_sub(sequence);
                                     s.ping_ms = Some(ping);
                                     s.last_pong_at = Some(std::time::Instant::now());
                                     s.rtt_samples.push_back(ping);
@@ -1103,9 +1119,9 @@ mod runtime {
                                 // Members is authoritative for peer cleanup; these errors carry no target identity.
                                 let phase = state.lock().unwrap_or_else(|p| p.into_inner()).phase;
                                 status(state, phase, if reason == "target connection is slow" {
-                                    "对方连接拥堵，已断开；本机仍在线，等待对方重新加入。"
+                                    crate::text!("对方因拥堵断开，本机仍在线；等待重新加入。", "Peer disconnected due to congestion. You are still online; waiting for them to rejoin.")
                                 } else {
-                                    "对方已断开；本机仍在线，等待对方重新加入。"
+                                    crate::text!("对方已断开，本机仍在线；等待重新加入。", "Peer disconnected. You are still online; waiting for them to rejoin.")
                                 });
                             }
                             Some(NetworkEvent::Tcp(Message::Error(reason))) if reason == "status reports are limited to once per second" => {
@@ -1117,21 +1133,23 @@ mod runtime {
                                     return Err(io::Error::new(io::ErrorKind::Unsupported, "Relay does not support member status; update Relay"));
                                 }
                                 status(state, Phase::Failed, if reason == "steam_id is already bound in this group" {
-                                    "游戏身份重复：同组已有相同 Steam 身份。请退出重复的游戏或工具实例，再重开游戏并重新启用联机。"
+                                    crate::text!("同组存在重复 Steam 身份。关闭重复实例，重开游戏并重新连接。", "Duplicate Steam identity in this group. Close duplicate instances, restart the game, and reconnect.")
                                 } else {
-                                    "服务器拒绝游戏数据：请查看排查日志中的具体原因，再重开游戏并重新启用联机。"
+                                    crate::text!("服务器拒绝游戏数据。请查看日志，重开游戏并重新连接。", "Server rejected game data. Check the logs, restart the game, and reconnect.")
                                 }); return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Relay rejected state"));
                             }
                             Some(NetworkEvent::Closed) | None => {
+                                crate::diagnostics::network_history(&["relay interrupted reason=closed".into()]);
                                 relay_recovery=Some(network.begin_resume(settings.server.clone(),stop.clone()).await?);
                                 change(state,|s|{s.relay_recovering=true;s.disconnects+=1;s.last_disconnect_at=Some(std::time::Instant::now());});
-                                status(state,Phase::Connecting,"连接中断，正在恢复原会话；暂时保留游戏接入");
+                                status(state,Phase::Connecting,crate::text!("连接中断，正在恢复会话；游戏接入暂时保留", "Disconnected. Restoring session; game connection retained for now"));
                             }
                             Some(NetworkEvent::Fault(e))=>{
+                                crate::diagnostics::network_history(&[format!("relay interrupted reason=read_fault kind={:?} os_error={:?}", e.kind(), e.raw_os_error())]);
                                 if !recoverable(&e){return Err(e);}
                                 relay_recovery=Some(network.begin_resume(settings.server.clone(),stop.clone()).await?);
                                 change(state,|s|{s.relay_recovering=true;s.disconnects+=1;s.last_disconnect_at=Some(std::time::Instant::now());});
-                                status(state,Phase::Connecting,"连接中断，正在恢复原会话；暂时保留游戏接入");
+                                status(state,Phase::Connecting,crate::text!("连接中断，正在恢复会话；游戏接入暂时保留", "Disconnected. Restoring session; game connection retained for now"));
                             }
                             _ => return Err(io::Error::other("unexpected Relay message")),
                         }
@@ -1162,7 +1180,7 @@ mod runtime {
                                 if let Some(Ok(Err(error)))=accepted {
                                     if error.kind()==io::ErrorKind::Unsupported {
                                         pending=None;
-                                        status(state,Phase::RestartRequired,"客户端与 Hook 版本不匹配，请完整解压同一版本并重开游戏；Relay 保持连接");
+                                        status(state,Phase::RestartRequired,crate::text!("客户端与 Hook 版本不匹配。请完整解压同一版本并重开游戏；服务器连接保持", "Client and Hook versions differ. Extract the same release and restart the game; server connection retained"));
                                     }
                                 }
                             }
@@ -1177,7 +1195,7 @@ mod runtime {
                                 log("INFO", "hook ready", "received adapter readiness; awaiting/confirming Relay binding");
                                 if let Some(h) = hook.as_mut() {
                                     h.ready = true;
-                                    if h.bound && !h.acknowledged { h.send(&Message::IpcReady).await?; h.acknowledged = true; status(state, Phase::Ready, "游戏已接入 NetBurrow，可在游戏中邀请同组朋友"); }
+                                    if h.bound && !h.acknowledged { h.send(&Message::IpcReady).await?; h.acknowledged = true; status(state, Phase::Ready, crate::text!("游戏已接入，可邀请同组好友", "Game connected. Invite friends in your group")); }
                                 }
                             }
                             Some(Ok(Message::Data(packet))) => {
@@ -1207,7 +1225,7 @@ mod runtime {
                                 if let Some(Err(error)) = ended { log("ERROR", "ipc disconnected", &error.to_string()); }
                                 else { log("INFO", "ipc disconnected", "Hook stopped or reader channel closed"); }
                                 if recover {if let Some(h)=hook.as_mut(){h.begin_resume().await;}log("WARN","ipc recovery","waiting up to 3s for original Hook to reconnect");}
-                                else {disconnect_hook(&mut hook, &mut pending, network).await;status(state, Phase::RestartRequired, "游戏接入已停止，请退出游戏后重开");}
+                                else {disconnect_hook(&mut hook, &mut pending, network).await;status(state, Phase::RestartRequired, crate::text!("游戏接入已停止，请重开游戏", "Game connection stopped. Restart the game"));}
                             }
                             _ => return Err(io::Error::other("unexpected Hook message")),
                         }
@@ -1217,10 +1235,11 @@ mod runtime {
                         change(state, |s| s.path_diagnostics = network.diagnostics.snapshot(std::time::Instant::now()));
                         if relay_recovery.is_none() {
                             if let Err(e)=network.writer.check() {
+                                crate::diagnostics::network_history(&[format!("relay interrupted reason=write_fault kind={:?} os_error={:?}", e.kind(), e.raw_os_error())]);
                                 if !recoverable(&e){return Err(e);}
                                 relay_recovery=Some(network.begin_resume(settings.server.clone(),stop.clone()).await?);
                                 change(state,|s|{s.relay_recovering=true;s.disconnects+=1;s.last_disconnect_at=Some(std::time::Instant::now());});
-                                status(state,Phase::Connecting,"发送中断，正在恢复原会话；暂时保留游戏接入");
+                                status(state,Phase::Connecting,crate::text!("发送中断，正在恢复会话；游戏接入暂时保留", "Sending interrupted. Restoring session; game connection retained for now"));
                             }
                         }
                         while let Some((peer,epoch))=network.writer.queue.fault() { if let Some(h)=hook.as_mut() {h.fail_peer(peer,epoch)?;} }
@@ -1228,12 +1247,12 @@ mod runtime {
                         if let Some(error)=ipc_error {
                             log("ERROR","ipc interrupted",&error.to_string());
                             if recoverable(&error) {if let Some(h)=hook.as_mut(){h.begin_resume().await;}}
-                            else {disconnect_hook(&mut hook,&mut pending,network).await;status(state,Phase::RestartRequired,"游戏接入出现不可恢复错误，请退出游戏后重开");}
+                            else {disconnect_hook(&mut hook,&mut pending,network).await;status(state,Phase::RestartRequired,crate::text!("游戏接入无法恢复，请重开游戏", "Game connection cannot recover. Restart the game"));}
                         }
                         if hook.as_ref().is_some_and(|h|h.recovering_since.is_some_and(|t|t.elapsed()>=Duration::from_secs(3))) {
                             if let Some(task)=ipc_recovery.take(){task.abort();}
                             disconnect_hook(&mut hook,&mut pending,network).await;
-                            status(state,Phase::RestartRequired,"本地连接恢复超时，请退出游戏后重开");
+                            status(state,Phase::RestartRequired,crate::text!("本地连接恢复超时，请重开游戏", "Local connection recovery timed out. Restart the game"));
                         }
                         if let Some(h)=hook.as_mut() {
                             while let Some((peer,epoch))=h.writer.queue.fault() {h.fail_peer(peer,epoch)?;}
@@ -1266,10 +1285,11 @@ mod runtime {
                             last_stats = Instant::now();
                         }
                         if relay_recovery.is_none() && network.events.tcp.pong_age() > Duration::from_secs(15) {
+                            crate::diagnostics::network_history(&[format!("relay interrupted reason=heartbeat_timeout pong_age_ms={}", network.events.tcp.pong_age().as_millis())]);
                             change(state, |s| s.heartbeat_timeouts += 1);
                             relay_recovery=Some(network.begin_resume(settings.server.clone(),stop.clone()).await?);
                             change(state,|s|{s.relay_recovering=true;s.disconnects+=1;s.last_disconnect_at=Some(std::time::Instant::now());});
-                            status(state,Phase::Connecting,"心跳超时，正在恢复原会话；暂时保留游戏接入");
+                            status(state,Phase::Connecting,crate::text!("心跳超时，正在恢复会话；游戏接入暂时保留", "Heartbeat timed out. Restoring session; game connection retained for now"));
                         }
                         if last_ping.elapsed() >= Duration::from_secs(1) {
                             network.send(&Message::Ping(since.elapsed().as_millis() as u64)).await?;
@@ -1297,7 +1317,7 @@ mod runtime {
                             change(state,|s| {if s.process_unknown!=unknown {log("WARN","process monitor",&format!("state={process_state:?}"));}s.process_unknown=unknown;});
                             if process_state==ProcessState::Exited {
                                 disconnect_hook(&mut hook, &mut pending, network).await;
-                                status(state, Phase::WaitingForGame, "游戏已退出，等待下次从 Steam 启动");
+                                status(state, Phase::WaitingForGame, crate::text!("游戏已退出，等待从 Steam 启动", "Game exited. Start it again from Steam"));
                                 continue;
                             }
                             if let Some(child) = p.helper.as_mut() {
@@ -1310,28 +1330,28 @@ mod runtime {
                                         log("ERROR", "helper", &diagnostic);
                                         change(state, |s| { s.logs.push(diagnostic.trim().to_owned()); if s.logs.len()>64 {s.logs.remove(0);} });
                                         disconnect_hook(&mut hook, &mut pending, network).await;
-                                        status(state, Phase::RestartRequired, "游戏接入失败：Hook 加载失败。请完整解压工具、检查安全软件是否拦截文件，并查看日志；处理后退出游戏，从 Steam 重开。");
+                                        status(state, Phase::RestartRequired, crate::text!("Hook 加载失败。请完整解压程序、检查安全软件拦截及日志，再从 Steam 重开游戏。", "Hook failed to load. Extract the complete package, check security software and logs, then restart the game from Steam."));
                                         continue;
                                     }
                                 }
                             }
                             if p.since.elapsed() > Duration::from_secs(35) && !hook.as_ref().is_some_and(|h| h.acknowledged) {
                                 disconnect_hook(&mut hook, &mut pending, network).await;
-                                status(state, Phase::RestartRequired, "游戏接入超时：请确认运行的是受支持的忏悔+版本，查看日志后退出游戏并从 Steam 重开。");
+                                status(state, Phase::RestartRequired, crate::text!("游戏接入超时。请确认使用受支持的忏悔+版本，查看日志并从 Steam 重开。", "Game connection timed out. Check that your Repentance+ version is supported, review the logs, and restart from Steam."));
                             }
                         } else if games.len() > 1 {
-                            status(state, Phase::RestartRequired, "发现多个游戏进程，请只保留一个并重开");
+                            status(state, Phase::RestartRequired, crate::text!("检测到多个游戏进程，请仅保留一个并重开", "Multiple game processes found. Keep one instance and restart it"));
                         } else if let Some(game) = games.into_iter().next() {
                             let key = (game.pid, game.created);
                             if !seen.contains(&key) {
                                 seen.insert(key);
                                 match launch(game, directory, port) {
-                                    Ok(value) => { pending = Some(value); status(state, Phase::Attaching, "已发现游戏进程，正在加载自己的 Hook…"); }
-                                    Err(error) => { log("ERROR", "helper launch", &error.to_string()); status(state, Phase::RestartRequired, "无法启动 Hook helper，请检查文件权限并重开游戏"); },
+                                    Ok(value) => { pending = Some(value); status(state, Phase::Attaching, crate::text!("已检测到游戏，正在接入…", "Game detected. Connecting…")); }
+                                    Err(error) => { log("ERROR", "helper launch", &error.to_string()); status(state, Phase::RestartRequired, crate::text!("无法启动注入器，请检查文件权限并重开游戏", "Cannot start the injector. Check file permissions and restart the game")); },
                                 }
                             }
                         } else if seen.is_empty() && hook.is_none() {
-                            status(state, Phase::WaitingForGame, "Relay 已连接，请从 Steam 正常启动游戏");
+                            status(state, Phase::WaitingForGame, crate::text!("已连接，请从 Steam 启动游戏", "Connected. Start the game from Steam"));
                         }
                     }
                 }
@@ -1814,7 +1834,7 @@ mod runtime {
                     .await
                     .unwrap()
                     .unwrap_err(),
-                GROUP_NOT_ALLOWED_HINT
+                group_not_allowed_hint()
             );
             let state = Arc::new(Mutex::new(Snapshot {
                 ping_ms: Some(42),
@@ -1842,7 +1862,7 @@ mod runtime {
             {
                 let snapshot = state.lock().unwrap();
                 assert_eq!(snapshot.phase, Phase::Failed);
-                assert_eq!(snapshot.detail, GROUP_NOT_ALLOWED_HINT);
+                assert_eq!(snapshot.detail, group_not_allowed_hint());
                 assert!(snapshot.peers.is_empty());
                 assert!(snapshot.ping_ms.is_none());
                 assert!(snapshot.rtt_samples.is_empty());

@@ -1,4 +1,7 @@
 mod client;
+pub mod i18n;
+#[cfg(windows)]
+mod network_history;
 mod path_diagnostics;
 pub use path_diagnostics::{PathDiagnostics, PathPeer, SequenceReport};
 #[cfg(windows)]
@@ -19,6 +22,7 @@ pub use settings::{
     Settings, Transport, WindowPlacement, RecentConnection, autodetect_game, config_directory, load_settings, new_group,
     save_minimize_on_close, save_notifications_enabled, save_window_placement, save_settings,
     save_start_minimized, save_recent_connections, save_game_settings, save_auto_check_updates,
+    save_crash_capture, save_language,
 };
 
 #[cfg(windows)]
@@ -48,7 +52,7 @@ impl SingleInstance {
         let activate = process::Handle::new(unsafe {
             CreateEventW(std::ptr::null(), 0, 0, event_name.as_ptr())
         })
-        .map_err(|e| format!("无法创建窗口唤回事件：{e}"))?;
+        .map_err(|e| crate::text_format!("无法初始化窗口唤回：{e}", "Cannot initialize window activation: {e}"))?;
         let name = process::wide(mutex_name);
         let raw = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
         let already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
@@ -65,8 +69,7 @@ impl SingleInstance {
                     }
                 }
                 if SetEvent(activate.0) == 0 {
-                    return Err(format!(
-                        "无法唤回现有窗口：{}",
+                    return Err(crate::text_format!("无法显示现有窗口：{}", "Cannot show the existing window: {}",
                         std::io::Error::last_os_error()
                     ));
                 }
@@ -93,7 +96,7 @@ pub struct SingleInstance;
 #[cfg(not(windows))]
 impl SingleInstance {
     pub fn acquire() -> Result<Option<Self>, String> {
-        Err("Windows 客户端只能在 Windows 上运行".into())
+        Err(crate::text!("此客户端仅支持 Windows", "This client requires Windows").into())
     }
     pub fn activation_requested(&self) -> bool {
         false

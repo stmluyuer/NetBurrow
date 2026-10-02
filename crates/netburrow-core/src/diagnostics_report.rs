@@ -32,7 +32,7 @@ pub fn export_report(settings: &Settings, snapshot: &Snapshot) -> Result<PathBuf
         settings,
         snapshot,
     )
-    .map_err(|error| format!("无法导出诊断信息：{error}"))
+    .map_err(|error| crate::text_format!("无法导出诊断：{error}", "Cannot export diagnostics: {error}"))
 }
 
 fn export_to(
@@ -141,6 +141,8 @@ fn build_report(logs: &Path, settings: &Settings, snapshot: &Snapshot) -> String
         "injector.log",
         "hook.previous.log",
         "hook.log",
+        "network.previous.log",
+        "network.log",
     ] {
         result.push_str(&format!("\n--- {name} ---\n"));
         match read_tail(&logs.join(name)) {
