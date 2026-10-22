@@ -19,10 +19,10 @@ pub use preflight::{preflight, Check, CheckLevel, PreflightReport};
 pub use quality::{connection_quality, Quality};
 pub use netburrow_protocol::MemberStatus;
 pub use settings::{
-    Settings, Transport, WindowPlacement, RecentConnection, autodetect_game, config_directory, load_settings, new_group,
+    Settings, Theme, Transport, WindowPlacement, RecentConnection, autodetect_game, config_directory, load_settings, new_group,
     save_minimize_on_close, save_notifications_enabled, save_window_placement, save_settings,
     save_start_minimized, save_recent_connections, save_game_settings, save_auto_check_updates,
-    save_crash_capture, save_language,
+    save_crash_capture, save_language, save_theme,
 };
 
 #[cfg(windows)]

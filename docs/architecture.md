@@ -31,7 +31,7 @@ NetBurrow 为少量朋友组队转发《以撒的结合：忏悔+》的游戏数
 
 游戏接入行为参考 [TractorBeam 固定版本 ea0393f](https://github.com/mcthesw/TractorBeam/tree/ea0393f5665dd1e0775d9dc1d0c987304461191c)，该上游版本使用 [AGPL-3.0](https://github.com/mcthesw/TractorBeam/blob/ea0393f5665dd1e0775d9dc1d0c987304461191c/LICENSE)。项目原始独立实现要求不将其源码、协议库、二进制、界面或资产作为工程底座；当前构建不依赖研究目录。当前 Hook 的队列、接口登记及安装检查使用 NetBurrow 的实现。
 
-这些设计要求与结构差异不是对全部代码来源的法律审计结论。后续引入外部实现、片段或资产时，必须记录具体来源和适用许可；NetBurrow 自有代码的 [MIT 声明](../LICENSE) 不覆盖上游的独立许可要求。通用依赖、内置字体及资源的通知见 [第三方许可清单](../THIRD_PARTY_LICENSES.txt)。图标的生成入口为 `scripts/generate-icons.ps1`，系统字体在运行时从 Windows 本机读取，不随包复制。
+这些设计要求与结构差异不是对全部代码来源的法律审计结论。后续引入外部实现、片段或资产时，必须记录具体来源和适用许可；NetBurrow 自有代码的 [MIT 声明](../LICENSE) 不覆盖上游的独立许可要求。通用依赖、内置字体及资源的通知见 [第三方许可清单](../THIRD_PARTY_LICENSES.txt)。图标的生成入口为 `scripts/generate-icons.ps1`，系统字体在运行时从 Windows 本机读取，不随包复制。可选主题的彩色插画由 `scripts/convert-theme-art.ps1` 转为调色板图（`assets/themes`）；主题字体（站酷快乐体、Fusion Pixel，均为 SIL OFL 1.1）由 `scripts/subset-theme-fonts.py` 裁成界面用字子集随包内置，许可原文见 `assets/fonts/NOTICE.txt`。
 
 ## 本地化与诊断
 

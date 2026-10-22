@@ -236,6 +236,10 @@ def generate(registry):
     for digest, body in documents.items():
         appendix.extend([f"BEGIN NOTICE SHA256: {digest}", body.rstrip(), f"END NOTICE SHA256: {digest}", ""])
     result = "\n".join(header) + "\n\n" + "\n\n".join(entries) + "\n\n" + "\n".join(appendix)
+    # Theme fonts are repository assets, not Cargo packages; their notices ship verbatim.
+    bundled_fonts = ROOT / "crates/netburrow-app/assets/fonts/NOTICE.txt"
+    if bundled_fonts.exists():
+        result = result.rstrip("\n") + "\n\n" + bundled_fonts.read_text(encoding="utf-8").rstrip() + "\n"
     return result, issues, len(packages), len(documents)
 
 

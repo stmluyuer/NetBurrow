@@ -13,10 +13,11 @@ impl NetBurrowApp {
             .resizable(false)
             .frame(
                 egui::Frame::new()
-                    .fill(BACKGROUND)
+                    .fill(pal().background)
                     .inner_margin(egui::Margin::symmetric(PAGE_MARGIN, 8)),
             )
             .show(ui, |ui| {
+                art::backdrop(ui);
                 ui.horizontal(|ui| {
                     if widgets::button(
                         ui,
@@ -39,15 +40,16 @@ impl NetBurrowApp {
                             ui.label(
                                 RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
                                     .size(12.0)
-                                    .color(SUBTLE),
+                                    .color(pal().subtle),
                             );
                         }
                     });
                 });
             });
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(BACKGROUND).inner_margin(PAGE_MARGIN))
+            .frame(egui::Frame::new().fill(pal().background).inner_margin(PAGE_MARGIN))
             .show(ui, |ui| {
+                art::backdrop(ui);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -82,14 +84,14 @@ impl NetBurrowApp {
 
     fn header_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            art::show(ui, art::Art::Logo, Vec2::new(56.0, 44.0), TEXT);
+            art::show(ui, art::Art::Logo, Vec2::new(56.0, 44.0), pal().text);
             ui.add_space(2.0);
             ui.vertical(|ui| {
                 ui.label(RichText::new("NetBurrow").font(bold(25.0)));
                 ui.label(
                     RichText::new(netburrow_core::text!("以撒好友联机", "Isaac co-op with friends"))
                         .size(13.0)
-                        .color(MUTED),
+                        .color(pal().muted),
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -156,10 +158,15 @@ impl NetBurrowApp {
         let context = ui.ctx().clone();
         let id = egui::Id::new("status-card");
         const TINT_SECONDS: f32 = 0.3;
-        let ink = widgets::animate_color(&context, id.with("ink"), if tone == Tone::Neutral { TEXT } else { tone.fg() }, TINT_SECONDS);
-        let detail_color = widgets::animate_color(&context, id.with("detail"), if tone == Tone::Neutral { MUTED } else { tone.fg() }, TINT_SECONDS);
-        let fill = widgets::animate_color(&context, id.with("fill"), if tone == Tone::Neutral { CARD } else { tone.soft() }, TINT_SECONDS);
-        let border = widgets::animate_color(&context, id.with("border"), tone.border(), TINT_SECONDS);
+        // Picked with the card palette: these colours are drawn on the card, not the page.
+        let (ink, detail_color, fill, border) = theme::in_card(|| {
+            (
+                widgets::animate_color(&context, id.with("ink"), if tone == Tone::Neutral { pal().text } else { tone.fg() }, TINT_SECONDS),
+                widgets::animate_color(&context, id.with("detail"), if tone == Tone::Neutral { pal().muted } else { tone.fg() }, TINT_SECONDS),
+                widgets::animate_color(&context, id.with("fill"), if tone == Tone::Neutral { pal().card } else { tone.soft() }, TINT_SECONDS),
+                widgets::animate_color(&context, id.with("border"), tone.border(), TINT_SECONDS),
+            )
+        });
         let entered = widgets::appear(&context, id.with("enter"), (illustration, title), 0.35);
         // In-progress states breathe so the card reads as "working", not frozen.
         let breathing = illustration == art::Art::Connecting;
@@ -172,7 +179,7 @@ impl NetBurrowApp {
             .is_some_and(|(_, report)| !report.can_start());
         let show_logs = active && matches!(phase, Phase::Connecting | Phase::RestartRequired | Phase::Failed);
 
-        widgets::card(tone).fill(fill).stroke(egui::Stroke::new(1.0, border)).show(ui, |ui| {
+        let card = widgets::card(tone).fill(fill).stroke(egui::Stroke::new(1.0, border)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 art::show(ui, illustration, Vec2::new(92.0, 76.0), ink.gamma_multiply(art_alpha));
@@ -204,7 +211,12 @@ impl NetBurrowApp {
                             None => label.to_owned(),
                         };
                         ui.add_space(2.0);
-                        widgets::status_chip(ui, &text, quality_tone).on_hover_text(reason);
+                        ui.horizontal(|ui| {
+                            widgets::status_chip(ui, &text, quality_tone).on_hover_text(reason);
+                            if theme::illustrated() {
+                                widgets::hearts(ui, quality);
+                            }
+                        });
                     }
                 });
             });
@@ -221,7 +233,7 @@ impl NetBurrowApp {
                     egui::Label::new(
                         RichText::new(netburrow_core::text!("未看到朋友？核对服务器和完整组码。", "Missing a friend? Check your server and full group code."))
                             .size(12.0)
-                            .color(MUTED),
+                            .color(pal().muted),
                     )
                     .wrap(),
                 );
@@ -284,13 +296,18 @@ impl NetBurrowApp {
                             ui.label(
                                 RichText::new(netburrow_core::text!("断开后需重开游戏", "Restart the game after disconnecting"))
                                     .size(12.0)
-                                    .color(MUTED),
+                                    .color(pal().muted),
                             );
                         });
                     }
                 });
             }
         });
+        // A failed run leaves a splat on the card corner.
+        if tone == Tone::Danger && theme::illustrated() {
+            let at = card.response.rect.right_top() + Vec2::new(-30.0, 22.0);
+            art::paint_item(ui.painter(), egui::Rect::from_center_size(at, Vec2::splat(58.0)), art::Item::Splat, entered);
+        }
     }
 
     fn members_ui(&mut self, ui: &mut egui::Ui) {
@@ -302,7 +319,7 @@ impl NetBurrowApp {
             ui.label(
                 RichText::new(netburrow_core::text_format!("{count} 人", "{count}"))
                     .size(13.0)
-                    .color(MUTED),
+                    .color(pal().muted),
             );
         });
         ui.add_space(6.0);
@@ -310,7 +327,7 @@ impl NetBurrowApp {
             widgets::card(Tone::Neutral).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.vertical_centered(|ui| {
-                    art::show(ui, art::Art::EmptyMembers, Vec2::new(120.0, 76.0), SUBTLE);
+                    art::show(ui, art::Art::EmptyMembers, Vec2::new(120.0, 76.0), pal().subtle);
                     ui.add_space(4.0);
                     ui.label(
                         RichText::new(if self.client.is_some() {
@@ -319,12 +336,12 @@ impl NetBurrowApp {
                             netburrow_core::text!("暂无成员", "No members")
                         })
                         .size(13.0)
-                        .color(MUTED),
+                        .color(pal().muted),
                     );
                     ui.label(
                         RichText::new(netburrow_core::text!("把组码发给好友，即可同组联机", "Share the group code to play together"))
                             .size(12.0)
-                            .color(SUBTLE),
+                            .color(pal().subtle),
                     );
                     if !self.settings.group.trim().is_empty() {
                         ui.add_space(6.0);
@@ -462,7 +479,7 @@ impl NetBurrowApp {
                         egui::Button::new(
                             RichText::new(if editing { netburrow_core::text!("完成", "Done") } else { netburrow_core::text!("编辑", "Edit") })
                                 .size(14.0)
-                                .color(ACCENT),
+                                .color(pal().link),
                         )
                         .frame(false),
                     )
@@ -542,14 +559,24 @@ fn member_row(ui: &mut egui::Ui, peer: &netburrow_core::PeerInfo) {
                 ui.set_width(width);
                 ui.add(egui::Label::new(RichText::new(display).size(14.0)).truncate())
                     .on_hover_text(netburrow_core::text_format!("{name}\n连接编号 #{}", "{name}\nConnection #{}", peer.client_id));
-                ui.label(RichText::new(transport).size(11.5).color(MUTED))
+                ui.label(RichText::new(transport).size(11.5).color(pal().muted))
                     .on_hover_text(netburrow_core::text!("不可靠消息使用 UDP，可靠消息使用 TCP", "UDP for unreliable messages; TCP for reliable messages"));
             },
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             widgets::status_chip(ui, status, tone);
-            ui.label(RichText::new(ping).size(13.0).color(MUTED))
+            ui.label(RichText::new(ping).size(13.0).color(pal().muted))
                 .on_hover_text(netburrow_core::text!("成员到服务器的往返延迟，不代表玩家间延迟", "Round-trip latency from this member to the server, not between players"));
+            // Illustrated themes colour-code the member state with a pill.
+            let pill = match tone {
+                Tone::Accent => Some(art::Item::PillGreen),
+                Tone::Warn => Some(art::Item::PillBlue),
+                Tone::Danger => Some(art::Item::PillRed),
+                Tone::Neutral | Tone::Info => None,
+            };
+            if let Some(pill) = pill.filter(|_| theme::illustrated()) {
+                art::item(ui, pill, 20.0);
+            }
         });
     });
 }

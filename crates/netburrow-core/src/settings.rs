@@ -21,6 +21,33 @@ pub struct WindowPlacement {
 
 fn enabled_by_default() -> bool { true }
 
+/// UI appearance. Only non-default themes are written, so older builds can still read the file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    #[default]
+    Classic,
+    Paper,
+    Pixel,
+    Cartoon,
+}
+
+impl Theme {
+    fn is_classic(&self) -> bool { *self == Theme::Classic }
+}
+
+/// A theme name from a newer build falls back to the default instead of rejecting the whole file.
+impl<'de> Deserialize<'de> for Theme {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match String::deserialize(deserializer)?.as_str() {
+            "paper" => Theme::Paper,
+            "pixel" => Theme::Pixel,
+            "cartoon" => Theme::Cartoon,
+            _ => Theme::Classic,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecentConnection {
     pub server: String,
@@ -56,6 +83,8 @@ pub struct Settings {
     pub start_minimized: bool,
     #[serde(default)]
     pub recent_connections: Vec<RecentConnection>,
+    #[serde(default, skip_serializing_if = "Theme::is_classic")]
+    pub theme: Theme,
 }
 
 impl Default for Settings {
@@ -78,6 +107,7 @@ impl Default for Settings {
             window_placement: None,
             start_minimized: false,
             recent_connections: Vec::new(),
+            theme: Theme::Classic,
         }
     }
 }
@@ -223,6 +253,10 @@ pub fn save_language(language: crate::i18n::Language) -> Result<(), String> {
     update_preferences_in(&config_directory(), |settings| settings.language = language)
 }
 
+pub fn save_theme(theme: Theme) -> Result<(), String> {
+    update_preferences_in(&config_directory(), |settings| settings.theme = theme)
+}
+
 pub fn save_crash_capture(enabled: bool, consent: bool) -> Result<(), String> {
     save_crash_capture_in(&config_directory(), enabled, consent)
 }
@@ -304,6 +338,17 @@ pub fn autodetect_game() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn theme_stays_readable_across_versions() {
+        // Older builds reject unknown fields, so the default theme must not be written at all.
+        let classic = serde_json::to_string(&Settings::default()).unwrap();
+        assert!(!classic.contains("theme"));
+        let paper = Settings { theme: Theme::Paper, ..Settings::default() };
+        let saved = serde_json::to_string(&paper).unwrap();
+        assert_eq!(serde_json::from_str::<Settings>(&saved).unwrap().theme, Theme::Paper);
+        let future = saved.replace("\"paper\"", "\"neon\"");
+        assert_eq!(serde_json::from_str::<Settings>(&future).unwrap().theme, Theme::Classic);
+    }
     #[test]
     fn preference_save_preserves_connection_and_corrupt_file() {
         let dir = std::env::temp_dir().join(format!("netburrow-preferences-{}-{}", std::process::id(), new_group().unwrap()));

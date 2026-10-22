@@ -24,7 +24,7 @@ pub enum Action {
 
 pub fn inline(ui: &mut egui::Ui, action: Action) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(22.0), egui::Sense::hover());
-    draw(ui.painter(), rect, action, super::TEXT, super::BACKGROUND);
+    draw(ui.painter(), rect, action, super::pal().text, super::pal().background);
 }
 
 pub fn draw(
@@ -34,6 +34,21 @@ pub fn draw(
     color: egui::Color32,
     background: egui::Color32,
 ) {
+    // Illustrated themes draw the matching game item; copy, paste and arrows stay as line icons.
+    let item = match action {
+        Action::Settings => Some(super::art::Item::Gear),
+        Action::Power => Some(super::art::Item::Power),
+        Action::Search => Some(super::art::Item::Lens),
+        Action::Log => Some(super::art::Item::Scroll),
+        Action::Folder => Some(super::art::Item::Chest),
+        Action::Server => Some(super::art::Item::Rune),
+        Action::User => Some(super::art::Item::CardFace),
+        Action::Copy | Action::Paste | Action::Down => None,
+    };
+    if let Some(item) = item.filter(|_| super::theme::illustrated()) {
+        super::art::paint_item(p, rect.expand(rect.width() * 0.15), item, color.a() as f32 / 255.0);
+        return;
+    }
     let scale = rect.width() / 14.0;
     let stroke = Stroke::new(1.25 * scale, color);
     let at = |x, y| rect.min + Vec2::new(x, y) * scale;

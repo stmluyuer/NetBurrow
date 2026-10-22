@@ -153,10 +153,11 @@ impl NetBurrowApp {
             .resizable(false)
             .frame(
                 egui::Frame::new()
-                    .fill(BACKGROUND)
+                    .fill(pal().background)
                     .inner_margin(egui::Margin::symmetric(PAGE_MARGIN, 14)),
             )
             .show(ui, |ui| {
+                art::backdrop(ui);
                 ui.horizontal(|ui| {
                     if widgets::button(ui, widgets::Kind::Ghost, None, netburrow_core::text!("← 返回联机", "← Back"), Vec2::new(0.0, 32.0))
                         .clicked()
@@ -194,10 +195,11 @@ impl NetBurrowApp {
             .resizable(false)
             .frame(
                 egui::Frame::new()
-                    .fill(BACKGROUND)
+                    .fill(pal().background)
                     .inner_margin(egui::Margin::symmetric(PAGE_MARGIN, 12)),
             )
             .show(ui, |ui| {
+                art::backdrop(ui);
                 if let Some(destination) = self.view.leave_settings {
                     widgets::banner(ui, Tone::Warn, netburrow_core::text!("有未应用的更改", "Unapplied changes"), false);
                     ui.add_space(6.0);
@@ -217,7 +219,7 @@ impl NetBurrowApp {
                     });
                 } else if self.view.page == Page::Settings && self.game_dirty() {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(netburrow_core::text!("有未应用的更改", "Unapplied changes")).size(13.0).color(MUTED));
+                        ui.label(RichText::new(netburrow_core::text!("有未应用的更改", "Unapplied changes")).size(13.0).color(pal().muted));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let editable = self.connection_editable();
                         if ui
@@ -285,8 +287,9 @@ impl NetBurrowApp {
                 self.notice_ui(ui);
             });
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(BACKGROUND).inner_margin(PAGE_MARGIN))
+            .frame(egui::Frame::new().fill(pal().background).inner_margin(PAGE_MARGIN))
             .show(ui, |ui| {
+                art::backdrop(ui);
                 // Only the content fades on tab switches; the header and tabs stay put.
                 let tab = (self.view.page as u8, self.view.settings_tab as u8, self.view.diagnostic_tab as u8);
                 ui.multiply_opacity(widgets::appear(ui.ctx(), egui::Id::new("tab-fade"), tab, 0.18));
@@ -418,7 +421,7 @@ impl NetBurrowApp {
                 } else { self.set_crash_capture(enabled, self.settings.crash_capture_consent); }
             }
             if !(self.settings.auto_crash_capture || self.crash_capture.is_running()) {
-                ui.label(RichText::new(netburrow_core::text!("启用联机后自动开始记录", "Starts when you go online")).size(12.0).color(MUTED));
+                ui.label(RichText::new(netburrow_core::text!("启用联机后自动开始记录", "Starts when you go online")).size(12.0).color(pal().muted));
             } else {
                 ui.small(self.crash_capture.status.display_message())
                     .on_hover_text(&self.crash_capture.status.message);
@@ -481,13 +484,13 @@ impl NetBurrowApp {
             });
             let detail = self.last_snapshot.detail.trim();
             if self.client.is_some() && !detail.is_empty() {
-                ui.add(egui::Label::new(RichText::new(detail).size(13.0).color(MUTED)).wrap());
+                ui.add(egui::Label::new(RichText::new(detail).size(13.0).color(pal().muted)).wrap());
             }
             ui.add_space(8.0);
             if self.preflight_report.is_none() && self.preflight.is_none() {
                 ui.horizontal(|ui| {
-                    art::show(ui, art::Art::EmptyCheck, Vec2::new(72.0, 40.0), SUBTLE);
-                    ui.label(RichText::new(netburrow_core::text!("尚未检查", "Not checked yet")).size(13.0).color(MUTED));
+                    art::show(ui, art::Art::EmptyCheck, Vec2::new(72.0, 40.0), pal().subtle);
+                    ui.label(RichText::new(netburrow_core::text!("尚未检查", "Not checked yet")).size(13.0).color(pal().muted));
                 });
                 ui.add_space(4.0);
             }
@@ -506,7 +509,7 @@ impl NetBurrowApp {
         });
         widgets::section(ui, netburrow_core::text!("连接统计", "Statistics"), |ui| {
             if self.client.is_none() {
-                ui.label(RichText::new(netburrow_core::text!("以下可能包含上次运行记录", "May include data from the previous session")).size(12.0).color(MUTED));
+                ui.label(RichText::new(netburrow_core::text!("以下可能包含上次运行记录", "May include data from the previous session")).size(12.0).color(pal().muted));
                 ui.add_space(4.0);
             }
             let (quality, reason) =
@@ -521,16 +524,16 @@ impl NetBurrowApp {
                 ui.label(RichText::new(netburrow_core::text!("连接质量", "Quality")).size(14.0));
                 widgets::status_chip(ui, label, tone);
             });
-            ui.add(egui::Label::new(RichText::new(reason).size(12.0).color(MUTED)).wrap());
+            ui.add(egui::Label::new(RichText::new(reason).size(12.0).color(pal().muted)).wrap());
             ui.add_space(8.0);
             let snapshot = &self.last_snapshot;
             widgets::metrics(ui, &[
-                (netburrow_core::text!("发送 · 接收", "Sent · Received"), netburrow_core::text_format!("{} · {} 包", "{} · {} packets", snapshot.sent, snapshot.received)),
-                (netburrow_core::text!("UDP 发送 · 接收", "UDP sent · Received"), netburrow_core::text_format!("{} · {} 包", "{} · {} packets", snapshot.udp_sent, snapshot.udp_received)),
-                (netburrow_core::text!("断线", "Disconnects"), netburrow_core::text_format!("{} 次", "{}", snapshot.disconnects)),
-                (netburrow_core::text!("心跳超时", "Heartbeat timeouts"), netburrow_core::text_format!("{} 次", "{}", snapshot.heartbeat_timeouts)),
-                (netburrow_core::text!("原 Relay 会话恢复", "Relay session recoveries"), netburrow_core::text_format!("{} 次", "{}", snapshot.relay_recoveries)),
-                (netburrow_core::text!("本地游戏连接恢复", "Game connection recoveries"), netburrow_core::text_format!("{} 次", "{}", snapshot.ipc_recoveries)),
+                (art::Item::Coin, netburrow_core::text!("发送 · 接收", "Sent · Received"), netburrow_core::text_format!("{} · {} 包", "{} · {} packets", snapshot.sent, snapshot.received)),
+                (art::Item::SoulHeart, netburrow_core::text!("UDP 发送 · 接收", "UDP sent · Received"), netburrow_core::text_format!("{} · {} 包", "{} · {} packets", snapshot.udp_sent, snapshot.udp_received)),
+                (art::Item::Bomb, netburrow_core::text!("断线", "Disconnects"), netburrow_core::text_format!("{} 次", "{}", snapshot.disconnects)),
+                (art::Item::EmptyHeart, netburrow_core::text!("心跳超时", "Heartbeat timeouts"), netburrow_core::text_format!("{} 次", "{}", snapshot.heartbeat_timeouts)),
+                (art::Item::Key, netburrow_core::text!("原 Relay 会话恢复", "Relay session recoveries"), netburrow_core::text_format!("{} 次", "{}", snapshot.relay_recoveries)),
+                (art::Item::HalfHeart, netburrow_core::text!("本地游戏连接恢复", "Game connection recoveries"), netburrow_core::text_format!("{} 次", "{}", snapshot.ipc_recoveries)),
             ]);
             self.member_diagnostics_ui(ui);
         });
@@ -605,9 +608,9 @@ impl NetBurrowApp {
             });
         }
         let output = egui::Frame::new()
-            .fill(FIELD)
-            .stroke(egui::Stroke::new(1.0, DIVIDER))
-            .corner_radius(RADIUS_CARD)
+            .fill(pal().field)
+            .stroke(egui::Stroke::new(1.0, pal().divider))
+            .corner_radius(pal().card_radius)
             .inner_margin(egui::Margin::same(10))
             .show(ui, |ui| {
                 egui::ScrollArea::both()
@@ -638,15 +641,15 @@ impl NetBurrowApp {
         widgets::card(Tone::Neutral).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                art::show(ui, art::Art::Logo, Vec2::new(72.0, 58.0), TEXT);
+                art::show(ui, art::Art::Logo, Vec2::new(72.0, 58.0), pal().text);
                 ui.add_space(4.0);
                 ui.vertical(|ui| {
                     ui.label(RichText::new("NetBurrow").font(bold(22.0)));
-                    ui.label(RichText::new(&version).size(13.0).color(MUTED));
+                    ui.label(RichText::new(&version).size(13.0).color(pal().muted));
                     ui.label(
                         RichText::new(netburrow_core::text!("以撒的结合：忏悔+ 联机工具", "Multiplayer for The Binding of Isaac: Repentance+"))
                             .size(12.0)
-                            .color(MUTED),
+                            .color(pal().muted),
                     );
                 });
             });
@@ -691,7 +694,7 @@ impl NetBurrowApp {
                 }
                 if self.update_check.is_checking() {
                     ui.spinner();
-                    ui.label(RichText::new(netburrow_core::text!("正在检查…", "Checking…")).size(13.0).color(MUTED));
+                    ui.label(RichText::new(netburrow_core::text!("正在检查…", "Checking…")).size(13.0).color(pal().muted));
                 }
             });
             if let Some(result) = &self.update_check.result {
@@ -712,7 +715,7 @@ impl NetBurrowApp {
                             egui::ScrollArea::vertical().id_salt("update-notes").max_height(140.0).show(ui, |ui| {
                                 ui.add(egui::Label::new(&checked.release.notes).wrap());
                             });
-                            ui.add(egui::Label::new(RichText::new(netburrow_core::text!("退出游戏和 NetBurrow，将完整 ZIP 解压到新文件夹后启动。现有设置会保留。", "Close the game and NetBurrow, extract the full ZIP into a new folder, then launch it. Your settings are kept.")).small().color(MUTED)).wrap());
+                            ui.add(egui::Label::new(RichText::new(netburrow_core::text!("退出游戏和 NetBurrow，将完整 ZIP 解压到新文件夹后启动。现有设置会保留。", "Close the game and NetBurrow, extract the full ZIP into a new folder, then launch it. Your settings are kept.")).small().color(pal().muted)).wrap());
                         }
                     }
                     Err(error) => widgets::check_row(ui, widgets::Check::Fail, netburrow_core::text!("无法检查更新", "Could not check for updates"), error),

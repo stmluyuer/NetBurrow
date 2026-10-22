@@ -58,9 +58,9 @@ impl NetBurrowApp {
     pub(super) fn group_field(&mut self, ui: &mut egui::Ui) {
         let enabled = self.connection_editable();
         let field = egui::Frame::new()
-            .fill(FIELD)
-            .stroke(egui::Stroke::new(1.0, BORDER))
-            .corner_radius(RADIUS_CONTROL)
+            .fill(pal().field)
+            .stroke(egui::Stroke::new(1.0, pal().border))
+            .corner_radius(pal().control_radius)
             .inner_margin(egui::Margin::symmetric(12, 7))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());

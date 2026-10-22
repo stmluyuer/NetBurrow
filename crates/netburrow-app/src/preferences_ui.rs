@@ -13,7 +13,7 @@ impl NetBurrowApp {
         }
         ui.add_enabled_ui(enabled, |ui| {
             widgets::section(ui, netburrow_core::text!("游戏", "Game"), |ui| {
-                ui.label(RichText::new(netburrow_core::text!("游戏位置", "Game path")).size(13.0).color(MUTED));
+                ui.label(RichText::new(netburrow_core::text!("游戏位置", "Game path")).size(13.0).color(pal().muted));
                 ui.add_sized(
                     [ui.available_width(), 36.0],
                     egui::TextEdit::singleline(&mut draft.game_path)
@@ -60,7 +60,7 @@ impl NetBurrowApp {
                 }
             });
             widgets::section(ui, netburrow_core::text!("网络", "Network"), |ui| {
-                ui.label(RichText::new(netburrow_core::text!("传输方式", "Transport")).size(13.0).color(MUTED));
+                ui.label(RichText::new(netburrow_core::text!("传输方式", "Transport")).size(13.0).color(pal().muted));
                 widgets::segmented(ui, &mut draft.transport, &[
                     (Transport::Tcp, netburrow_core::text!("TCP（推荐）", "TCP (recommended)")),
                     (Transport::Udp, netburrow_core::text!("UDP 优先", "Prefer UDP")),
@@ -72,7 +72,7 @@ impl NetBurrowApp {
                         netburrow_core::text!("兼容性最好，适合大多数网络", "Most compatible; works on most networks")
                     })
                     .size(12.0)
-                    .color(MUTED),
+                    .color(pal().muted),
                 );
                 ui.add_space(8.0);
                 egui::CollapsingHeader::new(netburrow_core::text!("高级选项", "Advanced options"))
@@ -101,6 +101,37 @@ impl NetBurrowApp {
         });
     }
     pub(super) fn preferences_content(&mut self, ui: &mut egui::Ui) {
+        widgets::section(ui, netburrow_core::text!("外观", "Appearance"), |ui| {
+            let previous = self.settings.theme;
+            widgets::segmented(ui, &mut self.settings.theme, &[
+                (netburrow_core::Theme::Classic, netburrow_core::text!("默认", "Classic")),
+                (netburrow_core::Theme::Paper, netburrow_core::text!("纸片涂鸦", "Paper")),
+                (netburrow_core::Theme::Pixel, netburrow_core::text!("地下室像素", "Pixel")),
+                (netburrow_core::Theme::Cartoon, netburrow_core::text!("扁平卡通", "Cartoon")),
+            ]);
+            if self.settings.theme != previous {
+                let result = if self.smoke_test.is_some() {
+                    Ok(())
+                } else {
+                    netburrow_core::save_theme(self.settings.theme)
+                };
+                match result {
+                    Ok(()) => {
+                        self.saved_settings.theme = self.settings.theme;
+                        if let Some(draft) = &mut self.view.game_draft {
+                            draft.theme = self.settings.theme;
+                        }
+                        theme::set(ui.ctx(), self.settings.theme);
+                        self.notice = None;
+                    }
+                    Err(error) => {
+                        self.settings.theme = previous;
+                        self.notice = Some(error);
+                    }
+                }
+            }
+            ui.label(RichText::new(netburrow_core::text!("立即生效", "Applies immediately")).size(12.0).color(pal().muted));
+        });
         widgets::section(ui, netburrow_core::text!("语言", "Language"), |ui| {
             let previous_language = self.settings.language;
             widgets::segmented(ui, &mut self.settings.language, &[
@@ -127,7 +158,7 @@ impl NetBurrowApp {
                     }
                 }
             }
-            ui.label(RichText::new(netburrow_core::text!("重启后生效", "Applies after restart")).size(12.0).color(MUTED));
+            ui.label(RichText::new(netburrow_core::text!("重启后生效", "Applies after restart")).size(12.0).color(pal().muted));
         });
         widgets::section(ui, netburrow_core::text!("启动", "Startup"), |ui| {
             if widgets::switch_row(
@@ -164,7 +195,7 @@ impl NetBurrowApp {
             }
         });
         widgets::section(ui, netburrow_core::text!("窗口", "Window"), |ui| {
-            ui.label(RichText::new(netburrow_core::text!("关闭窗口时", "When closing the window")).size(13.0).color(MUTED));
+            ui.label(RichText::new(netburrow_core::text!("关闭窗口时", "When closing the window")).size(13.0).color(pal().muted));
             let before = self.settings.minimize_on_close;
             widgets::segmented(ui, &mut self.settings.minimize_on_close, &[
                 (false, netburrow_core::text!("退出并断开", "Quit and disconnect")),

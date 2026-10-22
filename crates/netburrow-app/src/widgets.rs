@@ -1,12 +1,12 @@
 //! Themed controls shared by every page. Each reports accessibility info like the egui widget it replaces.
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, Vec2};
 
+use super::art::{self, Item};
 use super::icons::{self, Action};
-use super::theme::*;
+use super::theme::{self, *};
 
 const HOVER_SECONDS: f32 = 0.12;
 const MOVE_SECONDS: f32 = 0.16;
-const SWITCH_OFF: Color32 = Color32::from_rgb(196, 189, 178);
 
 fn hover(ui: &egui::Ui, response: &egui::Response) -> f32 {
     ui.ctx().animate_bool_with_time(
@@ -59,18 +59,50 @@ pub fn pulse(context: &egui::Context, period: f32) -> f32 {
 }
 
 /// Raised card; a non-neutral tone tints it for status and confirmation content.
-pub fn card(tone: Tone) -> egui::Frame {
-    egui::Frame::new()
-        .fill(if tone == Tone::Neutral { CARD } else { tone.soft() })
-        .stroke(egui::Stroke::new(1.0, tone.border()))
-        .corner_radius(RADIUS_CARD)
-        .inner_margin(egui::Margin::same(14))
-        .shadow(egui::Shadow {
-            offset: [0, 1],
-            blur: 6,
-            spread: 0,
-            color: Color32::from_black_alpha(10),
+/// Its contents are drawn with the theme's card palette.
+pub struct Card {
+    frame: egui::Frame,
+}
+
+impl Card {
+    pub fn fill(mut self, fill: Color32) -> Self {
+        self.frame = self.frame.fill(fill);
+        self
+    }
+    /// Inked themes keep their outline colour; the width never drops below the theme's.
+    pub fn stroke(mut self, stroke: egui::Stroke) -> Self {
+        let palette = card_pal();
+        let color = if palette.ink_outline { palette.border } else { stroke.color };
+        self.frame = self.frame.stroke(egui::Stroke::new(stroke.width.max(palette.stroke), color));
+        self
+    }
+    pub fn inner_margin(mut self, margin: impl Into<egui::Margin>) -> Self {
+        self.frame = self.frame.inner_margin(margin);
+        self
+    }
+    pub fn show<R>(self, ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> egui::InnerResponse<R> {
+        theme::in_card(|| {
+            self.frame.show(ui, |ui| {
+                theme::card_visuals(ui);
+                add_contents(ui)
+            })
         })
+    }
+}
+
+pub fn card(tone: Tone) -> Card {
+    theme::in_card(|| {
+        let palette = pal();
+        let outline = if palette.ink_outline { palette.border } else { tone.border() };
+        Card {
+            frame: egui::Frame::new()
+                .fill(if tone == Tone::Neutral { palette.card } else { tone.soft() })
+                .stroke(egui::Stroke::new(palette.stroke, outline))
+                .corner_radius(palette.card_radius)
+                .inner_margin(egui::Margin::same(14))
+                .shadow(palette.card_shadow),
+        }
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -105,21 +137,39 @@ pub fn button(
         return response;
     }
     let t = hover(ui, &response);
+    let palette = pal();
+    let inked = palette.ink_outline && kind != Kind::Ghost;
     let (mut fill, stroke, text) = match kind {
-        Kind::Primary => (ACCENT.lerp_to_gamma(ACCENT_HOVER, t), Color32::TRANSPARENT, Color32::WHITE),
-        Kind::Secondary => (CARD.lerp_to_gamma(SURFACE, t), BORDER, TEXT),
-        Kind::Ghost => (Color32::TRANSPARENT.lerp_to_gamma(SURFACE, t), Color32::TRANSPARENT, ACCENT),
+        Kind::Primary => (
+            palette.accent.lerp_to_gamma(palette.accent_hover, t),
+            if inked { palette.border } else { Color32::TRANSPARENT },
+            palette.on_accent,
+        ),
+        Kind::Secondary => (palette.card.lerp_to_gamma(palette.surface, t), palette.border, palette.on_card),
+        Kind::Ghost => (Color32::TRANSPARENT.lerp_to_gamma(palette.surface, t), Color32::TRANSPARENT, palette.link),
     };
-    if response.is_pointer_button_down_on() {
-        fill = fill.lerp_to_gamma(TEXT, 0.08);
+    let pressed = response.is_pointer_button_down_on();
+    if pressed {
+        fill = fill.lerp_to_gamma(palette.text, 0.08);
     }
     let alpha = fade(response.enabled());
     let painter = ui.painter();
+    let mut rect = rect;
+    // Sticker and pixel buttons sit on a solid shadow and sink onto it while pressed.
+    if let Some((offset, shadow)) = palette.button_shadow.filter(|_| kind != Kind::Ghost) {
+        let offset = offset.min(Vec2::splat(rect.height() / 10.0));
+        rect = rect.translate(-offset);
+        if pressed {
+            rect = rect.translate(offset);
+        } else {
+            painter.rect_filled(rect.translate(offset), palette.control_radius, shadow.gamma_multiply(alpha));
+        }
+    }
     painter.rect(
         rect,
-        RADIUS_CONTROL,
+        palette.control_radius,
         fill.gamma_multiply(alpha),
-        egui::Stroke::new(1.0, stroke.gamma_multiply(alpha)),
+        egui::Stroke::new(if inked { palette.stroke } else { 1.0 }, stroke.gamma_multiply(alpha)),
         egui::StrokeKind::Inside,
     );
     let color = text.gamma_multiply(alpha);
@@ -146,14 +196,14 @@ pub fn icon_button(ui: &mut egui::Ui, action: Action, label: &str) -> egui::Resp
     });
     let t = hover(ui, &response);
     let painter = ui.painter();
-    painter.circle_filled(rect.center(), 16.0, SURFACE.gamma_multiply(t));
-    let color = if response.enabled() { MUTED.lerp_to_gamma(TEXT, t) } else { SUBTLE };
+    painter.circle_filled(rect.center(), 16.0, pal().surface.gamma_multiply(t));
+    let color = if response.enabled() { pal().muted.lerp_to_gamma(pal().text, t) } else { pal().subtle };
     icons::draw(
         painter,
         Rect::from_center_size(rect.center(), Vec2::splat(19.0)),
         action,
         color,
-        FIELD.lerp_to_gamma(SURFACE, t),
+        pal().field.lerp_to_gamma(pal().surface, t),
     );
     response.on_hover_text(label)
 }
@@ -161,14 +211,27 @@ pub fn icon_button(ui: &mut egui::Ui, action: Action, label: &str) -> egui::Resp
 fn paint_switch(ui: &egui::Ui, rect: Rect, response: &egui::Response, on: bool) {
     let t = ui.ctx().animate_bool_with_time(response.id.with("switch"), on, MOVE_SECONDS);
     let alpha = fade(response.enabled());
-    let track = SWITCH_OFF
-        .lerp_to_gamma(ACCENT, t)
-        .lerp_to_gamma(TEXT, 0.08 * hover(ui, response));
+    let palette = pal();
+    let track = palette.switch_off
+        .lerp_to_gamma(palette.accent, t)
+        .lerp_to_gamma(palette.text, 0.08 * hover(ui, response));
     let painter = ui.painter();
-    painter.rect_filled(rect, rect.height() / 2.0, track.gamma_multiply(alpha));
-    let radius = rect.height() / 2.0 - 3.0;
-    let x = egui::lerp(rect.left() + radius + 3.0..=rect.right() - radius - 3.0, t);
-    painter.circle_filled(Pos2::new(x, rect.center().y), radius, Color32::WHITE.gamma_multiply(alpha));
+    let square = palette.control_radius == egui::CornerRadius::ZERO;
+    let outline = if palette.ink_outline {
+        egui::Stroke::new(palette.stroke.min(2.0), palette.border.gamma_multiply(alpha))
+    } else {
+        egui::Stroke::NONE
+    };
+    let rounding = if square { 0.0 } else { rect.height() / 2.0 };
+    painter.rect(rect, rounding, track.gamma_multiply(alpha), outline, egui::StrokeKind::Inside);
+    let radius = rect.height() / 2.0 - if palette.ink_outline { 4.0 } else { 3.0 };
+    let x = egui::lerp(rect.left() + radius + 4.0..=rect.right() - radius - 4.0, t);
+    let knob = Color32::WHITE.lerp_to_gamma(palette.card, 0.3).gamma_multiply(alpha);
+    if square {
+        painter.rect_filled(Rect::from_center_size(Pos2::new(x, rect.center().y), Vec2::splat(radius * 2.0)), 0.0, knob);
+    } else {
+        painter.circle(Pos2::new(x, rect.center().y), radius, knob, outline);
+    }
 }
 
 /// Animated on/off switch.
@@ -204,7 +267,7 @@ pub fn toggle(ui: &mut egui::Ui, value: &mut bool, label: &str) -> egui::Respons
     ui.painter().galley(
         Pos2::new(track.right() + 8.0, rect.center().y - galley.size().y / 2.0),
         galley,
-        TEXT.gamma_multiply(fade(response.enabled())),
+        pal().text.gamma_multiply(fade(response.enabled())),
     );
     response
 }
@@ -221,7 +284,7 @@ pub fn switch_row(ui: &mut egui::Ui, value: &mut bool, title: &str, description:
                 ui.set_min_width(width);
                 ui.label(RichText::new(title).font(bold(15.0)));
                 if !description.is_empty() {
-                    ui.add(egui::Label::new(RichText::new(description).size(12.0).color(MUTED)).wrap());
+                    ui.add(egui::Label::new(RichText::new(description).size(12.0).color(pal().muted)).wrap());
                 }
             },
         );
@@ -252,7 +315,7 @@ pub fn segmented<T: Copy + PartialEq>(ui: &mut egui::Ui, value: &mut T, options:
     let id = ui.id().with(("segmented", options.iter().map(|(_, label)| *label).collect::<Vec<_>>()));
     let enabled = ui.is_enabled();
     let painter = ui.painter().clone();
-    painter.rect_filled(rect, RADIUS_CONTROL + 1, SURFACE);
+    painter.rect_filled(rect, pal().control_radius, pal().surface);
 
     let mut segments = Vec::with_capacity(options.len());
     let mut x = rect.left() + INSET;
@@ -270,9 +333,12 @@ pub fn segmented<T: Copy + PartialEq>(ui: &mut egui::Ui, value: &mut T, options:
         let pill = Rect::from_min_size(Pos2::new(left, target.top()), Vec2::new(width, target.height()));
         painter.add(
             egui::Shadow { offset: [0, 1], blur: 3, spread: 0, color: Color32::from_black_alpha(18) }
-                .as_shape(pill, RADIUS_CONTROL),
+                .as_shape(pill, pal().control_radius),
         );
-        painter.rect_filled(pill, RADIUS_CONTROL, CARD);
+        painter.rect_filled(pill, pal().control_radius, pal().card);
+        if pal().ink_outline {
+            painter.rect_stroke(pill, pal().control_radius, egui::Stroke::new(1.5, pal().border), egui::StrokeKind::Inside);
+        }
     }
 
     let mut changed = false;
@@ -287,7 +353,7 @@ pub fn segmented<T: Copy + PartialEq>(ui: &mut egui::Ui, value: &mut T, options:
             *value = *option;
             changed = true;
         }
-        let color = if selected { TEXT } else { MUTED.lerp_to_gamma(TEXT, hover(ui, &response)) };
+        let color = if selected { pal().on_card } else { pal().muted.lerp_to_gamma(pal().text, hover(ui, &response)) };
         painter.galley(
             segment.center() - galley.size() / 2.0,
             galley,
@@ -311,23 +377,28 @@ pub fn section<R>(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut
     inner
 }
 
-/// Grid of number tiles (muted label over a bold value), two per row.
-pub fn metrics(ui: &mut egui::Ui, items: &[(&str, String)]) {
+/// Grid of number tiles (muted label over a bold value), two per row; illustrated themes add the item.
+pub fn metrics(ui: &mut egui::Ui, items: &[(Item, &str, String)]) {
     const GAP: f32 = 8.0;
     let width = ((ui.available_width() - GAP) / 2.0).floor();
     for row in items.chunks(2) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = GAP;
-            for (label, value) in row {
+            for (item, label, value) in row {
                 egui::Frame::new()
-                    .fill(SURFACE)
-                    .corner_radius(RADIUS_CONTROL)
+                    .fill(pal().surface)
+                    .corner_radius(pal().control_radius)
                     .inner_margin(egui::Margin::symmetric(12, 8))
                     .show(ui, |ui| {
                         ui.set_width(width - 24.0);
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(*label).size(12.0).color(MUTED));
-                            ui.label(RichText::new(value).font(bold(17.0)));
+                        ui.horizontal(|ui| {
+                            if theme::illustrated() {
+                                art::item(ui, *item, 30.0);
+                            }
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(*label).size(12.0).color(pal().muted));
+                                ui.label(RichText::new(value).font(bold(17.0)));
+                            });
                         });
                     });
             }
@@ -354,6 +425,16 @@ pub fn check_icon(ui: &mut egui::Ui, check: Check) -> egui::Response {
     };
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(20.0), egui::Sense::hover());
     let painter = ui.painter();
+    if theme::illustrated() {
+        let item = match check {
+            Check::Pass => Item::Heart,
+            Check::Info => Item::SoulHeart,
+            Check::Warn => Item::HalfHeart,
+            Check::Fail => Item::Splat,
+        };
+        art::paint_item(painter, rect.expand(2.0), item, 1.0);
+        return response;
+    }
     let c = rect.center();
     painter.circle_filled(c, 10.0, tone.soft());
     let stroke = egui::Stroke::new(1.8, tone.fg());
@@ -385,7 +466,7 @@ pub fn check_row(ui: &mut egui::Ui, check: Check, title: &str, detail: &str) {
         ui.vertical(|ui| {
             ui.label(RichText::new(title).size(14.0));
             if !detail.is_empty() {
-                ui.add(egui::Label::new(RichText::new(detail).size(12.0).color(MUTED)).wrap());
+                ui.add(egui::Label::new(RichText::new(detail).size(12.0).color(pal().muted)).wrap());
             }
         });
     });
@@ -402,7 +483,9 @@ pub fn status_chip(ui: &mut egui::Ui, text: &str, tone: Tone) -> egui::Response 
         egui::Sense::hover(),
     );
     let painter = ui.painter();
-    painter.rect_filled(rect, 12, tone.soft());
+    let square = pal().control_radius == egui::CornerRadius::ZERO;
+    let outline = if pal().ink_outline { egui::Stroke::new(1.5, tone.fg()) } else { egui::Stroke::NONE };
+    painter.rect(rect, if square { 0 } else { 12 }, tone.soft(), outline, egui::StrokeKind::Inside);
     painter.circle_filled(Pos2::new(rect.left() + 12.0, rect.center().y), 3.5, tone.fg());
     painter.galley(
         Pos2::new(rect.left() + 20.0, rect.center().y - galley.size().y / 2.0),
@@ -412,15 +495,19 @@ pub fn status_chip(ui: &mut egui::Ui, text: &str, tone: Tone) -> egui::Response 
     response
 }
 
-/// Member initial in a tinted circle; `seed` keeps each member's tint stable.
+/// Member initial in a tinted circle, or a trinket in illustrated themes; `seed` keeps each choice stable.
 pub fn avatar(ui: &mut egui::Ui, name: &str, seed: u64) -> egui::Response {
+    const TRINKETS: [Item; 6] = [Item::Tooth, Item::Nail, Item::Pin, Item::Key, Item::Coin, Item::Rune];
+    if theme::illustrated() {
+        return art::item(ui, TRINKETS[(seed % TRINKETS.len() as u64) as usize], 32.0);
+    }
     const TONES: [Tone; 4] = [Tone::Accent, Tone::Warn, Tone::Info, Tone::Neutral];
     let tone = TONES[(seed % TONES.len() as u64) as usize];
     let initial: String = name.chars().next().into_iter().flat_map(char::to_uppercase).collect();
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(32.0), egui::Sense::hover());
     let painter = ui.painter();
     painter.circle_filled(rect.center(), 16.0, tone.soft());
-    let ink = if tone == Tone::Neutral { TEXT } else { tone.fg() };
+    let ink = if tone == Tone::Neutral { pal().text } else { tone.fg() };
     painter.text(rect.center(), egui::Align2::CENTER_CENTER, initial, bold(14.0), ink);
     response
 }
@@ -453,10 +540,10 @@ pub fn sparkline(ui: &mut egui::Ui, samples: &[u64], size: Vec2, color: Color32)
 /// Inline message on a tinted surface. Returns true when its dismiss button was clicked.
 pub fn banner(ui: &mut egui::Ui, tone: Tone, text: &str, dismissible: bool) -> bool {
     let mut dismissed = false;
-    let color = if tone == Tone::Neutral { TEXT } else { tone.fg() };
+    let color = if tone == Tone::Neutral { pal().text } else { tone.fg() };
     egui::Frame::new()
         .fill(tone.soft())
-        .corner_radius(RADIUS_CONTROL)
+        .corner_radius(pal().control_radius)
         .inner_margin(egui::Margin::symmetric(12, 8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -478,10 +565,25 @@ pub fn banner(ui: &mut egui::Ui, tone: Tone, text: &str, dismissible: bool) -> b
                     },
                 );
                 dismissed = ui
-                    .add(egui::Button::new(RichText::new("×").size(15.0).color(MUTED)).frame(false))
+                    .add(egui::Button::new(RichText::new("×").size(15.0).color(pal().muted)).frame(false))
                     .on_hover_text(netburrow_core::text!("关闭提示", "Dismiss"))
                     .clicked();
             });
         });
     dismissed
+}
+
+/// Connection quality as three hearts, for illustrated themes.
+pub fn hearts(ui: &mut egui::Ui, quality: netburrow_core::Quality) {
+    use netburrow_core::Quality;
+    let row = match quality {
+        Quality::Pending => [Item::EmptyHeart; 3],
+        Quality::Normal => [Item::Heart; 3],
+        Quality::Unstable => [Item::Heart, Item::HalfHeart, Item::EmptyHeart],
+        Quality::Abnormal => [Item::HalfHeart, Item::EmptyHeart, Item::EmptyHeart],
+    };
+    ui.spacing_mut().item_spacing.x = 1.0;
+    for item in row {
+        art::item(ui, item, 18.0);
+    }
 }

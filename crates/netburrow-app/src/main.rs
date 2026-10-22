@@ -136,7 +136,11 @@ impl NetBurrowApp {
             settings.language = netburrow_core::i18n::Language::En;
         }
         netburrow_core::i18n::set_language(settings.language);
-        let chinese_font_available = configure_fonts(&context);
+        if let Some(name) = std::env::args().find_map(|arg| arg.strip_prefix("--preview-theme=").map(str::to_owned)).filter(|_| smoke_test) {
+            settings.theme = serde_json::from_value(serde_json::Value::String(name)).unwrap_or_default();
+        }
+        let chinese_font_available = theme::init_fonts();
+        theme::set(&context, settings.theme);
         let font_notice = if !chinese_font_available
             && settings.language == netburrow_core::i18n::Language::ZhCn
         {
@@ -459,38 +463,6 @@ fn system_font_directory() -> Option<std::path::PathBuf> {
 #[cfg(not(windows))]
 fn system_font_directory() -> Option<std::path::PathBuf> {
     None
-}
-
-/// Returns whether a Chinese font was loaded, so startup can avoid missing glyphs.
-fn configure_fonts(context: &egui::Context) -> bool {
-    let mut fonts = egui::FontDefinitions::default();
-    let mut regular = Vec::new();
-    let mut heavy = Vec::new();
-    let directory = system_font_directory();
-    let mut chinese_font_available = false;
-    for (name, file, is_bold) in [
-        ("latin", "segoeui.ttf", false),
-        ("cjk", "msyh.ttc", false),
-        ("cjk-fallback", "simsun.ttc", false),
-        ("latin-bold", "segoeuib.ttf", true),
-        ("cjk-bold", "msyhbd.ttc", true),
-    ] {
-        let Some(directory) = &directory else { break };
-        if name == "cjk-fallback" && chinese_font_available { continue; }
-        if let Ok(bytes) = std::fs::read(directory.join(file)) {
-            chinese_font_available |= name == "cjk" || name == "cjk-fallback";
-            fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_owned(bytes)));
-            if is_bold { heavy.push(name.to_owned()); } else { regular.push(name.to_owned()); }
-        }
-    }
-    let fallback = fonts.families[&egui::FontFamily::Proportional].clone();
-    regular.extend(fallback);
-    heavy.extend(regular.clone());
-    fonts.families.entry(egui::FontFamily::Monospace).or_default().extend(regular.clone());
-    fonts.families.insert(egui::FontFamily::Proportional, regular);
-    fonts.families.insert(egui::FontFamily::Name("ui-bold".into()), heavy);
-    context.set_fonts(fonts);
-    chinese_font_available
 }
 
 #[cfg(windows)]
