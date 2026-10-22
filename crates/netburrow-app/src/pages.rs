@@ -84,7 +84,13 @@ impl NetBurrowApp {
             return;
         }
         ui.add_space(8.0);
-        if widgets::banner(ui, Tone::Neutral, &message, true) {
+        let dismissed = ui
+            .scope(|ui| {
+                ui.multiply_opacity(widgets::appear(ui.ctx(), egui::Id::new("notice-fade"), &message, 0.25));
+                widgets::banner(ui, Tone::Neutral, &message, true)
+            })
+            .inner;
+        if dismissed {
             self.notice = None;
         }
     }
@@ -281,6 +287,9 @@ impl NetBurrowApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BACKGROUND).inner_margin(PAGE_MARGIN))
             .show(ui, |ui| {
+                // Only the content fades on tab switches; the header and tabs stay put.
+                let tab = (self.view.page as u8, self.view.settings_tab as u8, self.view.diagnostic_tab as u8);
+                ui.multiply_opacity(widgets::appear(ui.ctx(), egui::Id::new("tab-fade"), tab, 0.18));
                 if self.view.page == Page::Diagnostics
                     && self.view.diagnostic_tab == DiagnosticTab::Logs
                 {

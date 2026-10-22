@@ -2,6 +2,9 @@ use super::*;
 
 impl NetBurrowApp {
     pub(super) fn main_ui(&mut self, ui: &mut egui::Ui) {
+        // Each page fades in when you navigate to it.
+        let entered = widgets::appear(ui.ctx(), egui::Id::new("page-fade"), self.view.page as u8, 0.18);
+        ui.multiply_opacity(entered);
         if self.view.page != Page::Home {
             self.secondary_ui(ui);
             return;
@@ -149,7 +152,18 @@ impl NetBurrowApp {
                 .into()
             }
         };
-        let ink = if tone == Tone::Neutral { TEXT } else { tone.fg() };
+        // Colours ease between states; the illustration and title fade in when the state changes.
+        let context = ui.ctx().clone();
+        let id = egui::Id::new("status-card");
+        const TINT_SECONDS: f32 = 0.3;
+        let ink = widgets::animate_color(&context, id.with("ink"), if tone == Tone::Neutral { TEXT } else { tone.fg() }, TINT_SECONDS);
+        let detail_color = widgets::animate_color(&context, id.with("detail"), if tone == Tone::Neutral { MUTED } else { tone.fg() }, TINT_SECONDS);
+        let fill = widgets::animate_color(&context, id.with("fill"), if tone == Tone::Neutral { CARD } else { tone.soft() }, TINT_SECONDS);
+        let border = widgets::animate_color(&context, id.with("border"), tone.border(), TINT_SECONDS);
+        let entered = widgets::appear(&context, id.with("enter"), (illustration, title), 0.35);
+        // In-progress states breathe so the card reads as "working", not frozen.
+        let breathing = illustration == art::Art::Connecting;
+        let art_alpha = entered * if breathing { 0.65 + 0.35 * widgets::pulse(&context, 1.6) } else { 1.0 };
         let finished = self.client.as_ref().is_some_and(Client::is_finished);
         let missing_game = !Path::new(self.settings.game_path.trim()).is_file();
         let failed_check = self
@@ -158,20 +172,20 @@ impl NetBurrowApp {
             .is_some_and(|(_, report)| !report.can_start());
         let show_logs = active && matches!(phase, Phase::Connecting | Phase::RestartRequired | Phase::Failed);
 
-        widgets::card(tone).show(ui, |ui| {
+        widgets::card(tone).fill(fill).stroke(egui::Stroke::new(1.0, border)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                art::show(ui, illustration, Vec2::new(92.0, 76.0), ink);
+                art::show(ui, illustration, Vec2::new(92.0, 76.0), ink.gamma_multiply(art_alpha));
                 ui.add_space(6.0);
                 ui.vertical(|ui| {
                     ui.add_space(4.0);
-                    ui.label(RichText::new(title).font(bold(19.0)).color(ink));
+                    ui.label(RichText::new(title).font(bold(19.0)).color(ink.gamma_multiply(entered)));
                     if !detail.is_empty() {
                         ui.add(
                             egui::Label::new(
                                 RichText::new(&detail)
                                     .size(13.0)
-                                    .color(if tone == Tone::Neutral { MUTED } else { ink }),
+                                    .color(detail_color.gamma_multiply(entered)),
                             )
                             .wrap(),
                         );

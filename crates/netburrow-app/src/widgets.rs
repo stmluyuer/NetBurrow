@@ -20,6 +20,44 @@ fn fade(enabled: bool) -> f32 {
     if enabled { 1.0 } else { 0.45 }
 }
 
+/// Eases a colour toward `target`, one channel at a time; egui repaints only while it moves.
+pub fn animate_color(context: &egui::Context, id: egui::Id, target: Color32, seconds: f32) -> Color32 {
+    let channel = |index: usize, value: u8| {
+        context
+            .animate_value_with_time(id.with(index), value as f32, seconds)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    let [r, g, b, a] = target.to_array();
+    Color32::from_rgba_premultiplied(channel(0, r), channel(1, g), channel(2, b), channel(3, a))
+}
+
+/// Rises from 0 to 1 over `seconds` each time `key` changes under `id`, for fade-ins.
+pub fn appear(context: &egui::Context, id: egui::Id, key: impl std::hash::Hash + std::fmt::Debug, seconds: f32) -> f32 {
+    let key = egui::Id::new(key);
+    let now = context.input(|input| input.time);
+    let since = context.data_mut(|data| {
+        let entry = data.get_temp_mut_or_insert_with(id, || (key, now));
+        if entry.0 != key {
+            *entry = (key, now);
+        }
+        entry.1
+    });
+    let t = ((now - since) as f32 / seconds).clamp(0.0, 1.0);
+    if t < 1.0 {
+        context.request_repaint();
+    }
+    // Ease-out so content settles rather than stops abruptly.
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// Gentle 0..1 breathing value for in-progress states; asks for ~30 fps repaints while used.
+pub fn pulse(context: &egui::Context, period: f32) -> f32 {
+    context.request_repaint_after(std::time::Duration::from_millis(33));
+    let phase = context.input(|input| input.time) as f32 / period;
+    0.5 - 0.5 * (phase * std::f32::consts::TAU).cos()
+}
+
 /// Raised card; a non-neutral tone tints it for status and confirmation content.
 pub fn card(tone: Tone) -> egui::Frame {
     egui::Frame::new()
