@@ -2,7 +2,7 @@
 
 给《以撒的结合：忏悔+》用的 Windows 联机工具，通过 Relay 服务器中转游戏数据。
 
-[下载客户端](https://github.com/stmluyuer/NetBurrow-Releases) · [更新日志](CHANGELOG.md) · [部署服务器](docs/server-ai-handoff.md) · [项目架构](docs/architecture.md)
+[下载客户端](https://github.com/stmluyuer/NetBurrow/releases/latest) · [更新日志](CHANGELOG.md) · [问题反馈](https://github.com/stmluyuer/NetBurrow/issues) · [部署服务器](docs/server-ai-handoff.md) · [项目架构](docs/architecture.md)
 
 ## 开始使用
 
@@ -77,15 +77,19 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1
 <details>
 <summary>发布客户端更新</summary>
 
-客户端从独立的 [NetBurrow-Releases](https://github.com/stmluyuer/NetBurrow-Releases) 仓库检查更新。准备非空的 UTF-8 更新说明（最多 12000 个字符），执行：
+从 0.2.6 起，源码、[客户端下载](https://github.com/stmluyuer/NetBurrow/releases)和问题反馈统一在本仓库，客户端也从本仓库检查更新。准备非空的 UTF-8 更新说明（最多 12000 个字符），执行：
 
 ```powershell
 .\打包客户端.ps1 -ReleaseNotesPath .\更新说明.txt
 ```
 
-在发行仓库创建 `v<版本>` 的 Draft Release，上传脚本提示的客户端 ZIP 和 `.local\dist\updates\<版本>\latest.json`。核对标签、清单和程序版本后再发布并标记 Latest，注明对应的源码提交；不要把测试包设为最新正式版。
+在本仓库创建 `v<版本>` 的 Draft Release，标签指向实际构建的源码提交，上传脚本提示的客户端 ZIP 和 `.local\dist\updates\<版本>\latest.json`。核对标签、清单和程序版本后再发布并标记 Latest，注明对应的源码提交；不要把测试包设为最新正式版。
 
-发布后，确认未登录也能下载[更新清单](https://github.com/stmluyuer/NetBurrow-Releases/releases/latest/download/latest.json)和 ZIP，再用旧客户端检查。若需要同步更新 Relay，须在更新说明中写明。当前客户端不校验 ZIP 签名，也不检查 Relay 协议兼容性；分支项目自行发行时需要修改客户端更新地址。
+也可使用本仓库 Actions 中的 **Publish Windows client**：先更新 `Cargo.toml`、`Cargo.lock` 和本文件对应的 `CHANGELOG.md` 版本段，再运行工作流。合入主分支的版本号改动会自动触发同一流程；它运行更新检查的现有测试、构建 x64 客户端及 x86 接入组件，校验包内容后才发布正式版。已发布版本不会被覆盖；失败后可在 Actions 中重跑。
+
+发布后，确认未登录也能下载[更新清单](https://github.com/stmluyuer/NetBurrow/releases/latest/download/latest.json)和 ZIP，再用客户端检查。若需要同步更新 Relay，须在更新说明中写明。当前客户端不校验 ZIP 签名，也不检查 Relay 协议兼容性；分支项目自行发行时需要修改客户端更新地址。
+
+**旧版升级过渡：** [NetBurrow-Releases](https://github.com/stmluyuer/NetBurrow-Releases) 保留历史版本及 0.2.6 的 ZIP 和更新清单。0.2.5 及更早版本的检查与下载地址固定在旧仓库，必须保留同名完整 ZIP，不能只在清单中放一个新链接。旧版升级到 0.2.6 后便使用本仓库，旧仓库不再承担后续正式版本发布。历史迁移标签只用于保留下载入口，不代表原包的准确构建源码，详见对应发行说明。
 
 </details>
 

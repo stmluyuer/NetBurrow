@@ -5,9 +5,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const REPOSITORY: &str = "https://github.com/stmluyuer/NetBurrow-Releases";
-pub const RELEASES: &str = "https://github.com/stmluyuer/NetBurrow-Releases/releases";
-pub const ISSUES: &str = "https://github.com/stmluyuer/NetBurrow-Releases/issues/new";
+pub const REPOSITORY: &str = "https://github.com/stmluyuer/NetBurrow";
+pub const RELEASES: &str = "https://github.com/stmluyuer/NetBurrow/releases";
+pub const ISSUES: &str = "https://github.com/stmluyuer/NetBurrow/issues/new";
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_NOTES_CHARS: usize = 12_000;
 const REQUEST_BUDGET: Duration = Duration::from_secs(20);
@@ -169,7 +169,7 @@ fn read_body(
 
 #[cfg(windows)]
 fn download_manifest() -> Result<Vec<u8>, String> {
-    windows::download("/stmluyuer/NetBurrow-Releases/releases/latest/download/latest.json")
+    windows::download("/stmluyuer/NetBurrow/releases/latest/download/latest.json")
 }
 
 #[cfg(not(windows))]

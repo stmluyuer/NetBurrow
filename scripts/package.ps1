@@ -136,7 +136,7 @@ function Write-UpdateManifest {
     $updateManifestPath = Join-Path $updateDirectory 'latest.json'
     [IO.File]::WriteAllText($updateManifestPath, $releaseManifestJson, [Text.UTF8Encoding]::new($false))
     Write-Output "已生成：$updateManifestPath"
-    Write-Output '公开发行仓库：https://github.com/stmluyuer/NetBurrow-Releases'
+    Write-Output '公开发行仓库：https://github.com/stmluyuer/NetBurrow/releases'
     Write-Output "创建标签 v$Version 的 Draft Release，仅上传以下两个文件，确认附件齐全后发布为 Latest："
     Write-Output "  $appZip"
     Write-Output "  $updateManifestPath"

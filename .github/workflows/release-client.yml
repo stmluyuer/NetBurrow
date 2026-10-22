@@ -1,0 +1,50 @@
+name: Publish Windows client
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - .github/workflows/release-client.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-windows-client
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Migrate historical releases without changing assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/github-release.py copy --source stmluyuer/NetBurrow-Releases --tags v0.1.21 v0.2.4 v0.2.5 --historical
+      - name: Prepare Rust Windows targets
+        run: |
+          rustup update stable --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup target add x86_64-pc-windows-msvc i686-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Check existing update parsing and download-link tests
+        run: cargo test --locked --target x86_64-pc-windows-msvc -p netburrow-app update_check::tests
+      - name: Prepare release notes
+        run: python scripts/github-release.py notes
+      - name: Build and package the Windows client
+        run: ./scripts/package.ps1 -ClientOnly -KeepVersion -ReleaseNotesPath .local/release-notes.txt
+      - name: Publish verified complete release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/github-release.py publish
