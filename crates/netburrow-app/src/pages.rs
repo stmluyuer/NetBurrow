@@ -456,6 +456,25 @@ impl NetBurrowApp {
             self.notice = Some(netburrow_core::text_format!("无法打开文件夹：{error}", "Could not open folder: {error}"));
         }
     }
+    /// Writes the embedded license texts next to the settings and opens them in Notepad.
+    fn open_licenses(&mut self) {
+        let directory = netburrow_core::config_directory();
+        let path = directory.join("licenses.txt");
+        let result = (|| -> std::io::Result<()> {
+            let mut text = Vec::new();
+            std::io::Read::read_to_end(
+                &mut flate2::read::DeflateDecoder::new(&include_bytes!(concat!(env!("OUT_DIR"), "/licenses.deflate"))[..]),
+                &mut text,
+            )?;
+            std::fs::create_dir_all(&directory)?;
+            std::fs::write(&path, text)?;
+            std::process::Command::new("notepad.exe").arg(&path).spawn()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.notice = Some(netburrow_core::text_format!("无法打开许可文本：{error}", "Could not open license texts: {error}"));
+        }
+    }
     fn open_log_folder(&mut self) {
         let path = netburrow_core::diagnostics::directory();
         match std::fs::create_dir_all(&path) {
@@ -720,6 +739,23 @@ impl NetBurrowApp {
                     }
                     Err(error) => widgets::check_row(ui, widgets::Check::Fail, netburrow_core::text!("无法检查更新", "Could not check for updates"), error),
                 }
+            }
+        });
+        widgets::section(ui, netburrow_core::text!("开源许可", "Open source licenses"), |ui| {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(netburrow_core::text!(
+                        "NetBurrow 采用 MIT 许可。第三方依赖与内置字体的版权声明和许可原文随程序附带。",
+                        "NetBurrow is MIT licensed. Copyright notices and license texts for third-party dependencies and bundled fonts ship with the app."
+                    ))
+                    .size(13.0)
+                    .color(pal().muted),
+                )
+                .wrap(),
+            );
+            ui.add_space(6.0);
+            if widgets::button(ui, widgets::Kind::Secondary, Some(icons::Action::Log), netburrow_core::text!("查看许可文本", "View license texts"), Vec2::new(0.0, 30.0)).clicked() {
+                self.open_licenses();
             }
         });
         widgets::section(ui, netburrow_core::text!("链接", "Links"), |ui| {

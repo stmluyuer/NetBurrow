@@ -9,7 +9,7 @@
 需要 **64 位 Windows** 和 **32 位 `isaac-ng.exe`**。同一局的朋友都要开启 NetBurrow，使用相同的服务器地址和完整组码。
 
 1. 向管理员取得 Relay 地址和已授权的组码。自建服务器请先看[部署说明](docs/server-ai-handoff.md)；地址格式为 `主机名或IP:端口`，默认端口是 `24872`，TCP 和 UDP 共用该端口。
-2. 下载并完整解压 `NetBurrow-<版本>-win-x64.zip`。把 `NetBurrow.exe`、`netburrow-injector.exe`、`netburrow_hook.dll` 留在同一文件夹，保留随包的许可文件，不要混用不同版本。
+2. 下载并完整解压 `NetBurrow-<版本>-win-x64.zip`。把 `NetBurrow.exe`、`netburrow-injector.exe`、`netburrow_hook.dll` 留在同一文件夹，不要混用不同版本。开源许可原文内置在程序中，可在“设置 → 关于 → 开源许可”查看。
 3. 打开 `NetBurrow.exe`，填写服务器地址和组码，确认游戏路径指向实际的 `isaac-ng.exe`。传输方式先用默认的 TCP。
 4. 点击“连接”，出现“等待游戏”后，从 Steam 启动游戏，邀请朋友并开局。
 
@@ -72,7 +72,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1
 
 产物在 `.local\dist`。默认将版本末位加 1；可用 `-Version` 指定版本，重复打包或失败后重试用 `-KeepVersion`。保留版本会覆盖同版本 ZIP，已经分发的包有变化时应使用新版本。工具链和依赖缓存齐全时，`scripts\package.ps1` 可加 `-Offline`。
 
-打包需要根目录的 `LICENSE` 和 `THIRD_PARTY_LICENSES.txt`，这两个文件也会放进 ZIP。
+打包需要根目录的 `LICENSE` 和 `THIRD_PARTY_LICENSES.txt`：客户端构建时把两者压缩内置到 `NetBurrow.exe`（“关于”页可查看），客户端 ZIP 只含运行文件；Relay 源码包仍附带这两个文件。
 
 <details>
 <summary>发布客户端更新</summary>

@@ -221,9 +221,7 @@ New-Item -ItemType Directory -Force -Path $appStage | Out-Null
 Copy-Item -LiteralPath $appBinary -Destination (Join-Path $appStage 'NetBurrow.exe') -Force
 Copy-Item -LiteralPath $injectorBinary -Destination (Join-Path $appStage 'netburrow-injector.exe') -Force
 Copy-Item -LiteralPath $hookDll -Destination (Join-Path $appStage 'netburrow_hook.dll') -Force
-foreach ($name in $licenseFiles) {
-    Copy-Item -LiteralPath (Join-Path $repoRoot $name) -Destination (Join-Path $appStage $name) -Force
-}
+# The client embeds LICENSE and THIRD_PARTY_LICENSES.txt (About -> Open source licenses), so the zip holds only runtime files.
 Get-ChildItem -LiteralPath $appStage -File -Recurse | Where-Object { $_.LastWriteTime.Year -lt 1980 -or $_.LastWriteTime.Year -gt 2107 } | ForEach-Object { $_.LastWriteTime = Get-Date }
 Write-PortableZip -Source $appStage -Destination $appZip
 Write-Output "已生成：$appZip"

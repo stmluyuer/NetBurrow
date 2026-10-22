@@ -17,5 +17,8 @@ eframe = { version = "=0.35.0", default-features = false, features = ["default_f
 zip = { version = "=8.2.0", default-features = false, features = ["deflate-flate2"] }
 flate2 = { version = "=1.1.9", default-features = false, features = ["rust_backend"] }
 
+[build-dependencies]
+flate2 = { version = "=1.1.9", default-features = false, features = ["rust_backend"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_UI_Controls_Dialogs", "Win32_Networking_WinHttp"] }
