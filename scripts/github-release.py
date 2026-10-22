@@ -11,11 +11,24 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import time
 import tomllib
 from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 import zipfile
+
+
+def request_bytes(request):
+    for attempt in range(3):
+        try:
+            with urlopen(request, timeout=120) as response:
+                return response.read()
+        except HTTPError as error:
+            # Retry reads only; a failed write may already have reached GitHub.
+            if request.get_method() != "GET" or error.code not in {429, 502, 503, 504} or attempt == 2:
+                raise
+            time.sleep(2 * (attempt + 1))
 
 
 def api(path, method="GET", value=None, content_type="application/json"):
@@ -29,15 +42,13 @@ def api(path, method="GET", value=None, content_type="application/json"):
     host = "https://uploads.github.com" if path.startswith("/upload/") else "https://api.github.com"
     if path.startswith("/upload/"):
         path = path.removeprefix("/upload")
-    with urlopen(Request(host + path, data=data, headers=headers, method=method), timeout=120) as response:
-        body = response.read()
-        return json.loads(body) if body else None
+    body = request_bytes(Request(host + path, data=data, headers=headers, method=method))
+    return json.loads(body) if body else None
 
 
 def public_bytes(url):
     # Never send the repository token to public asset download redirects.
-    with urlopen(Request(url, headers={"User-Agent": "NetBurrow-release"}), timeout=120) as response:
-        return response.read()
+    return request_bytes(Request(url, headers={"User-Agent": "NetBurrow-release"}))
 
 
 def digest(data):

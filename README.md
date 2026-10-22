@@ -85,7 +85,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1
 
 在本仓库创建 `v<版本>` 的 Draft Release，标签指向实际构建的源码提交，上传脚本提示的客户端 ZIP 和 `.local\dist\updates\<版本>\latest.json`。核对标签、清单和程序版本后再发布并标记 Latest，注明对应的源码提交；不要把测试包设为最新正式版。
 
-也可使用本仓库 Actions 中的 **Publish Windows client**：先更新 `Cargo.toml`、`Cargo.lock` 和本文件对应的 `CHANGELOG.md` 版本段，再运行工作流。合入主分支的版本号改动会自动触发同一流程；它运行更新检查的现有测试、构建 x64 客户端及 x86 接入组件，校验包内容后才发布正式版。已发布版本不会被覆盖；失败后可在 Actions 中重跑。
+也可使用本仓库 Actions 中的 **Publish Windows client**：先更新 `Cargo.toml`、`Cargo.lock` 和 `CHANGELOG.md` 中的版本段，再运行工作流。合入主分支的版本号改动会自动触发同一流程；它运行更新检查的现有测试、构建 x64 客户端及 x86 接入组件，校验包内容后才发布正式版。已发布版本不会被覆盖；失败后可在 Actions 中重跑。
 
 发布后，确认未登录也能下载[更新清单](https://github.com/stmluyuer/NetBurrow/releases/latest/download/latest.json)和 ZIP，再用客户端检查。若需要同步更新 Relay，须在更新说明中写明。当前客户端不校验 ZIP 签名，也不检查 Relay 协议兼容性；分支项目自行发行时需要修改客户端更新地址。
 
