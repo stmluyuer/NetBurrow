@@ -16,6 +16,9 @@ mod preview;
 mod diagnostics_bundle;
 mod crash_capture;
 mod update_check;
+mod theme;
+mod art;
+mod widgets;
 use pages::{Page, SettingsTab, DiagnosticTab, ViewState};
 
 use std::path::Path;
@@ -23,16 +26,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, RichText, Vec2};
+use eframe::egui::{self, RichText, Vec2};
 use netburrow_core::{Client, Phase, Settings, SingleInstance, Snapshot, Transport};
+use theme::*;
 
 const WINDOW_TITLE: &str = "NetBurrow";
-const BACKGROUND: Color32 = Color32::from_rgb(246, 243, 237);
-const SURFACE: Color32 = Color32::from_rgb(237, 233, 224);
-const BORDER: Color32 = Color32::from_rgb(216, 210, 200);
-const TEXT: Color32 = Color32::from_rgb(52, 49, 45);
-const MUTED: Color32 = Color32::from_rgb(117, 111, 102);
-const ACCENT: Color32 = Color32::from_rgb(92, 114, 90);
 
 fn main() {
     let smoke_test = std::env::args().any(|argument| argument == "--smoke-test");
@@ -338,135 +336,23 @@ impl NetBurrowApp {
     }
 
     fn current_phase(&self) -> Phase {
-        self.client
-            .as_ref()
-            .map_or(Phase::Stopped, |_| self.last_snapshot.phase)
+        self.client.as_ref().map_or(
+            self.view.preview_phase.unwrap_or(Phase::Stopped),
+            |_| self.last_snapshot.phase,
+        )
     }
 
-    fn status_label(&self) -> (&'static str, Color32) {
+    fn status_label(&self) -> (&'static str, Tone) {
         match self.current_phase() {
-            Phase::Stopped => (netburrow_core::text!("未连接", "Disconnected"), Color32::GRAY),
-            Phase::Connecting => (netburrow_core::text!("连接中", "Connecting"), Color32::from_rgb(151, 103, 37)),
-            Phase::WaitingForGame => (netburrow_core::text!("等待游戏", "Waiting for game"), Color32::from_rgb(59, 108, 139)),
-            Phase::Attaching => (netburrow_core::text!("接入中", "Attaching"), Color32::from_rgb(151, 103, 37)),
-            Phase::Ready => (netburrow_core::text!("已就绪", "Ready"), Color32::from_rgb(92, 114, 90)),
-            Phase::RestartRequired => (netburrow_core::text!("需重开游戏", "Restart game"), Color32::from_rgb(158, 97, 39)),
-            Phase::Failed => (netburrow_core::text!("连接失败", "Connection failed"), Color32::from_rgb(174, 65, 60)),
+            Phase::Stopped => (netburrow_core::text!("未启用", "Offline"), Tone::Neutral),
+            Phase::Connecting => (netburrow_core::text!("连接中", "Connecting"), Tone::Warn),
+            Phase::WaitingForGame => (netburrow_core::text!("等待游戏", "Waiting for game"), Tone::Info),
+            Phase::Attaching => (netburrow_core::text!("接入中", "Attaching"), Tone::Warn),
+            Phase::Ready => (netburrow_core::text!("已就绪", "Ready"), Tone::Accent),
+            Phase::RestartRequired => (netburrow_core::text!("需重开游戏", "Restart game"), Tone::Warn),
+            Phase::Failed => (netburrow_core::text!("连接失败", "Connection failed"), Tone::Danger),
         }
     }
-
-    fn activity_ui(&mut self, ui: &mut egui::Ui) {
-        let show_members = self.client.is_some()
-            || (self.smoke_test.is_some() && !self.last_snapshot.peers.is_empty());
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(netburrow_core::text!("成员", "Members")).font(bold(20.0)));
-            ui.label(RichText::new((if show_members { self.last_snapshot.peers.len() } else { 0 }).to_string()).color(MUTED));
-        });
-        if !show_members || self.last_snapshot.peers.is_empty() {
-            ui.add_space(14.0);
-            ui.vertical_centered(|ui| {
-                icons::members_empty(ui);
-                ui.add_space(6.0);
-                ui.label(RichText::new(if self.client.is_some() {
-                    netburrow_core::text!("等待成员加入", "Waiting for members")
-                } else {
-                    netburrow_core::text!("暂无成员", "No members")
-                }).color(MUTED).size(12.0));
-            });
-            ui.add_space(14.0);
-        } else {
-            ui.add_space(4.0);
-            egui::ScrollArea::horizontal().id_salt("member-table-scroll").show(ui, |ui| {
-            egui::Grid::new("member-status-table")
-                .num_columns(4)
-                .min_col_width(0.0)
-                .spacing(Vec2::new(8.0, 8.0))
-                .striped(true)
-                .show(ui, |ui| {
-                    for title in [netburrow_core::text!("成员", "Member"), netburrow_core::text!("状态", "Status"), netburrow_core::text!("延迟", "Latency"), netburrow_core::text!("传输", "Transport")] {
-                        ui.label(RichText::new(title).size(12.0).color(MUTED));
-                    }
-                    ui.end_row();
-                    for peer in &self.last_snapshot.peers {
-                        let report = peer.status.as_ref();
-                        let name = report
-                            .filter(|r| !r.name.is_empty())
-                            .map(|r| r.name.clone())
-                            .unwrap_or_else(|| netburrow_core::text_format!("成员 {}", "Member {}", peer.client_id));
-                        let display = if peer.is_self {
-                            netburrow_core::text_format!("{name} · 本机", "{name} · You")
-                        } else {
-                            name.clone()
-                        };
-                        ui.add_sized(
-                            [134.0, 22.0],
-                            egui::Label::new(RichText::new(display).size(13.0)).truncate(),
-                        )
-                        .on_hover_text(netburrow_core::text_format!("{name}\n连接编号 #{}", "{name}\nConnection #{}", peer.client_id));
-                        let stale = report.is_some() && peer.status_is_stale();
-                        let (label, color) = if stale {
-                            (netburrow_core::text!("已过期", "Stale"), Color32::from_rgb(151, 103, 37))
-                        } else if let Some(report) = report {
-                            member_phase(report.phase)
-                        } else if peer.ready {
-                            (netburrow_core::text!("等待数据", "Pending"), MUTED)
-                        } else {
-                            (netburrow_core::text!("等待游戏", "Waiting for game"), MUTED)
-                        };
-                        ui.label(RichText::new(label).size(12.0).color(color));
-                        let ping = if stale {
-                            "—".to_owned()
-                        } else {
-                            report
-                                .and_then(|r| r.ping_ms)
-                                .map_or_else(|| "—".into(), |ms| format!("{ms} ms"))
-                        };
-                        ui.label(RichText::new(ping).size(13.0))
-                            .on_hover_text(netburrow_core::text!("成员到服务器的往返延迟，不代表玩家间延迟", "Round-trip latency from this member to the server, not between players"));
-                        let transport = if stale {
-                            "—"
-                        } else {
-                            match report.map(|r| r.transport) {
-                                Some(0) => "TCP",
-                                Some(1) => netburrow_core::text!("UDP 待连接", "UDP pending"),
-                                Some(2) => "UDP + TCP",
-                                _ => netburrow_core::text!("等待数据", "Pending"),
-                            }
-                        };
-                        ui.label(RichText::new(transport).size(12.0))
-                            .on_hover_text(netburrow_core::text!("不可靠消息使用 UDP，可靠消息使用 TCP", "UDP for unreliable messages; TCP for reliable messages"));
-                        ui.end_row();
-                    }
-                });
-            });
-        }
-        let detail = self.last_snapshot.detail.trim();
-        let show_detail = self.client.is_some() && !detail.is_empty();
-        let finished = self.client.as_ref().is_some_and(Client::is_finished);
-        let show_group_hint = self.client.is_some() && !finished
-            && self.last_snapshot.peers.len() <= 1
-            && matches!(self.current_phase(), Phase::WaitingForGame | Phase::Ready);
-        if show_detail || finished || show_group_hint {
-            ui.add_space(8.0);
-            if show_detail {
-                let text = detail;
-                ui.add(egui::Label::new(RichText::new(text).size(12.0).color(TEXT)).wrap());
-            }
-            if show_group_hint {
-                ui.add(egui::Label::new(RichText::new(netburrow_core::text!("未看到朋友？核对服务器和完整组码。", "Missing a friend? Check your server and full group code."))
-                    .size(12.0).color(MUTED)).wrap());
-            }
-            if finished {
-                ui.label(RichText::new(netburrow_core::text!("请断开，处理问题后重连", "Disconnect, resolve the issue, then reconnect")).size(12.0).color(Color32::from_rgb(151, 103, 37)));
-            }
-            if matches!(self.current_phase(), Phase::Connecting | Phase::RestartRequired | Phase::Failed) {
-                if icons::button(ui, icons::Action::Log, netburrow_core::text!("查看日志", "View logs")).clicked() {
-                    self.view.page = Page::Diagnostics;
-                }
-            }
-        }
-    }
-
 }
 
 impl eframe::App for NetBurrowApp {
@@ -542,67 +428,17 @@ impl Drop for NetBurrowApp {
     }
 }
 
-fn member_phase(phase: u8) -> (&'static str, Color32) {
+fn member_phase(phase: u8) -> (&'static str, Tone) {
     match phase {
-        0 => (netburrow_core::text!("连接中", "Connecting"), MUTED),
-        1 => (netburrow_core::text!("等待游戏", "Waiting for game"), Color32::from_rgb(59, 108, 139)),
-        2 => (netburrow_core::text!("接入中", "Attaching"), Color32::from_rgb(151, 103, 37)),
-        3 => (netburrow_core::text!("已就绪", "Ready"), ACCENT),
-        4 => (netburrow_core::text!("需重开", "Restart needed"), Color32::from_rgb(151, 103, 37)),
-        5 => (netburrow_core::text!("连接失败", "Connection failed"), Color32::from_rgb(174, 65, 60)),
-        _ => (netburrow_core::text!("未连接", "Disconnected"), MUTED),
+        0 => (netburrow_core::text!("连接中", "Connecting"), Tone::Neutral),
+        1 => (netburrow_core::text!("等待游戏", "Waiting for game"), Tone::Info),
+        2 => (netburrow_core::text!("接入中", "Attaching"), Tone::Warn),
+        3 => (netburrow_core::text!("已就绪", "Ready"), Tone::Accent),
+        4 => (netburrow_core::text!("需重开", "Restart needed"), Tone::Warn),
+        5 => (netburrow_core::text!("连接失败", "Connection failed"), Tone::Danger),
+        _ => (netburrow_core::text!("未连接", "Disconnected"), Tone::Neutral),
     }
 }
-fn configure_style(context: &egui::Context) {
-    // Fix the theme as well as its palette: OS light-mode events must not replace half the UI.
-    context.set_theme(egui::ThemePreference::Light);
-    context.all_styles_mut(|style| {
-        let mut visuals = egui::Visuals::light();
-        visuals.override_text_color = Some(TEXT);
-        visuals.weak_text_color = Some(MUTED);
-        visuals.panel_fill = BACKGROUND;
-        visuals.window_fill = SURFACE;
-        visuals.extreme_bg_color = BACKGROUND;
-        visuals.text_edit_bg_color = Some(Color32::from_rgb(252, 250, 246));
-        visuals.faint_bg_color = SURFACE;
-        visuals.window_corner_radius = egui::CornerRadius::same(12);
-        visuals.window_stroke = egui::Stroke::new(1.0, BORDER);
-        visuals.selection.bg_fill = Color32::from_rgb(217, 227, 211);
-        visuals.selection.stroke = egui::Stroke::new(1.0, ACCENT);
-        visuals.hyperlink_color = ACCENT;
-        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER);
-        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, TEXT);
-        for (widget, fill) in [
-            (&mut visuals.widgets.inactive, Color32::from_rgb(237, 233, 224)),
-            (&mut visuals.widgets.hovered, Color32::from_rgb(227, 223, 213)),
-            (&mut visuals.widgets.active, Color32::from_rgb(213, 221, 207)),
-            (&mut visuals.widgets.open, Color32::from_rgb(227, 230, 219)),
-        ] {
-            widget.bg_fill = fill;
-            widget.weak_bg_fill = fill;
-            widget.bg_stroke = egui::Stroke::new(1.0, BORDER);
-            widget.fg_stroke = egui::Stroke::new(1.0, TEXT);
-            widget.corner_radius = egui::CornerRadius::same(7);
-        }
-        style.visuals = visuals;
-        style.spacing.item_spacing = Vec2::new(9.0, 6.0);
-        style.spacing.button_padding = Vec2::new(12.0, 6.0);
-        style.spacing.interact_size = Vec2::new(36.0, 30.0);
-        style
-            .text_styles
-            .insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
-    });
-}
-fn bold(size: f32) -> egui::FontId {
-    egui::FontId::new(size, egui::FontFamily::Name("ui-bold".into()))
-}
-
 #[cfg(windows)]
 fn system_font_directory() -> Option<std::path::PathBuf> {
     use std::os::windows::ffi::OsStringExt;

@@ -12,7 +12,7 @@ impl NetBurrowApp {
         self.notice = Some(if changed_server {
             netburrow_core::text_format!("已选择服务器 {}，连接后生效", "Server set to {}. Applies when you connect.", recent.server)
         } else {
-            netburrow_core::text!("已选择联机组，点击连接加入", "Group selected. Click Connect to join.").into()
+            netburrow_core::text!("已选择联机组，点击启用联机加入", "Group selected. Click Go online to join.").into()
         });
     }
     fn store_history(&mut self, recent: Vec<netburrow_core::RecentConnection>) -> bool {
@@ -32,13 +32,16 @@ impl NetBurrowApp {
             }
         }
     }
-    pub(super) fn group_ui(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn group_header(&mut self, ui: &mut egui::Ui) {
         let enabled = self.connection_editable();
         ui.horizontal(|ui| {
-            ui.label(RichText::new(netburrow_core::text!("联机组", "Group")).font(bold(21.0)));
+            ui.label(RichText::new(netburrow_core::text!("联机组", "Group")).font(bold(18.0)));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .add_enabled(enabled, egui::Button::new(netburrow_core::text!("＋ 新建组", "＋ New group")).frame(false))
+                    .add_enabled_ui(enabled, |ui| {
+                        widgets::button(ui, widgets::Kind::Ghost, None, netburrow_core::text!("+ 创建联机组", "+ New group"), Vec2::new(0.0, 30.0))
+                    })
+                    .inner
                     .clicked()
                 {
                     match netburrow_core::new_group() {
@@ -51,22 +54,28 @@ impl NetBurrowApp {
                 }
             });
         });
-        ui.add_space(6.0);
+    }
+    pub(super) fn group_field(&mut self, ui: &mut egui::Ui) {
+        let enabled = self.connection_editable();
         let field = egui::Frame::new()
-            .fill(Color32::from_rgb(252, 250, 247))
+            .fill(FIELD)
             .stroke(egui::Stroke::new(1.0, BORDER))
-            .corner_radius(6)
+            .corner_radius(RADIUS_CONTROL)
             .inner_margin(egui::Margin::symmetric(12, 7))
             .show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
+                    // Leave exactly enough room for the three 34 px icon buttons that follow.
+                    let icons_width = 3.0 * (34.0 + ui.spacing().item_spacing.x);
                     let response = ui
                         .add_enabled_ui(enabled, |ui| {
                             ui.add_sized(
-                                [ui.available_width() - 144.0, 36.0],
+                                [ui.available_width() - icons_width, 36.0],
                                 egui::TextEdit::singleline(&mut self.settings.group)
                                     .id(egui::Id::new("group-code"))
                                     .font(egui::FontId::proportional(16.0))
                                     .frame(egui::Frame::NONE)
+                                    .vertical_align(egui::Align::Center)
                                     .hint_text(netburrow_core::text!("输入或粘贴组码", "Enter or paste group code")),
                             )
                         })
@@ -82,13 +91,13 @@ impl NetBurrowApp {
                         self.view.history_selection = None;
                     }
                     ui.add_enabled_ui(enabled, |ui| {
-                        if icons::icon_button(ui, icons::Action::Down, netburrow_core::text!("最近使用", "Recent groups")).clicked()
+                        if widgets::icon_button(ui, icons::Action::Down, netburrow_core::text!("最近使用", "Recent groups")).clicked()
                         {
                             self.view.history_open = !self.view.history_open;
                             self.view.history_filter.clear();
                             self.view.history_selection = None;
                         }
-                        if icons::icon_button(ui, icons::Action::Paste, netburrow_core::text!("粘贴组码", "Paste group code")).clicked() {
+                        if widgets::icon_button(ui, icons::Action::Paste, netburrow_core::text!("粘贴组码", "Paste group code")).clicked() {
                             match clipboard::read_text() {
                                 Ok(group) => {
                                     self.settings.group = group;
@@ -98,7 +107,7 @@ impl NetBurrowApp {
                             }
                         }
                     });
-                    if icons::icon_button(ui, icons::Action::Copy, netburrow_core::text!("复制组码", "Copy group code")).clicked() {
+                    if widgets::icon_button(ui, icons::Action::Copy, netburrow_core::text!("复制组码", "Copy group code")).clicked() {
                         ui.ctx().copy_text(self.settings.group.clone());
                         self.notice = Some(netburrow_core::text!("组码已复制", "Group code copied").into());
                     }

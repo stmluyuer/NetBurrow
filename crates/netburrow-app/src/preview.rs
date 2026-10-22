@@ -11,6 +11,26 @@ impl NetBurrowApp {
             if std::env::args().any(|arg| arg == "--preview-compact") {
                 context.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(520.0, 620.0)));
             }
+            if std::env::args().any(|arg| arg == "--preview-tall") {
+                context.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(580.0, 1100.0)));
+            }
+            if let Some(phase) = std::env::args()
+                .find_map(|arg| arg.strip_prefix("--preview-phase=").map(str::to_owned))
+            {
+                let phase = match phase.as_str() {
+                    "connecting" => Phase::Connecting,
+                    "waiting" => Phase::WaitingForGame,
+                    "attaching" => Phase::Attaching,
+                    "ready" => Phase::Ready,
+                    "restart" => Phase::RestartRequired,
+                    "failed" => Phase::Failed,
+                    _ => Phase::Stopped,
+                };
+                self.view.preview_phase = Some(phase);
+                self.last_snapshot.phase = phase;
+                self.last_snapshot.ping_ms = Some(42);
+                self.last_snapshot.rtt_samples = [38, 41, 40, 47, 43, 39, 42, 45, 41, 42].into();
+            }
             if let Some(page) = std::env::args()
                 .find_map(|arg| arg.strip_prefix("--preview-page=").map(str::to_owned))
             {

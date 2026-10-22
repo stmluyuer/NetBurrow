@@ -128,28 +128,19 @@ impl NetBurrowApp {
             ui.add_space(8.0);
         }
         if let Some((settings, report)) = &self.preflight_report {
-            let stale = !settings.same_connection(&self.settings);
-            egui::CollapsingHeader::new(if stale {
-                netburrow_core::text!("设置已修改，请重新检查", "Settings changed. Run the check again.")
-            } else {
-                netburrow_core::text!("检查结果", "Check results")
-            })
-            .default_open(!report.can_start())
-            .show(ui, |ui| {
-                for check in &report.checks {
-                    let (label, color) = match check.level {
-                        CheckLevel::Passed => (netburrow_core::text!("通过", "Passed"), ACCENT),
-                        CheckLevel::Info => (netburrow_core::text!("说明", "Info"), MUTED),
-                        CheckLevel::Warning => (netburrow_core::text!("提示", "Warning"), Color32::from_rgb(151, 103, 37)),
-                        CheckLevel::Failed => (netburrow_core::text!("未通过", "Failed"), Color32::from_rgb(174, 65, 60)),
-                    };
-                    ui.label(
-                        RichText::new(netburrow_core::text_format!("{} · {label}：{}", "{} · {label}: {}", check.name, check.detail))
-                            .color(color),
-                    );
-                }
-            });
-            ui.add_space(8.0);
+            if !settings.same_connection(&self.settings) {
+                widgets::banner(ui, Tone::Warn, netburrow_core::text!("设置已修改，请重新检查", "Settings changed. Run the check again."), false);
+                ui.add_space(6.0);
+            }
+            for check in &report.checks {
+                let level = match check.level {
+                    CheckLevel::Passed => widgets::Check::Pass,
+                    CheckLevel::Info => widgets::Check::Info,
+                    CheckLevel::Warning => widgets::Check::Warn,
+                    CheckLevel::Failed => widgets::Check::Fail,
+                };
+                widgets::check_row(ui, level, &check.name, &check.detail);
+            }
         }
     }
 

@@ -38,6 +38,8 @@ pub(super) struct ViewState {
     pub log_follow: bool,
     pub preview_requested: bool,
     pub capture_requested: bool,
+    /// Smoke-test captures only: shows a phase without starting a client.
+    pub preview_phase: Option<Phase>,
     pub notice_seen: Option<String>,
     pub notice_since: Instant,
 }
@@ -60,24 +62,11 @@ impl Default for ViewState {
             log_follow: true,
             preview_requested: false,
             capture_requested: false,
+            preview_phase: None,
             notice_seen: None,
             notice_since: Instant::now(),
         }
     }
-}
-
-pub(super) fn tab(ui: &mut egui::Ui, selected: bool, title: &str) -> bool {
-    let response = ui.add(
-        egui::Button::new(RichText::new(title).color(if selected { ACCENT } else { MUTED }))
-            .frame(false),
-    );
-    if selected {
-        ui.painter().line_segment(
-            [response.rect.left_bottom(), response.rect.right_bottom()],
-            egui::Stroke::new(2.0, ACCENT),
-        );
-    }
-    response.clicked()
 }
 
 impl NetBurrowApp {
@@ -94,12 +83,10 @@ impl NetBurrowApp {
             self.notice = None;
             return;
         }
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(message).size(12.0));
-            if ui.small_button("×").on_hover_text(netburrow_core::text!("关闭提示", "Dismiss")).clicked() {
-                self.notice = None;
-            }
-        });
+        ui.add_space(8.0);
+        if widgets::banner(ui, Tone::Neutral, &message, true) {
+            self.notice = None;
+        }
     }
     pub(super) fn connection_editable(&self) -> bool {
         self.client.is_none() && self.preflight.is_none()
@@ -161,12 +148,11 @@ impl NetBurrowApp {
             .frame(
                 egui::Frame::new()
                     .fill(BACKGROUND)
-                    .inner_margin(egui::Margin::symmetric(24, 14)),
+                    .inner_margin(egui::Margin::symmetric(PAGE_MARGIN, 14)),
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if ui
-                        .add(egui::Button::new(netburrow_core::text!("← 返回", "← Back")).frame(false))
+                    if widgets::button(ui, widgets::Kind::Ghost, None, netburrow_core::text!("← 返回联机", "← Back"), Vec2::new(0.0, 32.0))
                         .clicked()
                     {
                         self.leave_page(Page::Home);
@@ -180,112 +166,112 @@ impl NetBurrowApp {
                         .font(bold(22.0)),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (status, color) = self.status_label();
-                        ui.label(RichText::new(format!("● {status}")).size(12.0).color(color));
+                        let (status, tone) = self.status_label();
+                        widgets::status_chip(ui, status, tone);
                     });
                 });
                 ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    if self.view.page == Page::Settings {
-                        for (value, title) in [
-                            (SettingsTab::Game, netburrow_core::text!("游戏与网络", "Game & network")),
-                            (SettingsTab::General, netburrow_core::text!("通用", "General")),
-                            (SettingsTab::About, netburrow_core::text!("关于", "About")),
-                        ] {
-                            if tab(ui, self.view.settings_tab == value, title) {
-                                self.view.settings_tab = value;
-                            }
-                        }
-                    } else {
-                        for (value, title) in [
-                            (DiagnosticTab::Checks, netburrow_core::text!("连接检查", "Connection checks")),
-                            (DiagnosticTab::Logs, netburrow_core::text!("日志", "Logs")),
-                        ] {
-                            if tab(ui, self.view.diagnostic_tab == value, title) {
-                                self.view.diagnostic_tab = value;
-                            }
-                        }
-                    }
-                });
+                if self.view.page == Page::Settings {
+                    widgets::segmented(ui, &mut self.view.settings_tab, &[
+                        (SettingsTab::Game, netburrow_core::text!("游戏与网络", "Game & network")),
+                        (SettingsTab::General, netburrow_core::text!("通用", "General")),
+                        (SettingsTab::About, netburrow_core::text!("关于", "About")),
+                    ]);
+                } else {
+                    widgets::segmented(ui, &mut self.view.diagnostic_tab, &[
+                        (DiagnosticTab::Checks, netburrow_core::text!("连接检查", "Checks")),
+                        (DiagnosticTab::Logs, netburrow_core::text!("运行日志", "Logs")),
+                    ]);
+                }
             });
         egui::Panel::bottom("page-actions")
             .resizable(false)
             .frame(
                 egui::Frame::new()
                     .fill(BACKGROUND)
-                    .inner_margin(egui::Margin::symmetric(24, 12)),
+                    .inner_margin(egui::Margin::symmetric(PAGE_MARGIN, 12)),
             )
             .show(ui, |ui| {
                 if let Some(destination) = self.view.leave_settings {
-                    ui.label(netburrow_core::text!("有未应用的更改", "Unapplied changes"));
+                    widgets::banner(ui, Tone::Warn, netburrow_core::text!("有未应用的更改", "Unapplied changes"), false);
+                    ui.add_space(6.0);
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button(netburrow_core::text!("应用并返回", "Apply and return")).clicked() && self.apply_game() {
+                        if widgets::button(ui, widgets::Kind::Primary, None, netburrow_core::text!("应用并返回", "Apply and return"), Vec2::new(0.0, 32.0)).clicked() && self.apply_game() {
                             self.view.leave_settings = None;
                             self.view.page = destination;
                         }
-                        if ui.button(netburrow_core::text!("放弃并返回", "Discard and return")).clicked() {
+                        if widgets::button(ui, widgets::Kind::Secondary, None, netburrow_core::text!("放弃并返回", "Discard and return"), Vec2::new(0.0, 32.0)).clicked() {
                             self.view.game_draft = Some(self.settings.clone());
                             self.view.leave_settings = None;
                             self.view.page = destination;
                         }
-                        if ui.button(netburrow_core::text!("继续编辑", "Keep editing")).clicked() {
+                        if widgets::button(ui, widgets::Kind::Ghost, None, netburrow_core::text!("继续编辑", "Keep editing"), Vec2::new(0.0, 32.0)).clicked() {
                             self.view.leave_settings = None;
                         }
                     });
                 } else if self.view.page == Page::Settings && self.game_dirty() {
                     ui.horizontal(|ui| {
-                        if ui.button(netburrow_core::text!("放弃", "Discard")).clicked() {
-                            self.view.game_draft = Some(self.settings.clone());
-                        }
+                        ui.label(RichText::new(netburrow_core::text!("有未应用的更改", "Unapplied changes")).size(13.0).color(MUTED));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let editable = self.connection_editable();
                         if ui
-                            .add_enabled(
-                                self.connection_editable(),
-                                egui::Button::new(RichText::new(netburrow_core::text!("应用", "Apply")).color(Color32::WHITE))
-                                    .fill(ACCENT),
-                            )
+                            .add_enabled_ui(editable, |ui| {
+                                widgets::button(ui, widgets::Kind::Primary, None, netburrow_core::text!("应用", "Apply"), Vec2::new(0.0, 34.0))
+                            })
+                            .inner
                             .clicked()
                         {
                             self.apply_game();
                         }
+                        if widgets::button(ui, widgets::Kind::Secondary, None, netburrow_core::text!("放弃", "Discard"), Vec2::new(0.0, 34.0)).clicked() {
+                            self.view.game_draft = Some(self.settings.clone());
+                        }
+                        });
                     });
                 } else if self.view.page == Page::Diagnostics {
                     ui.horizontal_wrapped(|ui| {
-                        if self.preflight.is_some() && ui.button(netburrow_core::text!("取消检查", "Cancel check")).clicked() {
+                        if self.preflight.is_some() && widgets::button(ui, widgets::Kind::Secondary, None, netburrow_core::text!("取消检查", "Cancel check"), Vec2::new(0.0, 32.0)).clicked() {
                             self.stop();
                         }
                         let packing = self.diagnostic_bundle.is_some();
                         if ui
-                            .add_enabled(
-                                !packing,
-                                egui::Button::new(if packing { netburrow_core::text!("正在打包…", "Exporting…") } else { netburrow_core::text!("导出日志包", "Export log bundle") }),
-                            )
+                            .add_enabled_ui(!packing, |ui| {
+                                widgets::button(
+                                    ui,
+                                    widgets::Kind::Primary,
+                                    Some(icons::Action::Log),
+                                    if packing { netburrow_core::text!("正在打包…", "Exporting…") } else { netburrow_core::text!("一键打包日志", "Export log bundle") },
+                                    Vec2::new(0.0, 32.0),
+                                )
+                            })
+                            .inner
                             .on_hover_text(netburrow_core::text!("导出日志、诊断和最近完整崩溃记录为 ZIP；包含转储时可能较大", "Export logs, diagnostics, and the latest complete crash capture as ZIP. Dumps may make the file large."))
                             .clicked()
                         {
                             self.begin_diagnostic_bundle(ui.ctx());
                         }
-                        if ui.button(netburrow_core::text!("导出诊断", "Export diagnostics")).clicked() {
+                        if widgets::button(ui, widgets::Kind::Secondary, None, netburrow_core::text!("导出诊断", "Export diagnostics"), Vec2::new(0.0, 32.0)).clicked() {
                             self.export_diagnostics();
                         }
-                        if ui.button(netburrow_core::text!("记录卡住现场", "Capture freeze"))
+                        if widgets::button(ui, widgets::Kind::Secondary, None, netburrow_core::text!("记录卡住现场", "Capture freeze"), Vec2::new(0.0, 32.0))
                             .on_hover_text(netburrow_core::text!("游戏卡住时，记录时间并导出状态和近期日志", "When the game freezes, record the time and export current status and recent logs"))
                             .clicked()
                         {
                             self.export_diagnostics_at(true);
                         }
-                        if icons::button(ui, icons::Action::Folder, netburrow_core::text!("日志文件夹", "Log folder")).clicked()
+                        if widgets::button(ui, widgets::Kind::Secondary, Some(icons::Action::Folder), netburrow_core::text!("打开日志文件夹", "Open log folder"), Vec2::new(0.0, 32.0)).clicked()
                         {
                             self.open_log_folder();
                         }
                         if self.view.diagnostic_tab == DiagnosticTab::Logs
-                            && ui.button(netburrow_core::text!("回到最新", "Jump to latest")).clicked()
+                            && widgets::button(ui, widgets::Kind::Ghost, None, netburrow_core::text!("回到最新", "Jump to latest"), Vec2::new(0.0, 32.0)).clicked()
                         {
                             self.view.log_follow = true;
                         }
                     });
                     self.crash_capture_ui(ui);
                     if let Some(path) = self.diagnostic_export.clone() {
-                        if ui.button(netburrow_core::text!("打开导出位置", "Show exported file")).clicked() {
+                        if widgets::button(ui, widgets::Kind::Ghost, Some(icons::Action::Folder), netburrow_core::text!("打开导出位置", "Show exported file"), Vec2::new(0.0, 30.0)).clicked() {
                             self.open_folder(&path, true);
                         }
                     }
@@ -293,7 +279,7 @@ impl NetBurrowApp {
                 self.notice_ui(ui);
             });
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(BACKGROUND).inner_margin(24))
+            .frame(egui::Frame::new().fill(BACKGROUND).inner_margin(PAGE_MARGIN))
             .show(ui, |ui| {
                 if self.view.page == Page::Diagnostics
                     && self.view.diagnostic_tab == DiagnosticTab::Logs
@@ -417,12 +403,14 @@ impl NetBurrowApp {
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
             let mut enabled = self.settings.auto_crash_capture;
-            if ui.checkbox(&mut enabled, netburrow_core::text!("自动记录闪退", "Capture crashes automatically")).changed() {
+            if widgets::toggle(ui, &mut enabled, netburrow_core::text!("自动记录闪退", "Capture crashes automatically")).changed() {
                 if enabled && !self.settings.crash_capture_consent {
                     self.crash_capture_confirm = true;
                 } else { self.set_crash_capture(enabled, self.settings.crash_capture_consent); }
             }
-            if self.settings.auto_crash_capture || self.crash_capture.is_running() {
+            if !(self.settings.auto_crash_capture || self.crash_capture.is_running()) {
+                ui.label(RichText::new(netburrow_core::text!("启用联机后自动开始记录", "Starts when you go online")).size(12.0).color(MUTED));
+            } else {
                 ui.small(self.crash_capture.status.display_message())
                     .on_hover_text(&self.crash_capture.status.message);
                 if self.settings.auto_crash_capture && self.crash_capture.status.state == crash_capture::State::Failed
@@ -434,7 +422,8 @@ impl NetBurrowApp {
             }
         });
         if self.crash_capture_confirm {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.add_space(6.0);
+            widgets::card(Tone::Warn).show(ui, |ui| {
                 ui.label(netburrow_core::text!("连接期间自动监视游戏，闪退后生成排查 ZIP。仅保存在本机，不自动上传。", "Monitor the game while connected and create a ZIP after a crash. Files stay on this PC and are not uploaded automatically."));
                 ui.small(netburrow_core::text!("首次使用会下载并校验微软 ProcDump。采集可能短暂停顿游戏；转储可能占用数 GB，并含个人信息。导出日志包时会包含最近一次完整记录。", "First use downloads and verifies Microsoft ProcDump. Capture may briefly pause the game. Dumps may use several GB and contain personal information. Log bundles include the latest complete capture."));
                 ui.hyperlink_to(netburrow_core::text!("微软 Sysinternals 许可", "Microsoft Sysinternals license"), "https://learn.microsoft.com/en-us/sysinternals/license-terms");
@@ -463,55 +452,81 @@ impl NetBurrowApp {
         }
     }
     fn check_content(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new(netburrow_core::text!("当前连接", "Connection")).font(bold(18.0)));
-        let (status, color) = self.status_label();
-        ui.colored_label(color, status);
-        if self.client.is_some() {
-            ui.label(&self.last_snapshot.detail);
-        }
-        ui.add_space(12.0);
-        if ui
-            .add_enabled(self.connection_editable(), egui::Button::new(netburrow_core::text!("重新检查", "Run check")))
-            .on_disabled_hover_text(netburrow_core::text!("断开且当前检查结束后可重试", "Disconnect and wait for any active check to finish"))
-            .clicked()
-        {
-            self.begin_preflight(false);
-        }
-        if self.preflight_report.is_none() && self.preflight.is_none() {
-            ui.small(netburrow_core::text!("尚未检查", "Not checked"));
-        }
-        self.preflight_ui(ui);
-        ui.label(if self.current_phase() == Phase::Ready {
-            netburrow_core::text!("游戏接入：已就绪", "Game attachment: ready")
-        } else {
-            netburrow_core::text!("游戏接入：未验证", "Game attachment: not verified")
-        });
-        ui.add_space(16.0);
-        ui.separator();
-        ui.label(RichText::new(netburrow_core::text!("连接统计", "Statistics")).font(bold(18.0)));
-        if self.client.is_none() {
-            ui.small(netburrow_core::text!("可能包含上次记录", "May include data from the previous session"));
-        }
-        let (quality, reason) =
-            netburrow_core::connection_quality(&self.last_snapshot, Instant::now());
-        ui.label(netburrow_core::text_format!("质量：{} · {reason}", "Quality: {} · {reason}",
-            match quality {
-                netburrow_core::Quality::Pending => netburrow_core::text!("待测", "Pending"),
-                netburrow_core::Quality::Normal => netburrow_core::text!("正常", "Normal"),
-                netburrow_core::Quality::Unstable => netburrow_core::text!("波动", "Unstable"),
-                netburrow_core::Quality::Abnormal => netburrow_core::text!("异常", "Abnormal"),
+        widgets::section(ui, netburrow_core::text!("当前连接", "Connection"), |ui| {
+            ui.horizontal(|ui| {
+                let (status, tone) = self.status_label();
+                widgets::status_chip(ui, status, tone);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let editable = self.connection_editable();
+                    if ui
+                        .add_enabled_ui(editable, |ui| {
+                            widgets::button(ui, widgets::Kind::Secondary, Some(icons::Action::Search), netburrow_core::text!("重新检查", "Run check"), Vec2::new(0.0, 30.0))
+                        })
+                        .inner
+                        .on_disabled_hover_text(netburrow_core::text!("断开且当前检查结束后可重试", "Disconnect and wait for any active check to finish"))
+                        .clicked()
+                    {
+                        self.begin_preflight(false);
+                    }
+                });
+            });
+            let detail = self.last_snapshot.detail.trim();
+            if self.client.is_some() && !detail.is_empty() {
+                ui.add(egui::Label::new(RichText::new(detail).size(13.0).color(MUTED)).wrap());
             }
-        ));
-        ui.label(netburrow_core::text_format!("发送 {} 包 · 接收 {} 包", "Sent {} · Received {} packets",
-            self.last_snapshot.sent, self.last_snapshot.received
-        ));
-        ui.label(netburrow_core::text_format!("UDP 发送 {} 包 · 接收 {} 包", "UDP sent {} · Received {} packets",
-            self.last_snapshot.udp_sent, self.last_snapshot.udp_received
-        ));
-        ui.label(netburrow_core::text_format!("断线 {} 次 · 心跳超时 {} 次", "Disconnects {} · Heartbeat timeouts {}",
-            self.last_snapshot.disconnects, self.last_snapshot.heartbeat_timeouts
-        ));
-        ui.label(netburrow_core::text_format!("服务器会话恢复 {} 次 · 游戏连接恢复 {} 次", "Server session recoveries {} · Game connection recoveries {}",self.last_snapshot.relay_recoveries,self.last_snapshot.ipc_recoveries));
+            ui.add_space(8.0);
+            if self.preflight_report.is_none() && self.preflight.is_none() {
+                ui.horizontal(|ui| {
+                    art::show(ui, art::Art::EmptyCheck, Vec2::new(72.0, 40.0), SUBTLE);
+                    ui.label(RichText::new(netburrow_core::text!("尚未检查", "Not checked yet")).size(13.0).color(MUTED));
+                });
+                ui.add_space(4.0);
+            }
+            self.preflight_ui(ui);
+            let ready = self.current_phase() == Phase::Ready;
+            widgets::check_row(
+                ui,
+                if ready { widgets::Check::Pass } else { widgets::Check::Info },
+                if ready {
+                    netburrow_core::text!("实际游戏接入：已就绪", "Game attachment: ready")
+                } else {
+                    netburrow_core::text!("实际游戏接入：尚未验证", "Game attachment: not verified")
+                },
+                "",
+            );
+        });
+        widgets::section(ui, netburrow_core::text!("连接统计", "Statistics"), |ui| {
+            if self.client.is_none() {
+                ui.label(RichText::new(netburrow_core::text!("以下可能包含上次运行记录", "May include data from the previous session")).size(12.0).color(MUTED));
+                ui.add_space(4.0);
+            }
+            let (quality, reason) =
+                netburrow_core::connection_quality(&self.last_snapshot, Instant::now());
+            let (label, tone) = match quality {
+                netburrow_core::Quality::Pending => (netburrow_core::text!("待测", "Pending"), Tone::Neutral),
+                netburrow_core::Quality::Normal => (netburrow_core::text!("正常", "Normal"), Tone::Accent),
+                netburrow_core::Quality::Unstable => (netburrow_core::text!("波动", "Unstable"), Tone::Warn),
+                netburrow_core::Quality::Abnormal => (netburrow_core::text!("异常", "Abnormal"), Tone::Danger),
+            };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(netburrow_core::text!("连接质量", "Quality")).size(14.0));
+                widgets::status_chip(ui, label, tone);
+            });
+            ui.add(egui::Label::new(RichText::new(reason).size(12.0).color(MUTED)).wrap());
+            ui.add_space(8.0);
+            let snapshot = &self.last_snapshot;
+            widgets::metrics(ui, &[
+                (netburrow_core::text!("发送 · 接收", "Sent · Received"), netburrow_core::text_format!("{} · {} 包", "{} · {} packets", snapshot.sent, snapshot.received)),
+                (netburrow_core::text!("UDP 发送 · 接收", "UDP sent · Received"), netburrow_core::text_format!("{} · {} 包", "{} · {} packets", snapshot.udp_sent, snapshot.udp_received)),
+                (netburrow_core::text!("断线", "Disconnects"), netburrow_core::text_format!("{} 次", "{}", snapshot.disconnects)),
+                (netburrow_core::text!("心跳超时", "Heartbeat timeouts"), netburrow_core::text_format!("{} 次", "{}", snapshot.heartbeat_timeouts)),
+                (netburrow_core::text!("原 Relay 会话恢复", "Relay session recoveries"), netburrow_core::text_format!("{} 次", "{}", snapshot.relay_recoveries)),
+                (netburrow_core::text!("本地游戏连接恢复", "Game connection recoveries"), netburrow_core::text_format!("{} 次", "{}", snapshot.ipc_recoveries)),
+            ]);
+            self.member_diagnostics_ui(ui);
+        });
+    }
+    fn member_diagnostics_ui(&self, ui: &mut egui::Ui) {
         if !self.last_snapshot.peers.is_empty() {
             ui.collapsing(netburrow_core::text!("成员链路诊断", "Member connection diagnostics"), |ui| {
                 let diagnostics = &self.last_snapshot.path_diagnostics;
@@ -560,12 +575,12 @@ impl NetBurrowApp {
                 [ui.available_width() - 120.0, 32.0],
                 egui::TextEdit::singleline(&mut self.view.log_query).hint_text(netburrow_core::text!("搜索日志…", "Search logs…")),
             );
-            ui.checkbox(&mut self.view.log_follow, netburrow_core::text!("自动滚动", "Auto-scroll"));
+            widgets::toggle(ui, &mut self.view.log_follow, netburrow_core::text!("自动滚动", "Auto-scroll"));
         });
         if let Some(error) = netburrow_core::diagnostics::last_error() {
-            ui.colored_label(Color32::from_rgb(174, 65, 60), netburrow_core::text_format!("无法写入日志：{error}", "Cannot write logs: {error}"));
+            ui.colored_label(Tone::Danger.fg(), netburrow_core::text_format!("无法写入日志：{error}", "Cannot write logs: {error}"));
         }
-        ui.separator();
+        ui.add_space(6.0);
         let query = self.view.log_query.to_lowercase();
         let lines: Vec<_> = self
             .last_snapshot
@@ -580,88 +595,127 @@ impl NetBurrowApp {
                 netburrow_core::text!("无匹配记录", "No matching entries")
             });
         }
-        let output = egui::ScrollArea::both()
-            .id_salt("log-body")
-            .auto_shrink([false, false])
-            .stick_to_bottom(self.view.log_follow)
+        let output = egui::Frame::new()
+            .fill(FIELD)
+            .stroke(egui::Stroke::new(1.0, DIVIDER))
+            .corner_radius(RADIUS_CARD)
+            .inner_margin(egui::Margin::same(10))
             .show(ui, |ui| {
-                for line in lines {
-                    ui.add(
-                        egui::Label::new(RichText::new(line).monospace())
-                            .selectable(true)
-                            .extend(),
-                    );
-                }
-            });
+                egui::ScrollArea::both()
+                    .id_salt("log-body")
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(self.view.log_follow)
+                    .show(ui, |ui| {
+                        for line in lines {
+                            ui.add(
+                                egui::Label::new(RichText::new(line).monospace().size(12.5))
+                                    .selectable(true)
+                                    .extend(),
+                            );
+                        }
+                    })
+            })
+            .inner;
         if output.state.offset.y + output.inner_rect.height() + 4.0 < output.content_size.y {
             self.view.log_follow = false;
         }
     }
     fn about_content(&mut self, ui: &mut egui::Ui) {
-        icons::logo(ui);
-        ui.label(RichText::new("NetBurrow").font(bold(26.0)));
         let version = format!(
             "NetBurrow {} · {}",
             env!("CARGO_PKG_VERSION"),
             std::env::consts::ARCH
         );
-        ui.label(&version);
-        ui.small(netburrow_core::text!("以撒的结合：忏悔+ 联机工具", "Multiplayer for The Binding of Isaac: Repentance+"));
-        ui.add_space(18.0);
-        if ui.button(netburrow_core::text!("复制版本信息", "Copy version info")).clicked() {
-            ui.ctx().copy_text(version);
-            self.notice = Some(netburrow_core::text!("版本信息已复制", "Version info copied").into());
-        }
-        ui.add_space(8.0);
-        let mut auto_check = self.settings.auto_check_updates;
-        if ui.add_enabled(self.smoke_test.is_none() && !cfg!(test), egui::Checkbox::new(&mut auto_check, netburrow_core::text!("启动时检查更新", "Check for updates at startup"))).changed() {
-            match netburrow_core::save_auto_check_updates(auto_check) {
-                Ok(()) => {
-                    self.settings.auto_check_updates = auto_check;
-                    self.saved_settings.auto_check_updates = auto_check;
-                    self.update_check_at = None;
-                    if auto_check { self.update_check.begin(); }
-                }
-                Err(error) => self.notice = Some(error),
+        widgets::card(Tone::Neutral).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                art::show(ui, art::Art::Logo, Vec2::new(72.0, 58.0), TEXT);
+                ui.add_space(4.0);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("NetBurrow").font(bold(22.0)));
+                    ui.label(RichText::new(&version).size(13.0).color(MUTED));
+                    ui.label(
+                        RichText::new(netburrow_core::text!("以撒的结合：忏悔+ 联机工具", "Multiplayer for The Binding of Isaac: Repentance+"))
+                            .size(12.0)
+                            .color(MUTED),
+                    );
+                });
+            });
+            ui.add_space(6.0);
+            if widgets::button(ui, widgets::Kind::Secondary, Some(icons::Action::Copy), netburrow_core::text!("复制版本信息", "Copy version info"), Vec2::new(0.0, 30.0)).clicked() {
+                ui.ctx().copy_text(version.clone());
+                self.notice = Some(netburrow_core::text!("版本信息已复制", "Version info copied").into());
             }
-        }
-        ui.add(egui::Label::new(RichText::new(netburrow_core::text!("开启时立即检查，此后每次启动检查。", "Check now when enabled, then at each launch.")).small().color(MUTED)).wrap());
-        if ui.add_enabled(!self.update_check.is_checking() && self.smoke_test.is_none() && !cfg!(test), egui::Button::new(netburrow_core::text!("检查更新", "Check for updates"))).clicked() {
-            self.update_check_at = None;
-            self.update_check.begin();
-        }
-        if self.update_check.is_checking() {
-            ui.horizontal(|ui| { ui.spinner(); ui.label(netburrow_core::text!("正在检查…", "Checking…")); });
-        }
-        if let Some(result) = &self.update_check.result {
-            match result {
-                Ok(checked) => {
-                    let text = match checked.comparison {
-                        std::cmp::Ordering::Equal => netburrow_core::text!("已是最新版本", "You're up to date").to_owned(),
-                        std::cmp::Ordering::Less => netburrow_core::text_format!("当前版本高于公开版本 v{}", "This version is newer than public release v{}", checked.release.version),
-                        std::cmp::Ordering::Greater => netburrow_core::text_format!("新版本 v{} 可用", "Update v{} available", checked.release.version),
-                    };
-                    ui.label(RichText::new(text).color(ACCENT));
-                    if checked.comparison == std::cmp::Ordering::Greater {
-                        ui.hyperlink_to(netburrow_core::text!("下载新版 ↗", "Download update ↗"), checked.release.download_url());
-                        ui.hyperlink_to(netburrow_core::text!("发行说明 ↗", "Release notes ↗"), checked.release.page_url());
-                        egui::ScrollArea::vertical().id_salt("update-notes").max_height(140.0).show(ui, |ui| {
-                            ui.add(egui::Label::new(&checked.release.notes).wrap());
-                        });
-                        ui.add(egui::Label::new(RichText::new(netburrow_core::text!("退出游戏和 NetBurrow，将完整 ZIP 解压到新文件夹后启动。现有设置会保留。", "Close the game and NetBurrow, extract the full ZIP into a new folder, then launch it. Your settings are kept.")).small().color(MUTED)).wrap());
+        });
+        ui.add_space(18.0);
+        widgets::section(ui, netburrow_core::text!("更新", "Updates"), |ui| {
+            let live = self.smoke_test.is_none() && !cfg!(test);
+            let mut auto_check = self.settings.auto_check_updates;
+            if widgets::switch_row(
+                ui,
+                &mut auto_check,
+                netburrow_core::text!("启动时检查更新", "Check for updates at startup"),
+                netburrow_core::text!("开启时立即检查，此后每次启动检查。", "Check now when enabled, then at each launch."),
+            ) && live
+            {
+                match netburrow_core::save_auto_check_updates(auto_check) {
+                    Ok(()) => {
+                        self.settings.auto_check_updates = auto_check;
+                        self.saved_settings.auto_check_updates = auto_check;
+                        self.update_check_at = None;
+                        if auto_check { self.update_check.begin(); }
                     }
-                }
-                Err(error) => {
-                    ui.label(netburrow_core::text!("无法检查更新", "Could not check for updates"));
-                    ui.add(egui::Label::new(RichText::new(error).small().color(MUTED)).wrap());
+                    Err(error) => self.notice = Some(error),
                 }
             }
-        }
-        ui.hyperlink_to(netburrow_core::text!("所有版本 ↗", "All releases ↗"), update_check::RELEASES);
-        ui.hyperlink_to(netburrow_core::text!("项目主页 ↗", "Project website ↗"), update_check::REPOSITORY);
-        ui.hyperlink_to(netburrow_core::text!("反馈问题 ↗", "Report an issue ↗"), update_check::ISSUES);
-        ui.add_space(18.0);
-        if ui.button(netburrow_core::text!("打开诊断 →", "Open diagnostics →")).clicked() {
+            ui.horizontal(|ui| {
+                let idle = !self.update_check.is_checking() && live;
+                if ui
+                    .add_enabled_ui(idle, |ui| {
+                        widgets::button(ui, widgets::Kind::Secondary, None, netburrow_core::text!("检查更新", "Check for updates"), Vec2::new(0.0, 30.0))
+                    })
+                    .inner
+                    .clicked()
+                {
+                    self.update_check_at = None;
+                    self.update_check.begin();
+                }
+                if self.update_check.is_checking() {
+                    ui.spinner();
+                    ui.label(RichText::new(netburrow_core::text!("正在检查…", "Checking…")).size(13.0).color(MUTED));
+                }
+            });
+            if let Some(result) = &self.update_check.result {
+                ui.add_space(6.0);
+                match result {
+                    Ok(checked) => {
+                        let (text, check) = match checked.comparison {
+                            std::cmp::Ordering::Equal => (netburrow_core::text!("已是最新版本", "You're up to date").to_owned(), widgets::Check::Pass),
+                            std::cmp::Ordering::Less => (netburrow_core::text_format!("当前版本高于公开版本 v{}", "This version is newer than public release v{}", checked.release.version), widgets::Check::Info),
+                            std::cmp::Ordering::Greater => (netburrow_core::text_format!("新版本 v{} 可用", "Update v{} available", checked.release.version), widgets::Check::Warn),
+                        };
+                        widgets::check_row(ui, check, &text, "");
+                        if checked.comparison == std::cmp::Ordering::Greater {
+                            ui.horizontal(|ui| {
+                                ui.hyperlink_to(netburrow_core::text!("下载新版 ↗", "Download update ↗"), checked.release.download_url());
+                                ui.hyperlink_to(netburrow_core::text!("发行说明 ↗", "Release notes ↗"), checked.release.page_url());
+                            });
+                            egui::ScrollArea::vertical().id_salt("update-notes").max_height(140.0).show(ui, |ui| {
+                                ui.add(egui::Label::new(&checked.release.notes).wrap());
+                            });
+                            ui.add(egui::Label::new(RichText::new(netburrow_core::text!("退出游戏和 NetBurrow，将完整 ZIP 解压到新文件夹后启动。现有设置会保留。", "Close the game and NetBurrow, extract the full ZIP into a new folder, then launch it. Your settings are kept.")).small().color(MUTED)).wrap());
+                        }
+                    }
+                    Err(error) => widgets::check_row(ui, widgets::Check::Fail, netburrow_core::text!("无法检查更新", "Could not check for updates"), error),
+                }
+            }
+        });
+        widgets::section(ui, netburrow_core::text!("链接", "Links"), |ui| {
+            ui.hyperlink_to(netburrow_core::text!("所有版本 ↗", "All releases ↗"), update_check::RELEASES);
+            ui.hyperlink_to(netburrow_core::text!("项目主页 ↗", "Project website ↗"), update_check::REPOSITORY);
+            ui.hyperlink_to(netburrow_core::text!("反馈问题 ↗", "Report an issue ↗"), update_check::ISSUES);
+        });
+        if widgets::button(ui, widgets::Kind::Ghost, Some(icons::Action::Log), netburrow_core::text!("打开日志与诊断", "Open diagnostics"), Vec2::new(0.0, 32.0)).clicked() {
             self.leave_page(Page::Diagnostics);
         }
     }
