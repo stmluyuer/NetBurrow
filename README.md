@@ -34,6 +34,9 @@
 
 普通日志位于 `%LOCALAPPDATA%\NetBurrow\logs`，设置位于 `%LOCALAPPDATA%\NetBurrow\settings.json`。
 
+<details>
+<summary>开发者：构建、测试与打包</summary>
+
 ## 开发者构建与测试
 
 Windows 构建需要 Rust MSVC 工具链，以及 Visual Studio Build Tools 的“使用 C++ 的桌面开发”（含 x86/x64 工具和 Windows SDK）。Rust 需支持 2024 edition，并满足锁定依赖的要求。首次构建需要联网下载依赖。
@@ -90,6 +93,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1
 发布后，确认未登录也能下载[更新清单](https://github.com/stmluyuer/NetBurrow/releases/latest/download/latest.json)和 ZIP，再用客户端检查。若需要同步更新 Relay，须在更新说明中写明。当前客户端不校验 ZIP 签名，也不检查 Relay 协议兼容性；分支项目自行发行时需要修改客户端更新地址。
 
 **旧版升级过渡：** [NetBurrow-Releases](https://github.com/stmluyuer/NetBurrow-Releases) 保留历史版本及 0.2.6 的 ZIP 和更新清单。0.2.5 及更早版本的检查与下载地址固定在旧仓库，必须保留同名完整 ZIP，不能只在清单中放一个新链接。旧版升级到 0.2.6 后便使用本仓库，旧仓库不再承担后续正式版本发布。历史迁移标签只用于保留下载入口，不代表原包的准确构建源码，详见对应发行说明。
+
+</details>
 
 </details>
 
