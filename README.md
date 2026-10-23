@@ -1,8 +1,18 @@
+<img src="crates/netburrow-app/assets/netburrow.png" alt="NetBurrow 图标" width="88" height="88" align="right">
+
 # NetBurrow
 
 给《以撒的结合：忏悔+》用的 Windows 联机工具，通过 Relay 服务器中转游戏数据。
 
 [下载客户端](https://github.com/stmluyuer/NetBurrow/releases/latest) · [更新日志](CHANGELOG.md) · [问题反馈](https://github.com/stmluyuer/NetBurrow/issues) · [部署服务器](docs/server-ai-handoff.md) · [项目架构](docs/architecture.md)
+
+## 界面预览
+
+| 首页 | 通用设置 |
+| --- | --- |
+| <img src="docs/images/home-v0.2.6.png" alt="NetBurrow 首页：启用联机、联机组与成员列表" width="350"> | <img src="docs/images/settings-v0.2.6.png" alt="NetBurrow 通用设置：外观、语言、启动和窗口行为" width="350"> |
+
+截图来自 v0.2.6 的实际界面。首页为首次配置状态，尚未连接服务器。
 
 ## 开始使用
 
@@ -11,7 +21,7 @@
 1. 向管理员取得 Relay 地址和已授权的组码。自建服务器请先看[部署说明](docs/server-ai-handoff.md)；地址格式为 `主机名或IP:端口`，默认端口是 `24872`，TCP 和 UDP 共用该端口。
 2. 下载并完整解压 `NetBurrow-<版本>-win-x64.zip`。把 `NetBurrow.exe`、`netburrow-injector.exe`、`netburrow_hook.dll` 留在同一文件夹，不要混用不同版本。开源许可原文内置在程序中，可在“设置 → 关于 → 开源许可”查看。
 3. 打开 `NetBurrow.exe`，填写服务器地址和组码，确认游戏路径指向实际的 `isaac-ng.exe`。传输方式先用默认的 TCP。
-4. 点击“连接”，出现“等待游戏”后，从 Steam 启动游戏，邀请朋友并开局。
+4. 点击“启用联机”，出现“等待游戏”后，从 Steam 启动游戏，邀请朋友并开局。
 
 “新建组”只会在本机生成组码。新组码须由管理员加入服务器白名单，并在没有对局时重启 Relay 后才能使用。组码相当于入组凭据，请只私下分享给同组朋友；它不验证 Steam 账号，Relay 通信也没有 TLS 加密。
 
